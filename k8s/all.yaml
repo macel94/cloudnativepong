@@ -45,10 +45,10 @@ spec:
     spec:
       containers:
         - name: gateway
-          image: cloudnativepong-gateway:latest
-          imagePullPolicy: IfNotPresent
+          image: localhost/cloudnativepong-gateway:latest
+          imagePullPolicy: Never
           ports:
-            - containerPort: 8080
+            - containerPort: 80
               name: http
           env:
             - name: STATIC_ADDR
@@ -65,7 +65,7 @@ spec:
           readinessProbe:
             httpGet:
               path: /health
-              port: 8080
+              port: 80
             initialDelaySeconds: 2
             periodSeconds: 5
 ---
@@ -82,8 +82,8 @@ spec:
     app: cloudnativepong
     component: gateway
   ports:
-    - port: 8080
-      targetPort: 8080
+    - port: 80
+      targetPort: 80
       nodePort: 30080
       name: http
   type: NodePort
@@ -115,8 +115,8 @@ spec:
     spec:
       containers:
         - name: static
-          image: cloudnativepong-static:latest
-          imagePullPolicy: IfNotPresent
+          image: localhost/cloudnativepong-static:latest
+          imagePullPolicy: Never
           ports:
             - containerPort: 80
               name: http
@@ -197,12 +197,12 @@ spec:
       serviceAccountName: pong-lobby
       containers:
         - name: api
-          image: cloudnativepong-api:latest
-          imagePullPolicy: IfNotPresent
+          image: localhost/cloudnativepong-api:latest
+          imagePullPolicy: Never
           args:
             - "--mode=lobby"
             - "--namespace=pong"
-            - "--room-image=cloudnativepong:latest"
+            - "--room-image=localhost/cloudnativepong-room:latest"
           ports:
             - containerPort: 8080
               name: http
@@ -284,7 +284,7 @@ metadata:
     app: cloudnativepong
 rules:
   - apiGroups: [""]
-    resources: ["pods"]
+    resources: ["pods", "services"]
     verbs: ["create", "get", "list", "watch", "delete"]
   - apiGroups: [""]
     resources: ["pods/log"]
@@ -338,7 +338,7 @@ data:
         "containers": [
           {
             "name": "pong-room",
-            "image": "cloudnativepong:latest",
+            "image": "localhost/cloudnativepong-room:latest",
             "args": [
               "--mode=room",
               "--room-id=${ROOM_ID}",

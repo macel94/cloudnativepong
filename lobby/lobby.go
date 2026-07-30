@@ -5,6 +5,8 @@ package lobby
 import (
 	"bytes"
 	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -67,7 +69,7 @@ func (s *Server) CreateRoom(name string) (*db.Room, error) {
 	case "local":
 		// Spawn a room handler in-process (handled by main.go)
 		// Just record it — the caller must register the handler.
-	case "kubernetes":
+	case "lobby", "kubernetes":
 		// Create a K8s pod for this room
 		podIP, err := s.createK8sPod(id)
 		if err != nil {
@@ -200,8 +202,10 @@ func (s *Server) HandleJoinRoom(w http.ResponseWriter, r *http.Request) {
 // createK8sPod creates a new pod for a game room using the K8s REST API.
 func (s *Server) createK8sPod(roomID string) (string, error) {
 	// Read the service account token and CA from the pod's filesystem.
-	token, _ := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/token")
-	caCert := "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+	token, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/token")
+	if err != nil || len(token) == 0 {
+		return "", fmt.Errorf("kubernetes service account token not found — are we running in a K8s pod?")
+	}
 	apiHost := os.Getenv("KUBERNETES_SERVICE_HOST")
 	apiPort := os.Getenv("KUBERNETES_SERVICE_PORT")
 	if apiHost == "" {
@@ -222,7 +226,7 @@ func (s *Server) createK8sPod(roomID string) (string, error) {
 
 	image := s.roomImage
 	if image == "" {
-		image = "cloudnativepong:latest"
+		image = "cloudnativepong-room:latest"
 	}
 
 	pod := map[string]interface{}{
@@ -241,6 +245,7 @@ func (s *Server) createK8sPod(roomID string) (string, error) {
 				{
 					"name":  "pong-room",
 					"image": image,
+					"imagePullPolicy": "Never",
 					"args":  []string{"--mode=room", "--room-id=" + roomID, "--lobby-addr=" + s.lobbyAddr()},
 					"ports": []map[string]interface{}{
 						{"containerPort": 8080},
@@ -280,7 +285,7 @@ func (s *Server) createK8sPod(roomID string) (string, error) {
 		req.Header.Set("Authorization", "Bearer "+string(token))
 	}
 
-	client := &http.Client{Timeout: 15 * time.Second}
+	client := k8sClient()
 	// In-cluster we need to trust the CA
 	// For simplicity, skip TLS verify when CA cert is used (prod should verify)
 	resp, err := client.Do(req)
@@ -306,7 +311,10 @@ func (s *Server) createK8sPod(roomID string) (string, error) {
 
 	// Wait briefly for pod IP to be assigned
 	if podIP == "" {
-		podIP = s.waitForPodIP(roomID, caCert, string(token), apiHost, apiPort, ns)
+		podIP = s.waitForPodIP(roomID, string(token), apiHost, apiPort, ns)
+		if podIP == "" {
+			return "", fmt.Errorf("timed out waiting for pod IP for room %s", roomID)
+		}
 	}
 
 	return podIP, nil
@@ -355,7 +363,7 @@ func (s *Server) createK8sService(roomID, apiHost, apiPort, ns string, token []b
 		req.Header.Set("Authorization", "Bearer "+string(token))
 	}
 
-	client := &http.Client{Timeout: 15 * time.Second}
+	client := k8sClient()
 	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("k8s service api call: %w", err)
@@ -371,33 +379,39 @@ func (s *Server) createK8sService(roomID, apiHost, apiPort, ns string, token []b
 	return nil
 }
 
-// lobbyAddr returns the lobby's address for room pods to report back.
+// lobbyAddr returns the lobby's address for room pods to report back to.
+// In K8s mode, the lobby Service is reachable at pong-lobby.{namespace}.svc.cluster.local:8080.
+// In local mode, falls back to the node's non-loopback IPv4 address.
 func (s *Server) lobbyAddr() string {
-	host := os.Getenv("LOBBY_HOST")
-	if host == "" {
-		// Try to get the pod IP
-		host = os.Getenv("LOBBY_SERVICE_HOST")
-		if host == "" {
-			// Fallback: use the node's IP
-			addrs, _ := net.InterfaceAddrs()
-			for _, a := range addrs {
-				if ipnet, ok := a.(*net.IPNet); ok && !ipnet.IP.IsLoopback() && ipnet.IP.To4() != nil {
-					host = ipnet.IP.String()
-					break
-				}
-			}
+	host := os.Getenv("LOBBY_ADDR")
+	if host != "" {
+		return host
+	}
+	// In K8s, the lobby Service DNS name is deterministic
+	if s.mode == "lobby" || s.mode == "kubernetes" {
+		ns := s.k8sNS
+		if ns == "" {
+			ns = "default"
+		}
+		return fmt.Sprintf("pong-api.%s.svc.cluster.local:8080", ns)
+	}
+	// Fallback for local mode: use the node's IP
+	addrs, _ := net.InterfaceAddrs()
+	for _, a := range addrs {
+		if ipnet, ok := a.(*net.IPNet); ok && !ipnet.IP.IsLoopback() && ipnet.IP.To4() != nil {
+			return ipnet.IP.String() + ":8080"
 		}
 	}
-	return host + ":8080"
+	return "localhost:8080"
 }
 
-func (s *Server) waitForPodIP(roomID, caCert, token, apiHost, apiPort, ns string) string {
+func (s *Server) waitForPodIP(roomID, token, apiHost, apiPort, ns string) string {
 	url := fmt.Sprintf("https://%s:%s/api/v1/namespaces/%s/pods/pong-room-%s", apiHost, apiPort, ns, roomID)
 	for i := 0; i < 15; i++ {
 		time.Sleep(1 * time.Second)
 		req, _ := http.NewRequest("GET", url, nil)
 		req.Header.Set("Authorization", "Bearer "+token)
-		client := &http.Client{Timeout: 5 * time.Second}
+		client := k8sClient()
 		resp, err := client.Do(req)
 		if err != nil {
 			continue
@@ -413,6 +427,27 @@ func (s *Server) waitForPodIP(roomID, caCert, token, apiHost, apiPort, ns string
 		}
 	}
 	return ""
+}
+
+// k8sClient creates an HTTP client configured with the K8s API CA cert.
+func k8sClient() *http.Client {
+	const caCertPath = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+	tlsCfg := &tls.Config{}
+	caData, err := os.ReadFile(caCertPath)
+	if err == nil {
+		pool, _ := x509.SystemCertPool()
+		if pool == nil {
+			pool = x509.NewCertPool()
+		}
+		pool.AppendCertsFromPEM(caData)
+		tlsCfg.RootCAs = pool
+	}
+	return &http.Client{
+		Timeout: 15 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: tlsCfg,
+		},
+	}
 }
 
 func writeJSON(w http.ResponseWriter, v interface{}) {

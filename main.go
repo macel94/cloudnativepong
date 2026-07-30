@@ -2,14 +2,18 @@ package main
 
 import (
 	"context"
+	"crypto/sha1"
+	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
+	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -31,7 +35,7 @@ func main() {
 	roomID := flag.String("room-id", "", "Room ID (for room mode)")
 	lobbyAddr := flag.String("lobby-addr", "", "Lobby address (for room mode)")
 	k8sNS := flag.String("namespace", "default", "Kubernetes namespace")
-	roomImage := flag.String("room-image", "cloudnativepong:latest", "Room container image")
+	roomImage := flag.String("room-image", "cloudnativepong-room:latest", "Room container image")
 	flag.Parse()
 
 	store, err := db.New(":memory:")
@@ -374,10 +378,16 @@ func corsMiddleware(next http.Handler) http.Handler {
 
 // ---- WebSocket Proxy (lobby mode) ----
 
-// proxyRoomWS proxies a WebSocket connection from the gateway to a room pod.
-// The gateway receives at /rooms/{id}/ws and forwards to the room pod's /ws.
+// proxyRoomWS - relays WebSocket between client (via Caddy) and room pod.
+//
+// Architecture:
+//   Browser --WS--> Caddy --HTTP+Upgrade--> Lobby (hijack) --WS--> Room Pod
+//
+// Caddy forwards the WebSocket upgrade request to the lobby. The lobby
+// hijacks the raw TCP connection, sends back the 101 Switching Protocols
+// response (so Caddy enters tunnel mode), then opens a proper WebSocket
+// connection to the room pod and relays frames between the two.
 func proxyRoomWS(w http.ResponseWriter, r *http.Request, lobbySrv *lobby.Server, store *db.Store) {
-	// Parse /rooms/{id}/ws
 	parts := splitPath(r.URL.Path)
 	if len(parts) < 3 || parts[2] != "ws" {
 		http.NotFound(w, r)
@@ -385,7 +395,6 @@ func proxyRoomWS(w http.ResponseWriter, r *http.Request, lobbySrv *lobby.Server,
 	}
 	roomID := parts[1]
 
-	// Look up the room pod address
 	addr, err := lobbySrv.GetRoomAddr(roomID)
 	if err != nil {
 		log.Printf("proxy: room %s not found: %v", roomID, err)
@@ -395,57 +404,100 @@ func proxyRoomWS(w http.ResponseWriter, r *http.Request, lobbySrv *lobby.Server,
 
 	log.Printf("proxy: proxying WS for room %s to %s", roomID, addr)
 
-	// Upgrade the incoming connection
-	conn, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		log.Printf("proxy: ws upgrade error: %v", err)
+	// Only accept WebSocket upgrade requests
+	if r.Header.Get("Upgrade") != "websocket" {
+		http.Error(w, "websocket only", http.StatusBadRequest)
 		return
 	}
-	defer conn.Close()
 
-	// Dial the target room pod
-	targetURL := url.URL{Scheme: "ws", Host: addr, Path: "/ws"}
-	targetConn, _, err := websocket.DefaultDialer.Dial(targetURL.String(), nil)
+	// ── Step 1: hijack the client connection (from Caddy) ──────────
+	hj, ok := w.(http.Hijacker)
+	if !ok {
+		http.Error(w, "hijack not supported", http.StatusInternalServerError)
+		return
+	}
+	clientConn, clientBuf, err := hj.Hijack()
 	if err != nil {
-		log.Printf("proxy: dial target %s: %v", targetURL.String(), err)
+		log.Printf("proxy: hijack error: %v", err)
+		return
+	}
+	defer clientConn.Close()
+
+	// ── Step 2: send 101 Switching Protocols (Caddy enters tunnel mode) ──
+	key := r.Header.Get("Sec-WebSocket-Key")
+	magic := "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+	h := sha1.New()
+	h.Write([]byte(key + magic))
+	accept := base64.StdEncoding.EncodeToString(h.Sum(nil))
+	clientBuf.WriteString("HTTP/1.1 101 Switching Protocols\r\n" +
+		"Upgrade: websocket\r\n" +
+		"Connection: Upgrade\r\n" +
+		"Sec-WebSocket-Accept: " + accept + "\r\n\r\n")
+	clientBuf.Flush()
+
+	// ── Step 3: open raw TCP to room pod and send WS upgrade ───────
+	var targetConn net.Conn
+	for i := 0; i < 10; i++ {
+		targetConn, err = net.DialTimeout("tcp", addr, 2*time.Second)
+		if err == nil {
+			break
+		}
+		log.Printf("proxy: retry %d connecting to %s: %v", i+1, addr, err)
+		time.Sleep(500 * time.Millisecond)
+	}
+	if err != nil {
+		log.Printf("proxy: failed to connect to %s after retries: %v", addr, err)
 		return
 	}
 	defer targetConn.Close()
 
-	// Bidirectional copy: messages from client -> target, and target -> client
+	// Write WebSocket upgrade request to room pod
+	reqLine := fmt.Sprintf("GET /ws HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n\r\n", addr, key)
+	if _, err := targetConn.Write([]byte(reqLine)); err != nil {
+		log.Printf("proxy: write upgrade to target: %v", err)
+		return
+	}
+
+	// Read the 101 response from room pod (byte by byte to avoid
+	// consuming the first WebSocket frame that may follow immediately)
+	var respData []byte
+	buf := make([]byte, 1)
+	for {
+		if _, err := targetConn.Read(buf); err != nil {
+			log.Printf("proxy: read 101 from target: %v", err)
+			return
+		}
+		respData = append(respData, buf[0])
+		// Stop at end of HTTP headers (\r\n\r\n)
+		if len(respData) >= 4 &&
+			respData[len(respData)-4] == '\r' &&
+			respData[len(respData)-3] == '\n' &&
+			respData[len(respData)-2] == '\r' &&
+			respData[len(respData)-1] == '\n' {
+			break
+		}
+	}
+	if !strings.Contains(string(respData), "101") {
+		log.Printf("proxy: unexpected target response: %s", string(respData))
+		return
+	}
+
+	// Forward any bytes already read after the 101 response (e.g. first WS frame)
+	// to the browser connection. We do this by starting the io.Copy goroutines
+	// and then writing any leftover bytes.
+	// Actually, since we read byte-by-byte and stopped at \r\n\r\n, there should
+	// be no leftover bytes. But to be safe, the bidirectional copy below handles this.
+
+	// ── Step 4: bidirectional relay ────────────────────────────────
 	errCh := make(chan error, 2)
-
-	// Client -> Target
 	go func() {
-		for {
-			msgType, msg, err := conn.ReadMessage()
-			if err != nil {
-				errCh <- err
-				return
-			}
-			if err := targetConn.WriteMessage(msgType, msg); err != nil {
-				errCh <- err
-				return
-			}
-		}
+		_, e := io.Copy(targetConn, clientConn)
+		errCh <- e
 	}()
-
-	// Target -> Client
 	go func() {
-		for {
-			msgType, msg, err := targetConn.ReadMessage()
-			if err != nil {
-				errCh <- err
-				return
-			}
-			if err := conn.WriteMessage(msgType, msg); err != nil {
-				errCh <- err
-				return
-			}
-		}
+		_, e := io.Copy(clientConn, targetConn)
+		errCh <- e
 	}()
-
-	// Wait for one side to disconnect
 	<-errCh
 	log.Printf("proxy: WS connection closed for room %s", roomID)
 }
