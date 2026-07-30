@@ -11,7 +11,7 @@
 #   podman run --rm -p 8080:8080 cloudnativepong:latest --mode=lobby
 
 # ---- Build Stage ----
-FROM docker.io/golang:1.25-alpine AS builder
+FROM docker.io/golang:1.26-alpine AS builder
 
 RUN apk add --no-cache ca-certificates tzdata
 
