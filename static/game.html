@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PONG — Game</title>
+    <link rel="stylesheet" href="/style.css">
+    <style>
+        .game-wrapper {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 16px;
+        }
+        #pongCanvas {
+            background: #1a1a2e;
+            border-radius: 8px;
+            box-shadow: 0 0 24px rgba(100, 100, 255, 0.2);
+        }
+        .scoreboard {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            gap: 32px;
+            font-size: 2rem;
+            font-weight: 700;
+            font-family: monospace;
+        }
+        .score {
+            padding: 8px 24px;
+            background: #16213e;
+            border-radius: 8px;
+            min-width: 60px;
+            text-align: center;
+        }
+        .vs {
+            color: #888;
+        }
+        .status-bar {
+            font-size: 0.9rem;
+            color: #aaa;
+        }
+        .winner-overlay {
+            position: fixed;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(0,0,0,0.7);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            z-index: 10;
+        }
+        .winner-overlay h2 {
+            font-size: 3rem;
+            margin-bottom: 16px;
+        }
+        .hidden { display: none; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🏓 PONG</h1>
+            <p id="roomLabel" class="subtitle">Room: —</p>
+        </header>
+
+        <div class="game-wrapper">
+            <div class="scoreboard">
+                <span id="score1" class="score">0</span>
+                <span class="vs">vs</span>
+                <span id="score2" class="score">0</span>
+            </div>
+            <canvas id="pongCanvas" width="800" height="500"></canvas>
+            <p id="status" class="status-bar">Waiting for opponent...</p>
+        </div>
+
+        <div id="winnerOverlay" class="winner-overlay hidden">
+            <h2 id="winnerText"></h2>
+            <a href="/" class="btn primary">Back to Lobby</a>
+        </div>
+    </div>
+
+    <script src="/game.js"></script>
+</body>
+</html>
