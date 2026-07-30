@@ -19,7 +19,7 @@ data:
         "containers": [
           {
             "name": "pong-room",
-            "image": "ghcr.io/macel94/cloudnativepong-room:REPLACE_ME",
+            "image": "ghcr.io/macel94/cloudnativepong-room:sha-55b5259a71f8b66b59dfb08d46d8cad64423b2d8",
             "imagePullPolicy": "Always",
             "args": [
               "--mode=room",
