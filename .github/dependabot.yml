@@ -6,14 +6,10 @@ updates:
     schedule:
       interval: weekly
       day: monday
-    open-pull-requests-limit: 5
     groups:
       go-deps:
         patterns:
           - "*"
-        update-types:
-          - minor
-          - patch
 
   # — npm (Playwright tests) —
   - package-ecosystem: npm
@@ -21,14 +17,10 @@ updates:
     schedule:
       interval: weekly
       day: monday
-    open-pull-requests-limit: 5
     groups:
       npm-deps:
         patterns:
           - "*"
-        update-types:
-          - minor
-          - patch
 
   # — Docker base images —
   - package-ecosystem: docker
@@ -36,7 +28,10 @@ updates:
     schedule:
       interval: weekly
       day: monday
-    open-pull-requests-limit: 3
+    groups:
+      docker-deps:
+        patterns:
+          - "*"
 
   # — GitHub Actions —
   - package-ecosystem: github-actions
@@ -44,11 +39,7 @@ updates:
     schedule:
       interval: weekly
       day: monday
-    open-pull-requests-limit: 3
     groups:
       actions-deps:
         patterns:
           - "*"
-        update-types:
-          - minor
-          - patch
