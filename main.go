@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha1"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -13,7 +15,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -378,15 +379,17 @@ func corsMiddleware(next http.Handler) http.Handler {
 
 // ---- WebSocket Proxy (lobby mode) ----
 
-// proxyRoomWS - relays WebSocket between client (via Caddy) and room pod.
+// proxyRoomWS relays WebSocket traffic between the client (via NGINX) and a
+// dynamically created room pod.
 //
 // Architecture:
-//   Browser --WS--> Caddy --HTTP+Upgrade--> Lobby (hijack) --WS--> Room Pod
 //
-// Caddy forwards the WebSocket upgrade request to the lobby. The lobby
-// hijacks the raw TCP connection, sends back the 101 Switching Protocols
-// response (so Caddy enters tunnel mode), then opens a proper WebSocket
-// connection to the room pod and relays frames between the two.
+//	Browser --WS--> NGINX --HTTP+Upgrade--> Lobby (hijack) --WS--> Room Pod
+//
+// NGINX forwards the WebSocket upgrade request to the lobby. The lobby
+// hijacks the raw client connection, sends back the 101 Switching Protocols
+// response so NGINX enters tunnel mode, then opens a proper WebSocket
+// connection to the room pod and relays validated frames between the two.
 func proxyRoomWS(w http.ResponseWriter, r *http.Request, lobbySrv *lobby.Server, store *db.Store) {
 	parts := splitPath(r.URL.Path)
 	if len(parts) < 3 || parts[2] != "ws" {
@@ -410,7 +413,7 @@ func proxyRoomWS(w http.ResponseWriter, r *http.Request, lobbySrv *lobby.Server,
 		return
 	}
 
-	// ── Step 1: hijack the client connection (from Caddy) ──────────
+	// ── Step 1: hijack the client connection (from NGINX) ──────────
 	hj, ok := w.(http.Hijacker)
 	if !ok {
 		http.Error(w, "hijack not supported", http.StatusInternalServerError)
@@ -423,22 +426,18 @@ func proxyRoomWS(w http.ResponseWriter, r *http.Request, lobbySrv *lobby.Server,
 	}
 	defer clientConn.Close()
 
-	// ── Step 2: send 101 Switching Protocols (Caddy enters tunnel mode) ──
-	key := r.Header.Get("Sec-WebSocket-Key")
-	magic := "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-	h := sha1.New()
-	h.Write([]byte(key + magic))
-	accept := base64.StdEncoding.EncodeToString(h.Sum(nil))
-	clientBuf.WriteString("HTTP/1.1 101 Switching Protocols\r\n" +
-		"Upgrade: websocket\r\n" +
-		"Connection: Upgrade\r\n" +
-		"Sec-WebSocket-Accept: " + accept + "\r\n\r\n")
-	clientBuf.Flush()
-
-	// ── Step 3: open raw TCP to room pod and send WS upgrade ───────
-	var targetConn net.Conn
+	// ── Step 2: open a real WebSocket connection to the room pod ───
+	// Establish and read the first target message before acknowledging the
+	// browser. This closes the gateway tunnel race: the room's immediate
+	// "joined" frame is held in memory instead of arriving while the proxy
+	// is still switching the client connection into tunnel mode.
+	dialer := websocket.Dialer{
+		HandshakeTimeout: 2 * time.Second,
+		NetDialContext:   (&net.Dialer{Timeout: 2 * time.Second}).DialContext,
+	}
+	var target *websocket.Conn
 	for i := 0; i < 10; i++ {
-		targetConn, err = net.DialTimeout("tcp", addr, 2*time.Second)
+		target, _, err = dialer.Dial("ws://"+addr+"/ws", nil)
 		if err == nil {
 			break
 		}
@@ -449,55 +448,264 @@ func proxyRoomWS(w http.ResponseWriter, r *http.Request, lobbySrv *lobby.Server,
 		log.Printf("proxy: failed to connect to %s after retries: %v", addr, err)
 		return
 	}
-	defer targetConn.Close()
+	defer target.Close()
+	target.SetReadLimit(maxProxyMessageSize)
 
-	// Write WebSocket upgrade request to room pod
-	reqLine := fmt.Sprintf("GET /ws HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n\r\n", addr, key)
-	if _, err := targetConn.Write([]byte(reqLine)); err != nil {
-		log.Printf("proxy: write upgrade to target: %v", err)
+	// ── Step 3: acknowledge the browser and start both relays ──────
+	key := r.Header.Get("Sec-WebSocket-Key")
+	h := sha1.New()
+	h.Write([]byte(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
+	accept := base64.StdEncoding.EncodeToString(h.Sum(nil))
+	clientBuf.WriteString("HTTP/1.1 101 Switching Protocols\r\n" +
+		"Upgrade: websocket\r\n" +
+		"Connection: Upgrade\r\n" +
+		"Sec-WebSocket-Accept: " + accept + "\r\n\r\n")
+	if err := clientBuf.Flush(); err != nil {
+		log.Printf("proxy: flush client handshake: %v", err)
 		return
 	}
 
-	// Read the 101 response from room pod (byte by byte to avoid
-	// consuming the first WebSocket frame that may follow immediately)
-	var respData []byte
-	buf := make([]byte, 1)
-	for {
-		if _, err := targetConn.Read(buf); err != nil {
-			log.Printf("proxy: read 101 from target: %v", err)
-			return
-		}
-		respData = append(respData, buf[0])
-		// Stop at end of HTTP headers (\r\n\r\n)
-		if len(respData) >= 4 &&
-			respData[len(respData)-4] == '\r' &&
-			respData[len(respData)-3] == '\n' &&
-			respData[len(respData)-2] == '\r' &&
-			respData[len(respData)-1] == '\n' {
-			break
-		}
-	}
-	if !strings.Contains(string(respData), "101") {
-		log.Printf("proxy: unexpected target response: %s", string(respData))
-		return
+	// NGINX starts its tunnel copier after it receives the flushed 101. The
+	// browser sends proxyReadyMessage from WebSocket.onopen; hold all target
+	// frames until that post-upgrade client frame arrives. A timeout keeps raw
+	// WebSocket clients that do not send an application frame working.
+	clientReady := make(chan struct{})
+	var readyOnce sync.Once
+	signalClientReady := func() {
+		readyOnce.Do(func() { close(clientReady) })
 	}
 
-	// Forward any bytes already read after the 101 response (e.g. first WS frame)
-	// to the browser connection. We do this by starting the io.Copy goroutines
-	// and then writing any leftover bytes.
-	// Actually, since we read byte-by-byte and stopped at \r\n\r\n, there should
-	// be no leftover bytes. But to be safe, the bidirectional copy below handles this.
+	var clientWriteMu sync.Mutex
+	writeClientFrame := func(messageType int, payload []byte) error {
+		<-clientReady
+		clientWriteMu.Lock()
+		defer clientWriteMu.Unlock()
+		return writeWebSocketFrame(clientConn, messageType, payload)
+	}
 
-	// ── Step 4: bidirectional relay ────────────────────────────────
+	// Gorilla handles control frames from the room connection. Forwarding
+	// them through the same gated writer preserves ordering with data frames.
+	target.SetPingHandler(func(appData string) error {
+		return writeClientFrame(websocket.PingMessage, []byte(appData))
+	})
+	target.SetPongHandler(func(appData string) error {
+		return writeClientFrame(websocket.PongMessage, []byte(appData))
+	})
+	target.SetCloseHandler(func(code int, text string) error {
+		closePayload := websocket.FormatCloseMessage(code, text)
+		if err := target.WriteControl(websocket.CloseMessage, closePayload, time.Now().Add(5*time.Second)); err != nil && err != websocket.ErrCloseSent {
+			return err
+		}
+		return writeClientFrame(websocket.CloseMessage, closePayload)
+	})
+
 	errCh := make(chan error, 2)
 	go func() {
-		_, e := io.Copy(targetConn, clientConn)
-		errCh <- e
+		errCh <- relayBrowserToTargetReady(clientBuf, target, signalClientReady)
 	}()
 	go func() {
-		_, e := io.Copy(clientConn, targetConn)
-		errCh <- e
+		timer := time.NewTimer(500 * time.Millisecond)
+		defer timer.Stop()
+		select {
+		case <-clientReady:
+		case <-timer.C:
+			signalClientReady()
+		}
+		for {
+			messageType, payload, e := target.ReadMessage()
+			if e != nil {
+				errCh <- e
+				return
+			}
+			if e = writeClientFrame(messageType, payload); e != nil {
+				errCh <- e
+				return
+			}
+		}
 	}()
 	<-errCh
 	log.Printf("proxy: WS connection closed for room %s", roomID)
+}
+
+const maxProxyMessageSize = 16 << 20
+const proxyReadyMessage = `{"type":"proxy-ready"}`
+
+// relayBrowserToTarget reads client-to-server WebSocket frames from the
+// hijacked browser connection and sends equivalent messages through Gorilla.
+func relayBrowserToTarget(r io.Reader, target *websocket.Conn) error {
+	return relayBrowserToTargetReady(r, target, nil)
+}
+
+func relayBrowserToTargetReady(r io.Reader, target *websocket.Conn, ready func()) error {
+	signalReady := func() {
+		if ready != nil {
+			ready()
+		}
+	}
+	sendMessage := func(messageType int, payload []byte) error {
+		signalReady()
+		if messageType == websocket.TextMessage && bytes.Equal(payload, []byte(proxyReadyMessage)) {
+			return nil
+		}
+		return target.WriteMessage(messageType, payload)
+	}
+
+	var fragmented bool
+	var messageType int
+	var message []byte
+
+	for {
+		fin, opcode, payload, err := readWebSocketFrame(r)
+		if err != nil {
+			return err
+		}
+
+		if opcode >= 0x8 {
+			if !fin || len(payload) > 125 || opcode > byte(websocket.PongMessage) {
+				return fmt.Errorf("invalid websocket control frame")
+			}
+			signalReady()
+			if err := target.WriteControl(int(opcode), payload, time.Now().Add(5*time.Second)); err != nil {
+				return err
+			}
+			continue
+		}
+
+		switch opcode {
+		case 0x0: // continuation
+			if !fragmented {
+				return fmt.Errorf("unexpected websocket continuation frame")
+			}
+			if len(message)+len(payload) > maxProxyMessageSize {
+				return fmt.Errorf("websocket message exceeds proxy limit")
+			}
+			message = append(message, payload...)
+			if fin {
+				if err := sendMessage(messageType, message); err != nil {
+					return err
+				}
+				fragmented = false
+				message = nil
+			}
+		case 0x1, 0x2: // text or binary
+			if fragmented {
+				return fmt.Errorf("new websocket data frame before continuation")
+			}
+			if len(payload) > maxProxyMessageSize {
+				return fmt.Errorf("websocket message exceeds proxy limit")
+			}
+			if fin {
+				if err := sendMessage(int(opcode), payload); err != nil {
+					return err
+				}
+			} else {
+				fragmented = true
+				messageType = int(opcode)
+				message = append(message[:0], payload...)
+			}
+		default:
+			return fmt.Errorf("invalid websocket opcode: %d", opcode)
+		}
+	}
+}
+
+// readWebSocketFrame reads one frame from a client WebSocket. Client frames
+// are required to be masked by RFC 6455; the mask is removed before delivery
+// to Gorilla, which applies its own client-side masking when it writes.
+func readWebSocketFrame(r io.Reader) (fin bool, opcode byte, payload []byte, err error) {
+	var header [2]byte
+	if _, err = io.ReadFull(r, header[:]); err != nil {
+		return false, 0, nil, err
+	}
+	if header[0]&0x70 != 0 {
+		return false, 0, nil, fmt.Errorf("websocket reserved bits are set")
+	}
+
+	fin = header[0]&0x80 != 0
+	opcode = header[0] & 0x0f
+	masked := header[1]&0x80 != 0
+	if !masked {
+		return false, 0, nil, fmt.Errorf("client websocket frame is not masked")
+	}
+
+	lengthCode := header[1] & 0x7f
+	length := uint64(lengthCode)
+	if lengthCode == 126 {
+		var extended [2]byte
+		if _, err = io.ReadFull(r, extended[:]); err != nil {
+			return false, 0, nil, err
+		}
+		length = uint64(binary.BigEndian.Uint16(extended[:]))
+		if length < 126 {
+			return false, 0, nil, fmt.Errorf("non-minimal websocket payload length")
+		}
+	} else if lengthCode == 127 {
+		var extended [8]byte
+		if _, err = io.ReadFull(r, extended[:]); err != nil {
+			return false, 0, nil, err
+		}
+		length = binary.BigEndian.Uint64(extended[:])
+		if length&(uint64(1)<<63) != 0 || length < 65536 {
+			return false, 0, nil, fmt.Errorf("invalid websocket payload length")
+		}
+	}
+	if opcode >= 0x8 {
+		if opcode > byte(websocket.PongMessage) || !fin || length > 125 {
+			return false, 0, nil, fmt.Errorf("invalid websocket control frame")
+		}
+	} else if length > maxProxyMessageSize {
+		return false, 0, nil, fmt.Errorf("websocket frame exceeds proxy limit")
+	}
+
+	var mask [4]byte
+	if _, err = io.ReadFull(r, mask[:]); err != nil {
+		return false, 0, nil, err
+	}
+	payload = make([]byte, int(length))
+	if _, err = io.ReadFull(r, payload); err != nil {
+		return false, 0, nil, err
+	}
+	for i := range payload {
+		payload[i] ^= mask[i%4]
+	}
+	return fin, opcode, payload, nil
+}
+
+// writeWebSocketFrame writes an unmasked server-to-client WebSocket frame.
+func writeWebSocketFrame(w io.Writer, messageType int, payload []byte) error {
+	var header [10]byte
+	header[0] = 0x80 | byte(messageType)
+	n := 2
+	switch {
+	case len(payload) < 126:
+		header[1] = byte(len(payload))
+	case len(payload) <= 0xffff:
+		header[1] = 126
+		binary.BigEndian.PutUint16(header[2:4], uint16(len(payload)))
+		n = 4
+	default:
+		header[1] = 127
+		binary.BigEndian.PutUint64(header[2:10], uint64(len(payload)))
+		n = 10
+	}
+	if err := writeAll(w, header[:n]); err != nil {
+		return err
+	}
+	return writeAll(w, payload)
+}
+
+func writeAll(w io.Writer, p []byte) error {
+	for len(p) > 0 {
+		n, err := w.Write(p)
+		if n > 0 {
+			p = p[n:]
+		}
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+	}
+	return nil
 }

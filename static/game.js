@@ -38,6 +38,9 @@
 
         ws.onopen = function () {
             document.getElementById('status').textContent = 'Connected. Waiting for opponent...';
+            // The lobby proxy uses this first post-upgrade frame to know that
+            // the gateway has completed its WebSocket tunnel handoff.
+            ws.send(JSON.stringify({ type: 'proxy-ready' }));
         };
 
         ws.onmessage = function (e) {

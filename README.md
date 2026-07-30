@@ -15,7 +15,7 @@ A minimalist, horizontally-scalable PONG game running on Kubernetes. Each game r
 
 ```
                      ┌──────────────┐
-                     │   Gateway    │  (Caddy, 1 replica, NodePort)
+                     │   Gateway    │  (NGINX, 1 replica, NodePort)
                      │   :80        │
                      └──────┬───────┘
         ┌───────────────────┼───────────────────┐
@@ -33,7 +33,7 @@ A minimalist, horizontally-scalable PONG game running on Kubernetes. Each game r
 
 | Component | Image | Replicas | Purpose |
 |-----------|-------|----------|---------|
-| **Gateway** | `cloudnativepong-gateway` | 1 | Single entry point, routes by path |
+| **Gateway** | `cloudnativepong-gateway` | 1 | NGINX entry point, routes by path |
 | **Static** | `cloudnativepong-static` | 1 | Serves HTML, CSS, JS via nginx |
 | **API** | `cloudnativepong-api` | 1 | Room CRUD, K8s pod orchestration, WebSocket proxy |
 | **Room** | `cloudnativepong-room` | N (dynamic) | One pod per game, runs PONG engine |
@@ -99,25 +99,44 @@ npx playwright test
 TEST_MODE=k8s npx playwright test
 ```
 
+## 🔌 WebSocket Proxy Design
+
+Kubernetes traffic enters through the NGINX gateway. It routes REST requests to the Go lobby, static assets to the static service, and `/rooms/{id}/ws` to the lobby's room proxy. The lobby then opens a second WebSocket connection to the dynamically created room pod.
+
+The lobby keeps the browser-facing HTTP connection hijacked because the gateway must receive the lobby's `101 Switching Protocols` response before it can enter WebSocket tunnel mode. The room-side connection uses `gorilla/websocket`, rather than copying the underlying TCP socket, so bytes buffered during the room handshake and WebSocket control frames are preserved.
+
+The browser sends a small `{"type":"proxy-ready"}` message immediately after `WebSocket.onopen`. The lobby consumes that marker, releases the first room-to-browser frames only after the outer gateway handoff, and forwards all subsequent application messages. The browser-to-room relay validates masked client frames, reassembles fragmented messages, handles control frames, and enforces a 16 MiB message limit. The marker is harmless in local mode, where the browser connects directly to the in-process room handler.
+
+NGINX's `/rooms/` location explicitly enables HTTP/1.1 upgrade headers, disables request/response buffering, and uses one-hour WebSocket timeouts. See `gateway/nginx.conf` and `main.go` for the two sides of the handoff.
+
+## 📊 Verification Status
+
+- Local Go tests, race tests, vet, and static builds pass.
+- The local Playwright suite passes 12/12.
+- Isolated Chromium checks through the NGINX k3d gateway pass, including two-player joining.
+- The latest full k3d suite remains intermittent at 11/12: the two-player test can still leave Player 1 at `Waiting for opponent...`. This is documented as an unresolved follow-up and should not be treated as fixed by the gateway replacement alone.
+
 ## 📁 Project Structure
 
 ```
 .
 ├── main.go              # Entry point, routing, CORS, WS proxy
+├── main_test.go         # WebSocket frame and relay tests
 ├── lobby/               # Lobby server (room management, K8s integration)
 ├── game/                # PONG game engine (server-side state machine)
 ├── db/                  # SQLite database layer
 ├── static/              # Frontend (HTML, CSS, vanilla JS)
 │   └── nginx.conf       # nginx config for static pod
 ├── gateway/             # Gateway config
-│   └── Caddyfile        # Caddy routing rules
+│   └── nginx.conf       # NGINX routing and WebSocket upgrade rules
 ├── k8s/                 # Kubernetes manifests
 │   └── all.yaml         # All resources: gateway, static, api, RBAC, ConfigMap
 ├── tests/               # Playwright E2E tests
 ├── Dockerfile.api       # Go binary → scratch (lobby mode)
 ├── Dockerfile.room      # Go binary → scratch (room mode)
 ├── Dockerfile.static    # nginx:alpine + static files
-├── Dockerfile.gateway   # caddy:alpine + Caddyfile
+├── Dockerfile.gateway   # nginx:alpine + gateway/nginx.conf
+├── HANDOFF.md           # Current implementation state and next steps
 └── README.md
 ```
 
@@ -128,7 +147,7 @@ TEST_MODE=k8s npx playwright test
 | Language       | Go 1.25+                      | Single binary, no runtime, tiny images   |
 | Database       | SQLite (modernc.org/sqlite)   | Pure Go, embedded, zero ops              |
 | WebSocket      | gorilla/websocket             | Battle-tested, minimal API               |
-| Gateway        | Caddy                         | Auto-HTTPS, simple config, HTTP/2        |
+| Gateway        | NGINX                         | Kubernetes-friendly HTTP/WebSocket proxy |
 | Static Server  | nginx:alpine                  | Battle-tested, tiny footprint            |
 | Container      | `scratch` (Go), `alpine` (others) | Smallest possible images              |
 | Frontend       | Vanilla JS + Canvas           | No framework, instant load               |

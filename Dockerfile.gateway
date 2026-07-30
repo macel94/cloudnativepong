@@ -1,37 +1,13 @@
-# ── Cloud Native Pong — Gateway ────────────────────────────────────
-# Caddy-based reverse proxy that routes external traffic to the
-# static file server, API server, and WebSocket endpoints.
-#
-# Routes:
-#   /, /style.css, /lobby.js, /game.js, /index.html, /game.html → static:80
-#   /api/*                                                       → api:8080
-#   /rooms/*                                                     → api:8080
-#
-# Build:
-#   docker build -t cloudnativepong-gateway:latest -f Dockerfile.gateway .
-#
-# Run:
-#   docker run --rm -p 80:80 \
-#     --network pong-net \
-#     cloudnativepong-gateway:latest
+# Cloud Native Pong — Kubernetes gateway.
+# NGINX provides the browser-facing HTTP/WebSocket reverse proxy.
 
-FROM docker.io/caddy:alpine
+FROM docker.io/nginx:alpine
 
-# Metadata labels
 LABEL org.opencontainers.image.title="Cloud Native Pong — Gateway" \
-      org.opencontainers.image.description="Caddy reverse proxy routing traffic to static, API, and WebSocket backends" \
+      org.opencontainers.image.description="NGINX gateway routing static assets, API requests, and WebSocket rooms" \
       org.opencontainers.image.version="1.0.0" \
-      org.opencontainers.image.created="2025-07-30T00:00:00Z" \
-      org.opencontainers.image.source="https://github.com/cloudnativepong/cloudnativepong" \
-      org.opencontainers.image.url="https://cloudnativepong.dev" \
-      org.opencontainers.image.vendor="Cloud Native Pong" \
-      org.opencontainers.image.licenses="MIT" \
-      org.opencontainers.image.ref.name="latest"
+      org.opencontainers.image.licenses="MIT"
 
-# Copy the Caddyfile configuration
-COPY gateway/Caddyfile /etc/caddy/Caddyfile
+COPY gateway/nginx.conf /etc/nginx/conf.d/default.conf
 
-# Port exposed to external traffic
 EXPOSE 80
-
-# Default Caddy entrypoint is used (caddy run --config /etc/caddy/Caddyfile)
