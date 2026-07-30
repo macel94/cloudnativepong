@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -76,12 +77,14 @@ func main() {
 		}
 	}()
 
-	// Graceful shutdown
+	// Graceful shutdown with timeout
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 	log.Println("Shutting down...")
-	srv.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	srv.Shutdown(ctx)
 }
 
 // ---- Local mode: lobby + rooms in one process ----
