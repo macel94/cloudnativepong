@@ -1,0 +1,30 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: pong
+
+resources:
+  - ../../base
+  - ingress.yaml
+  - resource-quota.yaml
+  - hpa.yaml
+
+images:
+  - name: cloudnativepong-api
+    newName: ghcr.io/macel94/cloudnativepong-api
+    newTag: REPLACE_ME
+  - name: cloudnativepong-room
+    newName: ghcr.io/macel94/cloudnativepong-room
+    newTag: REPLACE_ME
+  - name: cloudnativepong-static
+    newName: ghcr.io/macel94/cloudnativepong-static
+    newTag: REPLACE_ME
+  - name: cloudnativepong-gateway
+    newName: ghcr.io/macel94/cloudnativepong-gateway
+    newTag: REPLACE_ME
+
+patches:
+  - path: deployment-pull-policy.yaml
+  - path: api-production.yaml
+  - path: room-template.yaml
+  - path: stateless-replicas.yaml

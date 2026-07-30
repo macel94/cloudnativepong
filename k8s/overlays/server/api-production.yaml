@@ -1,0 +1,25 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pong-api
+  namespace: pong
+spec:
+  template:
+    spec:
+      containers:
+        - name: api
+          args:
+            - --mode=lobby
+            - --namespace=pong
+            - --room-image=ghcr.io/macel94/cloudnativepong-room:sha-REPLACE_ME
+            - --db-path=/data/pong.db
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pong-api-data
+  namespace: pong
+spec:
+  resources:
+    requests:
+      storage: 10Gi

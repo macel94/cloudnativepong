@@ -31,11 +31,11 @@ type RoomHandler struct {
 
 // Server handles HTTP requests for the lobby.
 type Server struct {
-	store  *db.Store
-	mu     sync.RWMutex
-	rooms  map[string]*RoomHandler // local mode: in-process rooms
-	mode   string                  // "local" or "kubernetes"
-	k8sNS  string
+	store     *db.Store
+	mu        sync.RWMutex
+	rooms     map[string]*RoomHandler // local mode: in-process rooms
+	mode      string                  // "local" or "kubernetes"
+	k8sNS     string
 	roomImage string
 }
 
@@ -133,7 +133,180 @@ func (s *Server) JoinRoom(id string) error {
 	return s.store.IncrementPlayers(id)
 }
 
+// CleanupRoom removes the Kubernetes Pod and Service for a room and deletes
+// its database record. It is safe to call more than once.
+func (s *Server) CleanupRoom(roomID string) error {
+	if s.mode == "local" {
+		return s.store.DeleteRoom(roomID)
+	}
+
+	token, apiHost, apiPort, ns, err := s.k8sConfig()
+	if err != nil {
+		return err
+	}
+	for _, resource := range []string{"pods/pong-room-" + roomID, "services/pong-room-" + roomID} {
+		url := fmt.Sprintf("https://%s:%s/api/v1/namespaces/%s/%s", apiHost, apiPort, ns, resource)
+		req, err := http.NewRequest(http.MethodDelete, url, nil)
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Authorization", "Bearer "+string(token))
+		resp, err := k8sClient().Do(req)
+		if err != nil {
+			return fmt.Errorf("delete %s: %w", resource, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode >= 300 && resp.StatusCode != http.StatusNotFound {
+			return fmt.Errorf("delete %s returned %d", resource, resp.StatusCode)
+		}
+	}
+	return s.store.DeleteRoom(roomID)
+}
+
+func (s *Server) k8sConfig() (token []byte, apiHost, apiPort, ns string, err error) {
+	token, err = os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/token")
+	if err != nil || len(token) == 0 {
+		return nil, "", "", "", fmt.Errorf("kubernetes service account token not found — are we running in a K8s pod?")
+	}
+	apiHost = os.Getenv("KUBERNETES_SERVICE_HOST")
+	apiPort = os.Getenv("KUBERNETES_SERVICE_PORT")
+	if apiHost == "" {
+		apiHost = "kubernetes.default.svc"
+	}
+	if apiPort == "" {
+		apiPort = "443"
+	}
+	ns = s.k8sNS
+	if ns == "" {
+		nsData, _ := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
+		ns = strings.TrimSpace(string(nsData))
+	}
+	if ns == "" {
+		ns = "default"
+	}
+	return token, apiHost, apiPort, ns, nil
+}
+
+// ReconcileRooms removes terminal or orphaned room resources after an API
+// restart. Active rooms remain untouched.
+func (s *Server) ReconcileRooms() error {
+	if s.mode == "local" {
+		return nil
+	}
+	token, apiHost, apiPort, ns, err := s.k8sConfig()
+	if err != nil {
+		return err
+	}
+	url := fmt.Sprintf("https://%s:%s/api/v1/namespaces/%s/pods?labelSelector=role%%3Droom", apiHost, apiPort, ns)
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+string(token))
+	resp, err := k8sClient().Do(req)
+	if err != nil {
+		return err
+	}
+	body, readErr := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if readErr != nil {
+		return readErr
+	}
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("list room pods returned %d: %s", resp.StatusCode, body)
+	}
+
+	var result struct {
+		Items []struct {
+			Metadata struct {
+				Labels map[string]string `json:"labels"`
+			} `json:"metadata"`
+			Status struct {
+				Phase string `json:"phase"`
+			} `json:"status"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return err
+	}
+	for _, item := range result.Items {
+		roomID := item.Metadata.Labels["room-id"]
+		if roomID == "" {
+			continue
+		}
+		room, err := s.store.GetRoom(roomID)
+		if err != nil {
+			return err
+		}
+		if room == nil || room.Status == "finished" || item.Status.Phase == "Succeeded" || item.Status.Phase == "Failed" {
+			if err := s.CleanupRoom(roomID); err != nil {
+				log.Printf("reconcile: cleanup room %s: %v", roomID, err)
+			}
+		}
+	}
+
+	// A crash can leave a Service after its Pod has already disappeared. Clean
+	// those orphan Services as well; active room Services are retained.
+	url = fmt.Sprintf("https://%s:%s/api/v1/namespaces/%s/services?labelSelector=role%%3Droom", apiHost, apiPort, ns)
+	req, err = http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+string(token))
+	resp, err = k8sClient().Do(req)
+	if err != nil {
+		return err
+	}
+	body, readErr = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if readErr != nil {
+		return readErr
+	}
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("list room services returned %d: %s", resp.StatusCode, body)
+	}
+	var services struct {
+		Items []struct {
+			Metadata struct {
+				Labels map[string]string `json:"labels"`
+			} `json:"metadata"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal(body, &services); err != nil {
+		return err
+	}
+	for _, item := range services.Items {
+		roomID := item.Metadata.Labels["room-id"]
+		if roomID == "" {
+			continue
+		}
+		room, err := s.store.GetRoom(roomID)
+		if err != nil {
+			return err
+		}
+		if room == nil || room.Status == "finished" {
+			if err := s.CleanupRoom(roomID); err != nil {
+				log.Printf("reconcile: cleanup orphan service for room %s: %v", roomID, err)
+			}
+		}
+	}
+	return nil
+}
+
 // ---- HTTP Handlers ----
+
+// HandleRoomFinished removes a completed room's Pod, Service, and record.
+func (s *Server) HandleRoomFinished(w http.ResponseWriter, r *http.Request, roomID string) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := s.CleanupRoom(roomID); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
 
 // HandleListRooms returns JSON list of active rooms.
 func (s *Server) HandleListRooms(w http.ResponseWriter, r *http.Request) {
@@ -190,10 +363,10 @@ func (s *Server) HandleJoinRoom(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, map[string]string{
-		"room_id":   req.RoomID,
-		"ws_addr":   addr,
-		"ws_path":   "/rooms/" + req.RoomID + "/ws",
-		"mode":      s.mode,
+		"room_id": req.RoomID,
+		"ws_addr": addr,
+		"ws_path": "/rooms/" + req.RoomID + "/ws",
+		"mode":    s.mode,
 	})
 }
 
@@ -233,23 +406,34 @@ func (s *Server) createK8sPod(roomID string) (string, error) {
 		"apiVersion": "v1",
 		"kind":       "Pod",
 		"metadata": map[string]interface{}{
-			"name":   "pong-room-" + roomID,
+			"name": "pong-room-" + roomID,
 			"labels": map[string]string{
-				"app":      "cloudnativepong",
-				"room-id":  roomID,
-				"role":     "room",
+				"app":     "cloudnativepong",
+				"room-id": roomID,
+				"role":    "room",
 			},
 		},
 		"spec": map[string]interface{}{
 			"containers": []map[string]interface{}{
 				{
-					"name":  "pong-room",
-					"image": image,
-					"imagePullPolicy": "Never",
-					"args":  []string{"--mode=room", "--room-id=" + roomID, "--lobby-addr=" + s.lobbyAddr()},
+					"name":            "pong-room",
+					"image":           image,
+					"imagePullPolicy": "IfNotPresent",
+					"args":            []string{"--mode=room", "--room-id=" + roomID, "--lobby-addr=" + s.lobbyAddr()},
 					"ports": []map[string]interface{}{
 						{"containerPort": 8080},
 					},
+					"readinessProbe": map[string]interface{}{
+						"httpGet":             map[string]interface{}{"path": "/health", "port": 8080},
+						"initialDelaySeconds": 1,
+						"periodSeconds":       5,
+					},
+					"livenessProbe": map[string]interface{}{
+						"httpGet":             map[string]interface{}{"path": "/health", "port": 8080},
+						"initialDelaySeconds": 5,
+						"periodSeconds":       10,
+					},
+					"activeDeadlineSeconds": 7200,
 					"resources": map[string]interface{}{
 						"requests": map[string]string{
 							"cpu":    "50m",
@@ -262,7 +446,7 @@ func (s *Server) createK8sPod(roomID string) (string, error) {
 					},
 				},
 			},
-			"restartPolicy":            "Never",
+			"restartPolicy":                 "Never",
 			"terminationGracePeriodSeconds": 5,
 		},
 	}

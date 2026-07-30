@@ -37,9 +37,10 @@ func main() {
 	lobbyAddr := flag.String("lobby-addr", "", "Lobby address (for room mode)")
 	k8sNS := flag.String("namespace", "default", "Kubernetes namespace")
 	roomImage := flag.String("room-image", "cloudnativepong-room:latest", "Room container image")
+	dbPath := flag.String("db-path", ":memory:", "SQLite database path")
 	flag.Parse()
 
-	store, err := db.New(":memory:")
+	store, err := db.New(*dbPath)
 	if err != nil {
 		log.Fatalf("db init: %v", err)
 	}
@@ -59,18 +60,31 @@ func main() {
 		// Lobby-only mode: serves API, delegates rooms to K8s pods.
 		// Static files are served by nginx.
 		apiHandler := corsMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			switch r.URL.Path {
-			case "/api/rooms":
+			switch {
+			case r.URL.Path == "/api/rooms":
 				lobbySrv.HandleListRooms(w, r)
-			case "/api/rooms/create":
+			case r.URL.Path == "/api/rooms/create":
 				lobbySrv.HandleCreateRoom(w, r)
-			case "/api/rooms/join":
+			case r.URL.Path == "/api/rooms/join":
 				lobbySrv.HandleJoinRoom(w, r)
 			default:
 				http.NotFound(w, r)
 			}
 		}))
 		mux.Handle("/api/", apiHandler)
+		mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("ok\n"))
+		})
+		mux.HandleFunc("/internal/rooms/", func(w http.ResponseWriter, r *http.Request) {
+			parts := splitPath(r.URL.Path)
+			if len(parts) != 4 || parts[0] != "internal" || parts[1] != "rooms" || parts[3] != "finished" {
+				http.NotFound(w, r)
+				return
+			}
+			lobbySrv.HandleRoomFinished(w, r, parts[2])
+		})
+		go reconcileLobbyRooms(lobbySrv)
 		// WebSocket proxy: /rooms/{id}/ws -> room pod
 		mux.HandleFunc("/rooms/", func(w http.ResponseWriter, r *http.Request) {
 			proxyRoomWS(w, r, lobbySrv, store)
@@ -97,10 +111,22 @@ func main() {
 		}
 	}()
 
-	// Graceful shutdown with timeout
+	// Graceful shutdown with timeout. A room container exits after its game
+	// finishes so the lobby can remove the completed room resources.
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	<-quit
+	if *mode == "room" {
+		room := getOrCreateLocalRoom(*roomID)
+		select {
+		case <-room.done:
+			// Let clients receive the final state before the room container exits.
+			time.Sleep(3 * time.Second)
+			notifyRoomFinished(*roomID, *lobbyAddr)
+		case <-quit:
+		}
+	} else {
+		<-quit
+	}
 	log.Println("Shutting down...")
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -110,9 +136,12 @@ func main() {
 // ---- Local mode: lobby + rooms in one process ----
 
 type localRoom struct {
-	engine  *game.Engine
-	players [2]*websocket.Conn
-	mu      sync.Mutex
+	engine   *game.Engine
+	players  [2]*websocket.Conn
+	mu       sync.Mutex
+	loopOnce sync.Once
+	done     chan struct{}
+	doneOnce sync.Once
 }
 
 var localRooms sync.Map // roomID -> *localRoom
@@ -271,17 +300,13 @@ func handleRoomWS(w http.ResponseWriter, r *http.Request, roomID string) {
 		}
 	}()
 
-	// If this is player 2, start the game loop (or if already started, just listen)
+	// Player 2 joining triggers game start (or the existing waiting loop will
+	// observe both ready players). The loop is started once for every room so
+	// a single-player disconnect can also terminate an abandoned room.
 	if player == 2 {
-		// Player 2 joining triggers game start (both ready)
 		room.engine.PlayerReady(2)
 	}
-
-	// Wait a tick for both players to be ready, then start the loop
-	// Only one goroutine runs the tick loop
-	if player == 2 {
-		go runGameLoop(room)
-	}
+	room.loopOnce.Do(func() { go runGameLoop(room) })
 
 	// Keep connection alive (read loop above will exit on disconnect)
 	// This goroutine writes game state to the client
@@ -298,7 +323,9 @@ func handleRoomWS(w http.ResponseWriter, r *http.Request, roomID string) {
 			return
 		}
 		if state.Status == game.StatusFinished {
-			// Send final state and close
+			// Send final state and close. The room-mode process also watches the
+			// room completion signal and reports it to the lobby.
+			room.signalFinished()
 			time.Sleep(3 * time.Second)
 			localRooms.Delete(roomID)
 			return
@@ -313,6 +340,7 @@ func runGameLoop(room *localRoom) {
 	for range ticker.C {
 		state := room.engine.Tick()
 		if state.Status == game.StatusFinished {
+			room.signalFinished()
 			// Give clients time to see the final state
 			time.Sleep(3 * time.Second)
 			room.mu.Lock()
@@ -330,8 +358,43 @@ func runGameLoop(room *localRoom) {
 func getOrCreateLocalRoom(id string) *localRoom {
 	v, _ := localRooms.LoadOrStore(id, &localRoom{
 		engine: game.NewEngine(),
+		done:   make(chan struct{}),
 	})
 	return v.(*localRoom)
+}
+
+func (r *localRoom) signalFinished() {
+	r.doneOnce.Do(func() { close(r.done) })
+}
+
+func reconcileLobbyRooms(lobbySrv *lobby.Server) {
+	if err := lobbySrv.ReconcileRooms(); err != nil {
+		log.Printf("room reconciliation: %v", err)
+	}
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+	for range ticker.C {
+		if err := lobbySrv.ReconcileRooms(); err != nil {
+			log.Printf("room reconciliation: %v", err)
+		}
+	}
+}
+
+func notifyRoomFinished(roomID, lobbyAddr string) {
+	if lobbyAddr == "" {
+		return
+	}
+	url := "http://" + lobbyAddr + "/internal/rooms/" + roomID + "/finished"
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Post(url, "application/json", nil)
+	if err != nil {
+		log.Printf("room %s: failed to notify lobby: %v", roomID, err)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		log.Printf("room %s: lobby cleanup returned HTTP %d", roomID, resp.StatusCode)
+	}
 }
 
 func splitPath(path string) []string {
