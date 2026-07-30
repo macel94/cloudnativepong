@@ -13,8 +13,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  test:
-    name: E2E Tests
+  # ── Fast local-mode tests (single binary) ──────────────────────
+  e2e-local:
+    name: E2E (local mode)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -41,28 +42,86 @@ jobs:
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: playwright-report
+          name: playwright-report-local
           path: playwright-report/
 
-  container:
-    name: Container Image
+  # ── Build all Docker images ────────────────────────────────────
+  build-images:
+    name: Build images
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
 
-      - name: Build image
-        run: docker build -t cloudnativepong:latest .
+      - name: Build API image
+        run: docker build -t cloudnativepong-api:latest -f Dockerfile.api .
 
-      - name: Smoke-test container
+      - name: Build Room image
+        run: docker build -t cloudnativepong-room:latest -f Dockerfile.room .
+
+      - name: Build Static image
+        run: docker build -t cloudnativepong-static:latest -f Dockerfile.static .
+
+      - name: Build Gateway image
+        run: docker build -t cloudnativepong-gateway:latest -f Dockerfile.gateway .
+
+      - name: Show image sizes
+        run: docker images --filter=reference='cloudnativepong-*' --format "table {{.Repository}}\t{{.Size}}"
+
+  # ── Integration tests on k3d ───────────────────────────────────
+  e2e-k8s:
+    name: E2E (k3d)
+    needs: build-images
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Install Playwright
+        run: npm ci && npx playwright install chromium --with-deps
+
+      - name: Setup k3d
         run: |
-          docker run -d --rm -p 9090:8080 --name pong-ci cloudnativepong:latest --mode=local
-          sleep 2
-          curl -sf http://localhost:9090/api/rooms | grep '\[\]'
-          curl -sf -X POST http://localhost:9090/api/rooms/create \
+          curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
+          k3d cluster create pong --agents 2 --port 8080:80@loadbalancer
+
+      - name: Import images to k3d
+        run: |
+          # Rebuild and import (k3d uses its own containerd)
+          docker build -t cloudnativepong-api:latest -f Dockerfile.api .
+          docker build -t cloudnativepong-room:latest -f Dockerfile.room .
+          docker build -t cloudnativepong-static:latest -f Dockerfile.static .
+          docker build -t cloudnativepong-gateway:latest -f Dockerfile.gateway .
+          k3d image import cloudnativepong-api:latest cloudnativepong-room:latest cloudnativepong-static:latest cloudnativepong-gateway:latest -c pong
+
+      - name: Deploy to k3d
+        run: kubectl apply -f k8s/all.yaml
+
+      - name: Wait for pods
+        run: |
+          kubectl -n pong wait --for=condition=ready pod -l app=cloudnativepong --timeout=60s
+          kubectl -n pong get pods
+
+      - name: Smoke-test via gateway
+        run: |
+          curl -sf http://localhost:8080/ | grep '<!DOCTYPE'
+          curl -sf http://localhost:8080/api/rooms | grep '\[\]'
+          curl -sf -X POST http://localhost:8080/api/rooms/create \
             -H 'Content-Type: application/json' \
             -d '{"name":"ci-test"}' | grep '"id"'
-          curl -sf http://localhost:9090/ | grep '<!DOCTYPE'
-          docker stop pong-ci
 
-      - name: Show image size
-        run: docker images cloudnativepong --format "{{.Size}}"
+      - name: Run E2E tests against gateway
+        run: TEST_MODE=k8s npx playwright test --reporter=list
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: playwright-report-k8s
+          path: playwright-report/
+
+      - name: Cleanup
+        if: always()
+        run: k3d cluster delete pong

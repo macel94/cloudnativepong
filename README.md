@@ -9,72 +9,115 @@ A minimalist, horizontally-scalable PONG game running on Kubernetes. Each game r
 - **Blazing fast** — Go binary (~6 MB), `scratch` container image, sub-millisecond WebSocket messages.
 - **Embedded SQLite** — Pure Go, CGO-free, no external database needed.
 - **Self-cleaning** — Rooms auto-terminate when the game ends. No orphaned pods.
+- **Multi-service** — Gateway, static, API, room: each scales independently.
 
 ## 🏗 Architecture
 
 ```
-                   ┌──────────────┐
-                   │   Lobby Pod  │  (static, 1 replica)
-                   │  :8080       │
-                   └──────┬───────┘
-                          │ creates room pods via K8s API
-          ┌───────────────┼───────────────┐
-          ▼               ▼               ▼
-   ┌────────────┐  ┌────────────┐  ┌────────────┐
-   │  Room Pod  │  │  Room Pod  │  │  Room Pod  │  (dynamic, 1 per room)
-   │  :8080     │  │  :8080     │  │  :8080     │
-   └────────────┘  └────────────┘  └────────────┘
+                     ┌──────────────┐
+                     │   Gateway    │  (Caddy, 1 replica, NodePort)
+                     │   :80        │
+                     └──────┬───────┘
+        ┌───────────────────┼───────────────────┐
+        ▼                   ▼                   ▼
+ ┌──────────┐     ┌──────────────┐     ┌──────────────┐
+ │  Static   │     │   API/Lobby  │     │  Room Pods   │
+ │ (nginx)  │     │  (Go, 1 rep) │     │ (Go, dynamic)│
+ │  /        │     │  /api/*      │     │  /rooms/*    │
+ └──────────┘     └──────┬───────┘     └──────────────┘
+                         │ SQLite (PVC)
+                         │ K8s API (creates room pods)
 ```
 
-1. Players open the **lobby** → see active rooms → create or join a room.
-2. The lobby spawns a **room pod** via the Kubernetes API.
-3. Players connect directly to the room pod via **WebSocket**.
-4. Two players play PONG in real-time. The room pod terminates after the game ends.
+### Component responsibilities
+
+| Component | Image | Replicas | Purpose |
+|-----------|-------|----------|---------|
+| **Gateway** | `cloudnativepong-gateway` | 1 | Single entry point, routes by path |
+| **Static** | `cloudnativepong-static` | 1 | Serves HTML, CSS, JS via nginx |
+| **API** | `cloudnativepong-api` | 1 | Room CRUD, K8s pod orchestration, WebSocket proxy |
+| **Room** | `cloudnativepong-room` | N (dynamic) | One pod per game, runs PONG engine |
+
+### Routing
+
+```
+/              → Static (index.html)
+/api/*         → API (room management)
+/rooms/{id}/ws → API (proxies to room pod WebSocket)
+```
 
 ## 🚀 Quick Start
 
 ### Local Development (no Kubernetes)
 
 ```bash
-# Run everything in a single process
+# Single binary, lobby + rooms + static in one process
 go run . --mode=local
 
 # Open http://localhost:8080
 ```
 
-### On Kubernetes
+### Docker Compose (local multi-service)
 
 ```bash
-# Build and push the image
-docker build -t cloudnativepong:latest .
-# (push to your registry)
+# Build all images
+docker build -t cloudnativepong-api:latest -f Dockerfile.api .
+docker build -t cloudnativepong-room:latest -f Dockerfile.room .
+docker build -t cloudnativepong-static:latest -f Dockerfile.static .
+docker build -t cloudnativepong-gateway:latest -f Dockerfile.gateway .
+
+# Run with docker-compose (create a compose file or use k3d)
+```
+
+### On Kubernetes (k3d for local, any K8s for prod)
+
+```bash
+# Create a local K8s cluster (fast feedback loop)
+k3d cluster create pong --agents 2 --port 8080:80@loadbalancer
+
+# Build and load images
+podman build -t cloudnativepong-api:latest -f Dockerfile.api .
+podman build -t cloudnativepong-room:latest -f Dockerfile.room .
+podman build -t cloudnativepong-static:latest -f Dockerfile.static .
+podman build -t cloudnativepong-gateway:latest -f Dockerfile.gateway .
+k3d image import cloudnativepong-api:latest cloudnativepong-room:latest \
+  cloudnativepong-static:latest cloudnativepong-gateway:latest -c pong
 
 # Deploy
-kubectl apply -f k8s/
+kubectl apply -f k8s/all.yaml
+
+# Open http://localhost:8080
 ```
 
 ## 🧪 Testing
 
 ```bash
-# Install Playwright
-npm install
-
-# Run E2E tests
+# Local mode (fast dev)
 npx playwright test
+
+# K8s mode (full integration)
+TEST_MODE=k8s npx playwright test
 ```
 
 ## 📁 Project Structure
 
 ```
 .
-├── main.go              # Entry point, routing, CLI flags
+├── main.go              # Entry point, routing, CORS, WS proxy
 ├── lobby/               # Lobby server (room management, K8s integration)
 ├── game/                # PONG game engine (server-side state machine)
 ├── db/                  # SQLite database layer
 ├── static/              # Frontend (HTML, CSS, vanilla JS)
+│   └── nginx.conf       # nginx config for static pod
+├── gateway/             # Gateway config
+│   └── Caddyfile        # Caddy routing rules
 ├── k8s/                 # Kubernetes manifests
+│   └── all.yaml         # All resources: gateway, static, api, RBAC, ConfigMap
 ├── tests/               # Playwright E2E tests
-├── Dockerfile           # Multi-stage, scratch-based
+├── Dockerfile.api       # Go binary → scratch (lobby mode)
+├── Dockerfile.room      # Go binary → scratch (room mode)
+├── Dockerfile.static    # nginx:alpine + static files
+├── Dockerfile.gateway   # caddy:alpine + Caddyfile
 └── README.md
 ```
 
@@ -82,12 +125,15 @@ npx playwright test
 
 | Layer          | Choice                        | Why                                      |
 | -------------- | ----------------------------- | ---------------------------------------- |
-| Language       | Go 1.22+                      | Single binary, no runtime, tiny images   |
+| Language       | Go 1.25+                      | Single binary, no runtime, tiny images   |
 | Database       | SQLite (modernc.org/sqlite)   | Pure Go, embedded, zero ops              |
 | WebSocket      | gorilla/websocket             | Battle-tested, minimal API               |
-| Container      | `scratch`                     | Smallest possible image (~6 MB)          |
+| Gateway        | Caddy                         | Auto-HTTPS, simple config, HTTP/2        |
+| Static Server  | nginx:alpine                  | Battle-tested, tiny footprint            |
+| Container      | `scratch` (Go), `alpine` (others) | Smallest possible images              |
 | Frontend       | Vanilla JS + Canvas           | No framework, instant load               |
 | E2E Testing    | Playwright + TypeScript       | Reliable, cross-browser                  |
+| Local K8s      | k3d                           | Lightweight, fast startup (~10s)         |
 
 ## 🎮 How to Play
 
