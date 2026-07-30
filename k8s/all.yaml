@@ -1,0 +1,375 @@
+# Kubernetes manifests for Cloud Native Pong.
+#
+# Quick deploy:
+#   kubectl apply -f k8s/all.yaml
+#
+# What this creates:
+#   - namespace: pong
+#   - Gateway: reverse-proxy entry point (NodePort)
+#   - Static: serves frontend assets (ClusterIP)
+#   - API: lobby server with SQLite persistence (ClusterIP)
+#   - RBAC: ServiceAccount + Role + RoleBinding for K8s pod management
+#   - ConfigMap: room pod template for the API to create game pods
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: pong
+
+# ──────────────────────────────────────────────
+# Gateway — reverse proxy / entry point
+# Routes /api/* → API service, /* → Static service
+# Exposed externally via NodePort
+# ──────────────────────────────────────────────
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pong-gateway
+  namespace: pong
+  labels:
+    app: cloudnativepong
+    component: gateway
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cloudnativepong
+      component: gateway
+  template:
+    metadata:
+      labels:
+        app: cloudnativepong
+        component: gateway
+    spec:
+      containers:
+        - name: gateway
+          image: cloudnativepong-gateway:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+              name: http
+          env:
+            - name: STATIC_ADDR
+              value: "pong-static.pong.svc.cluster.local:80"
+            - name: API_ADDR
+              value: "pong-api.pong.svc.cluster.local:8080"
+          resources:
+            requests:
+              cpu: 50m
+              memory: 16Mi
+            limits:
+              cpu: 200m
+              memory: 32Mi
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 2
+            periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pong-gateway
+  namespace: pong
+  labels:
+    app: cloudnativepong
+    component: gateway
+spec:
+  selector:
+    app: cloudnativepong
+    component: gateway
+  ports:
+    - port: 8080
+      targetPort: 8080
+      nodePort: 30080
+      name: http
+  type: NodePort
+
+# ──────────────────────────────────────────────
+# Static — serves frontend HTML/CSS/JS assets
+# Internal ClusterIP only — accessed via gateway
+# ──────────────────────────────────────────────
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pong-static
+  namespace: pong
+  labels:
+    app: cloudnativepong
+    component: static
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cloudnativepong
+      component: static
+  template:
+    metadata:
+      labels:
+        app: cloudnativepong
+        component: static
+    spec:
+      containers:
+        - name: static
+          image: cloudnativepong-static:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 80
+              name: http
+          resources:
+            requests:
+              cpu: 10m
+              memory: 8Mi
+            limits:
+              cpu: 100m
+              memory: 16Mi
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 2
+            periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pong-static
+  namespace: pong
+  labels:
+    app: cloudnativepong
+    component: static
+spec:
+  selector:
+    app: cloudnativepong
+    component: static
+  ports:
+    - port: 80
+      targetPort: 80
+      name: http
+  type: ClusterIP
+
+# ──────────────────────────────────────────────
+# API (Lobby) — room management, game logic
+# Persists room state to a SQLite database on a
+# PersistentVolumeClaim (1 Gi).
+# Has RBAC permissions to create/delete room pods.
+# ──────────────────────────────────────────────
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pong-api-data
+  namespace: pong
+  labels:
+    app: cloudnativepong
+    component: api
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pong-api
+  namespace: pong
+  labels:
+    app: cloudnativepong
+    component: api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cloudnativepong
+      component: api
+  template:
+    metadata:
+      labels:
+        app: cloudnativepong
+        component: api
+    spec:
+      serviceAccountName: pong-lobby
+      containers:
+        - name: api
+          image: cloudnativepong-api:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - "--mode=lobby"
+            - "--namespace=pong"
+            - "--room-image=cloudnativepong:latest"
+          ports:
+            - containerPort: 8080
+              name: http
+          env:
+            - name: LOBBY_HOST
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: ROOM_POD_TEMPLATE
+              value: /etc/room-template/template.json
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: room-template
+              mountPath: /etc/room-template
+              readOnly: true
+          resources:
+            requests:
+              cpu: 50m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 64Mi
+          readinessProbe:
+            httpGet:
+              path: /api/rooms
+              port: 8080
+            initialDelaySeconds: 2
+            periodSeconds: 5
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: pong-api-data
+        - name: room-template
+          configMap:
+            name: pong-room-template
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pong-api
+  namespace: pong
+  labels:
+    app: cloudnativepong
+    component: api
+spec:
+  selector:
+    app: cloudnativepong
+    component: api
+  ports:
+    - port: 8080
+      targetPort: 8080
+      name: http
+  type: ClusterIP
+
+# ──────────────────────────────────────────────
+# RBAC — ServiceAccount, Role, and RoleBinding
+# Grants the lobby (API) pod permissions to
+# create, list, watch, and delete pods in the
+# pong namespace (dynamically spawning room pods).
+# ──────────────────────────────────────────────
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: pong-lobby
+  namespace: pong
+  labels:
+    app: cloudnativepong
+    component: api
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: pong-pod-manager
+  namespace: pong
+  labels:
+    app: cloudnativepong
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: pong-lobby-pod-manager
+  namespace: pong
+  labels:
+    app: cloudnativepong
+subjects:
+  - kind: ServiceAccount
+    name: pong-lobby
+    namespace: pong
+roleRef:
+  kind: Role
+  name: pong-pod-manager
+  apiGroup: rbac.authorization.k8s.io
+
+# ──────────────────────────────────────────────
+# Room Pod Template — ConfigMap
+# The API reads this JSON to know what pod spec
+# to POST to the K8s API when spawning a game
+# room. Each room pod runs in "room" mode and
+# connects back to the lobby for WebSocket relay.
+# ──────────────────────────────────────────────
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pong-room-template
+  namespace: pong
+  labels:
+    app: cloudnativepong
+data:
+  template.json: |
+    {
+      "apiVersion": "v1",
+      "kind": "Pod",
+      "metadata": {
+        "generateName": "pong-room-",
+        "labels": {
+          "app": "cloudnativepong",
+          "role": "room"
+        }
+      },
+      "spec": {
+        "containers": [
+          {
+            "name": "pong-room",
+            "image": "cloudnativepong:latest",
+            "args": [
+              "--mode=room",
+              "--room-id=${ROOM_ID}",
+              "--lobby-addr=${LOBBY_ADDR}"
+            ],
+            "ports": [
+              { "containerPort": 8080 }
+            ],
+            "resources": {
+              "requests": {
+                "cpu": "50m",
+                "memory": "32Mi"
+              },
+              "limits": {
+                "cpu": "200m",
+                "memory": "64Mi"
+              }
+            },
+            "env": [
+              {
+                "name": "LOBBY_HOST",
+                "valueFrom": {
+                  "fieldRef": {
+                    "fieldPath": "status.podIP"
+                  }
+                }
+              }
+            ]
+          }
+        ],
+        "restartPolicy": "Never",
+        "terminationGracePeriodSeconds": 5
+      }
+    }

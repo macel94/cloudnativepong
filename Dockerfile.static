@@ -1,0 +1,36 @@
+# ── Cloud Native Pong — Static File Server ──────────────────────────
+# Serves HTML, CSS, JS via nginx:alpine on port 80.
+#
+# Build:
+#   docker build -t cloudnativepong-static:latest -f Dockerfile.static .
+#
+# Run:
+#   docker run --rm -p 8080:80 cloudnativepong-static:latest
+
+FROM docker.io/nginx:alpine
+
+# Metadata labels (Open Containers Initiative)
+LABEL org.opencontainers.image.title="Cloud Native Pong — Static Server" \
+      org.opencontainers.image.description="Serves the Pong frontend (HTML, CSS, JS) via nginx with CORS and WebSocket headers" \
+      org.opencontainers.image.version="1.0.0" \
+      org.opencontainers.image.created="2025-07-30T00:00:00Z" \
+      org.opencontainers.image.source="https://github.com/cloudnativepong/cloudnativepong" \
+      org.opencontainers.image.url="https://cloudnativepong.dev" \
+      org.opencontainers.image.vendor="Cloud Native Pong" \
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.ref.name="latest"
+
+# Remove default nginx static files
+RUN rm -rf /usr/share/nginx/html/*
+
+# Copy static content
+COPY static/ /usr/share/nginx/html/
+
+# Copy nginx configuration
+COPY static/nginx.conf /etc/nginx/conf.d/default.conf
+
+# Port exposed to the gateway
+EXPOSE 80
+
+# Run nginx in foreground
+CMD ["nginx", "-g", "daemon off;"]

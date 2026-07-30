@@ -23,15 +23,14 @@
     const H = canvas.height;
 
     // Build WebSocket URL
+    // Both local and gateway modes use the gateway path: /rooms/{id}/ws
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     let wsURL;
     if (mode === 'local') {
-        wsURL = protocol + '//' + window.location.host + '/room/' + roomId + '/ws';
+        wsURL = protocol + '//' + window.location.host + '/rooms/' + roomId + '/ws';
     } else {
-        // In K8s mode, the game page connects directly to the room pod.
-        // The lobby passes the ws_addr, but since we're on game.html we reconstruct it.
-        // For simplicity, use the same host in K8s mode (room pod serves /ws).
-        wsURL = protocol + '//' + window.location.host + '/ws';
+        // In K8s mode, the gateway routes /rooms/{id}/ws to the correct room pod.
+        wsURL = protocol + '//' + window.location.host + '/rooms/' + roomId + '/ws';
     }
 
     function connect() {

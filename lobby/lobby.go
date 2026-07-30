@@ -90,6 +90,8 @@ func (s *Server) RegisterLocalRoom(id string, handler *RoomHandler) {
 }
 
 // GetRoomAddr returns the WebSocket address for a room.
+// In local mode, returns the in-process handler address.
+// In kubernetes mode, returns the stable ClusterIP Service DNS name.
 func (s *Server) GetRoomAddr(id string) (string, error) {
 	room, err := s.store.GetRoom(id)
 	if err != nil || room == nil {
@@ -104,7 +106,12 @@ func (s *Server) GetRoomAddr(id string) (string, error) {
 		}
 		return h.Addr, nil
 	}
-	return room.PodIP + ":8080", nil
+	// Return the stable ClusterIP Service DNS name
+	ns := s.k8sNS
+	if ns == "" {
+		ns = "default"
+	}
+	return fmt.Sprintf("pong-room-%s.%s.svc.cluster.local:8080", id, ns), nil
 }
 
 // ListRooms returns all active rooms.
@@ -183,6 +190,7 @@ func (s *Server) HandleJoinRoom(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]string{
 		"room_id":   req.RoomID,
 		"ws_addr":   addr,
+		"ws_path":   "/rooms/" + req.RoomID + "/ws",
 		"mode":      s.mode,
 	})
 }
@@ -254,6 +262,12 @@ func (s *Server) createK8sPod(roomID string) (string, error) {
 		},
 	}
 
+	// Create the ClusterIP Service for the room (before the pod, so DNS is ready)
+	if err := s.createK8sService(roomID, apiHost, apiPort, ns, token); err != nil {
+		log.Printf("Warning: failed to create service for room %s: %v", roomID, err)
+		// Non-fatal: the pod IP can still be used directly
+	}
+
 	body, _ := json.Marshal(pod)
 	url := fmt.Sprintf("https://%s:%s/api/v1/namespaces/%s/pods", apiHost, apiPort, ns)
 
@@ -296,6 +310,65 @@ func (s *Server) createK8sPod(roomID string) (string, error) {
 	}
 
 	return podIP, nil
+}
+
+// createK8sService creates a ClusterIP Service for a room pod so it has a
+// stable DNS name: pong-room-{id}.{namespace}.svc.cluster.local
+func (s *Server) createK8sService(roomID, apiHost, apiPort, ns string, token []byte) error {
+	svc := map[string]interface{}{
+		"apiVersion": "v1",
+		"kind":       "Service",
+		"metadata": map[string]interface{}{
+			"name": "pong-room-" + roomID,
+			"labels": map[string]string{
+				"app":     "cloudnativepong",
+				"room-id": roomID,
+				"role":    "room",
+			},
+		},
+		"spec": map[string]interface{}{
+			"selector": map[string]string{
+				"app":     "cloudnativepong",
+				"room-id": roomID,
+				"role":    "room",
+			},
+			"ports": []map[string]interface{}{
+				{
+					"protocol":   "TCP",
+					"port":       8080,
+					"targetPort": 8080,
+				},
+			},
+			"type": "ClusterIP",
+		},
+	}
+
+	body, _ := json.Marshal(svc)
+	url := fmt.Sprintf("https://%s:%s/api/v1/namespaces/%s/services", apiHost, apiPort, ns)
+
+	req, err := http.NewRequest("POST", url, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if len(token) > 0 {
+		req.Header.Set("Authorization", "Bearer "+string(token))
+	}
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("k8s service api call: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("k8s service api returned %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	log.Printf("Created ClusterIP Service for room %s (pong-room-%s.%s.svc.cluster.local)", roomID, roomID, ns)
+	return nil
 }
 
 // lobbyAddr returns the lobby's address for room pods to report back.

@@ -1,0 +1,54 @@
+# ── Cloud Native Pong — Room Server ────────────────────────────────
+# Multi-stage build: Go binary from golang:1.25-alpine → scratch.
+# Runs in --mode=room for dedicated game room pods.
+# Room ID and lobby address are injected at runtime via --room-id and --lobby-addr.
+#
+# Build:
+#   docker build -t cloudnativepong-room:latest -f Dockerfile.room .
+#
+# Run:
+#   docker run --rm -p 8080:8080 \
+#     cloudnativepong-room:latest \
+#     --room-id=abc123 --lobby-addr=lobby:8080
+
+# ── Build Stage ────────────────────────────────────────────────────
+FROM docker.io/golang:1.25-alpine AS builder
+
+RUN apk add --no-cache ca-certificates tzdata
+
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+    go build -ldflags="-s -w" -o /pong .
+
+# ── Final Stage ────────────────────────────────────────────────────
+FROM scratch
+
+# Metadata labels
+LABEL org.opencontainers.image.title="Cloud Native Pong — Room Server" \
+      org.opencontainers.image.description="Dedicated game room pod: runs a single Pong game instance" \
+      org.opencontainers.image.version="1.0.0" \
+      org.opencontainers.image.created="2025-07-30T00:00:00Z" \
+      org.opencontainers.image.source="https://github.com/cloudnativepong/cloudnativepong" \
+      org.opencontainers.image.url="https://cloudnativepong.dev" \
+      org.opencontainers.image.vendor="Cloud Native Pong" \
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.ref.name="latest"
+
+# Timezone data for proper log timestamps
+COPY --from=builder /usr/share/zoneinfo /usr/share/zoneinfo
+
+# CA certs for K8s API calls (room pods generally don't need these,
+# but keeping them for consistency ensures the image is self-sufficient)
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+
+# Binary
+COPY --from=builder /pong /pong
+
+EXPOSE 8080
+
+ENTRYPOINT ["/pong", "--mode=room"]

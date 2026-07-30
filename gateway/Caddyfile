@@ -1,0 +1,62 @@
+# ── Cloud Native Pong — Gateway Caddyfile ──────────────────────────
+# Routes external traffic to the static file server, API server, and
+# WebSocket endpoints. Caddy automatically handles HTTP/2, HTTPS,
+# and WebSocket upgrades.
+#
+# To use with Docker Compose or K8s, ensure service names resolve:
+#   static  → the nginx static server container
+#   api     → the lobby API server container
+#
+# Reference:
+#   https://caddyserver.com/docs/caddyfile
+
+# Global options
+{
+    # Default admin API is localhost:2019; disable for production
+    admin off
+}
+
+# Listen on port 80 for external traffic
+:80 {
+    # ── API endpoints ─────────────────────────────────────────────
+    # All /api/* requests go to the lobby API server.
+    # Must come before the catch-all / handler.
+    handle /api/* {
+        reverse_proxy api:8080
+    }
+
+    # ── WebSocket / rooms ─────────────────────────────────────────
+    # Rooms WebSocket is handled by the lobby API, which proxies to
+    # room pods. Caddy handles WebSocket upgrades automatically.
+    handle /rooms/* {
+        reverse_proxy api:8080
+    }
+
+    # ── Static files (HTML, CSS, JS) ──────────────────────────────
+    # Specific file paths first, then catch-all for everything else.
+    handle /style.css {
+        reverse_proxy static:80
+    }
+    handle /lobby.js {
+        reverse_proxy static:80
+    }
+    handle /game.js {
+        reverse_proxy static:80
+    }
+    handle /index.html {
+        reverse_proxy static:80
+    }
+    handle /game.html {
+        reverse_proxy static:80
+    }
+    handle / {
+        reverse_proxy static:80
+    }
+
+    # ── Fallback ──────────────────────────────────────────────────
+    # If no handle matches, return 404
+    @404 {
+        not path / /style.css /lobby.js /game.js /index.html /game.html /api/* /rooms/*
+    }
+    respond @404 404
+}

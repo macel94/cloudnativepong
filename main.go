@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"sync"
@@ -50,11 +51,25 @@ func main() {
 		setupLocalRoutes(mux, lobbySrv, store)
 
 	case "lobby":
-		// Lobby-only mode: serves UI + API, delegates rooms to K8s pods.
-		mux.HandleFunc("/api/rooms", lobbySrv.HandleListRooms)
-		mux.HandleFunc("/api/rooms/create", lobbySrv.HandleCreateRoom)
-		mux.HandleFunc("/api/rooms/join", lobbySrv.HandleJoinRoom)
-		mux.Handle("/", http.FileServer(http.Dir("./static")))
+		// Lobby-only mode: serves API, delegates rooms to K8s pods.
+		// Static files are served by nginx.
+		apiHandler := corsMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/api/rooms":
+				lobbySrv.HandleListRooms(w, r)
+			case "/api/rooms/create":
+				lobbySrv.HandleCreateRoom(w, r)
+			case "/api/rooms/join":
+				lobbySrv.HandleJoinRoom(w, r)
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		mux.Handle("/api/", apiHandler)
+		// WebSocket proxy: /rooms/{id}/ws -> room pod
+		mux.HandleFunc("/rooms/", func(w http.ResponseWriter, r *http.Request) {
+			proxyRoomWS(w, r, lobbySrv, store)
+		})
 
 	case "room":
 		// Room-only mode: runs a single game room.
@@ -149,7 +164,7 @@ func setupLocalRoutes(mux *http.ServeMux, lobbySrv *lobby.Server, store *db.Stor
 		})
 	})
 
-	// Room WebSocket endpoint
+	// Room WebSocket endpoint (both legacy and gateway paths)
 	mux.HandleFunc("/room/", func(w http.ResponseWriter, r *http.Request) {
 		// Parse /room/{id}/ws
 		path := r.URL.Path
@@ -161,7 +176,19 @@ func setupLocalRoutes(mux *http.ServeMux, lobbySrv *lobby.Server, store *db.Stor
 		handleRoomWS(w, r, parts[1])
 	})
 
-	// Static files
+	// Gateway WebSocket route: /rooms/{id}/ws
+	mux.HandleFunc("/rooms/", func(w http.ResponseWriter, r *http.Request) {
+		// Parse /rooms/{id}/ws
+		path := r.URL.Path
+		parts := splitPath(path)
+		if len(parts) < 3 || parts[2] != "ws" {
+			http.NotFound(w, r)
+			return
+		}
+		handleRoomWS(w, r, parts[1])
+	})
+
+	// Static files (local mode only — served by nginx in K8s)
 	mux.Handle("/", http.FileServer(http.Dir("./static")))
 }
 
@@ -327,4 +354,98 @@ func split(s string, sep byte) []string {
 		parts = append(parts, s[start:])
 	}
 	return parts
+}
+
+// ---- CORS Middleware ----
+
+// corsMiddleware wraps an http.Handler with CORS headers for API routes.
+func corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// ---- WebSocket Proxy (lobby mode) ----
+
+// proxyRoomWS proxies a WebSocket connection from the gateway to a room pod.
+// The gateway receives at /rooms/{id}/ws and forwards to the room pod's /ws.
+func proxyRoomWS(w http.ResponseWriter, r *http.Request, lobbySrv *lobby.Server, store *db.Store) {
+	// Parse /rooms/{id}/ws
+	parts := splitPath(r.URL.Path)
+	if len(parts) < 3 || parts[2] != "ws" {
+		http.NotFound(w, r)
+		return
+	}
+	roomID := parts[1]
+
+	// Look up the room pod address
+	addr, err := lobbySrv.GetRoomAddr(roomID)
+	if err != nil {
+		log.Printf("proxy: room %s not found: %v", roomID, err)
+		http.Error(w, "room not found", http.StatusNotFound)
+		return
+	}
+
+	log.Printf("proxy: proxying WS for room %s to %s", roomID, addr)
+
+	// Upgrade the incoming connection
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Printf("proxy: ws upgrade error: %v", err)
+		return
+	}
+	defer conn.Close()
+
+	// Dial the target room pod
+	targetURL := url.URL{Scheme: "ws", Host: addr, Path: "/ws"}
+	targetConn, _, err := websocket.DefaultDialer.Dial(targetURL.String(), nil)
+	if err != nil {
+		log.Printf("proxy: dial target %s: %v", targetURL.String(), err)
+		return
+	}
+	defer targetConn.Close()
+
+	// Bidirectional copy: messages from client -> target, and target -> client
+	errCh := make(chan error, 2)
+
+	// Client -> Target
+	go func() {
+		for {
+			msgType, msg, err := conn.ReadMessage()
+			if err != nil {
+				errCh <- err
+				return
+			}
+			if err := targetConn.WriteMessage(msgType, msg); err != nil {
+				errCh <- err
+				return
+			}
+		}
+	}()
+
+	// Target -> Client
+	go func() {
+		for {
+			msgType, msg, err := targetConn.ReadMessage()
+			if err != nil {
+				errCh <- err
+				return
+			}
+			if err := conn.WriteMessage(msgType, msg); err != nil {
+				errCh <- err
+				return
+			}
+		}
+	}()
+
+	// Wait for one side to disconnect
+	<-errCh
+	log.Printf("proxy: WS connection closed for room %s", roomID)
 }
