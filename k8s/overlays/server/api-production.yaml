@@ -4,9 +4,6 @@ metadata:
   name: pong-api
   namespace: pong
 spec:
-  strategy:
-    type: Recreate
-    rollingUpdate: null
   template:
     spec:
       containers:
@@ -25,4 +22,4 @@ metadata:
 spec:
   resources:
     requests:
-      storage: 10Gi
+      storage: 1Gi

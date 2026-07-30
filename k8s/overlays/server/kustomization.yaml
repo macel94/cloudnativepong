@@ -25,6 +25,13 @@ images:
 
 patches:
   - path: deployment-pull-policy.yaml
+  - path: api-recreate-strategy.yaml
+    target:
+      group: apps
+      version: v1
+      kind: Deployment
+      name: pong-api
+      namespace: pong
   - path: api-production.yaml
   - path: room-template.yaml
   - path: stateless-replicas.yaml
