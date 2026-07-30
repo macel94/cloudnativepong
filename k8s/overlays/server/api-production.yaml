@@ -14,7 +14,7 @@ spec:
           args:
             - --mode=lobby
             - --namespace=pong
-            - --room-image=ghcr.io/macel94/cloudnativepong-room:sha-55b5259a71f8b66b59dfb08d46d8cad64423b2d8
+            - --room-image=ghcr.io/macel94/cloudnativepong-room:sha-be80b7f847bac9a2c6b519cfd198d1eb3aa061d9
             - --db-path=/data/pong.db
 ---
 apiVersion: v1
