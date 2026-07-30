@@ -1,28 +1,4 @@
-apiVersion: kustomize.toolkit.fluxcd.io/v1
+apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
-metadata:
-  name: cloudnativepong
-  namespace: flux-system
-spec:
-  interval: 1m
-  retryInterval: 30s
-  timeout: 5m
-  prune: true
-  wait: true
-  path: ./k8s/overlays/server
-  sourceRef:
-    kind: GitRepository
-    name: flux-system
-  healthChecks:
-    - apiVersion: apps/v1
-      kind: Deployment
-      name: pong-api
-      namespace: pong
-    - apiVersion: apps/v1
-      kind: Deployment
-      name: pong-gateway
-      namespace: pong
-    - apiVersion: apps/v1
-      kind: Deployment
-      name: pong-static
-      namespace: pong
+resources:
+  - ../../../k8s/overlays/server
