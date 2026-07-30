@@ -103,7 +103,11 @@ jobs:
 
       - name: Wait for pods
         run: |
-          kubectl -n pong wait --for=condition=ready pod -l app=cloudnativepong --timeout=60s
+          if ! kubectl -n pong wait --for=condition=ready pod -l app=cloudnativepong --timeout=60s; then
+            kubectl -n pong get pods -o wide
+            kubectl -n pong describe pods
+            exit 1
+          fi
           kubectl -n pong get pods
 
       - name: Smoke-test via gateway

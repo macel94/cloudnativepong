@@ -45,7 +45,7 @@ spec:
     spec:
       containers:
         - name: gateway
-          image: localhost/cloudnativepong-gateway:latest
+          image: cloudnativepong-gateway:latest
           imagePullPolicy: Never
           ports:
             - containerPort: 80
@@ -110,7 +110,7 @@ spec:
     spec:
       containers:
         - name: static
-          image: localhost/cloudnativepong-static:latest
+          image: cloudnativepong-static:latest
           imagePullPolicy: Never
           ports:
             - containerPort: 80
@@ -192,12 +192,12 @@ spec:
       serviceAccountName: pong-lobby
       containers:
         - name: api
-          image: localhost/cloudnativepong-api:latest
+          image: cloudnativepong-api:latest
           imagePullPolicy: Never
           args:
             - "--mode=lobby"
             - "--namespace=pong"
-            - "--room-image=localhost/cloudnativepong-room:latest"
+            - "--room-image=cloudnativepong-room:latest"
           ports:
             - containerPort: 8080
               name: http
@@ -333,7 +333,7 @@ data:
         "containers": [
           {
             "name": "pong-room",
-            "image": "localhost/cloudnativepong-room:latest",
+            "image": "cloudnativepong-room:latest",
             "args": [
               "--mode=room",
               "--room-id=${ROOM_ID}",

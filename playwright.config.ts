@@ -26,7 +26,6 @@ export default defineConfig({
   // K8s tests use the already-running gateway; only local tests start a binary.
   webServer: isK8s ? undefined : {
     command: './cloudnativepong --mode=local',
-    cwd: '/root/sources/cloudnativepong',
     port: 8080,
     reuseExistingServer: !isCI,
   },
