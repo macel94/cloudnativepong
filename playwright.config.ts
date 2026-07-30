@@ -1,6 +1,8 @@
 import { defineConfig, devices } from '@playwright/test';
 
 const isCI = !!process.env.CI;
+const isK8s = process.env.TEST_MODE === 'k8s';
+const baseURL = process.env.BASE_URL || 'http://localhost:8080';
 
 export default defineConfig({
   testDir: './tests',
@@ -12,7 +14,7 @@ export default defineConfig({
   workers: isCI ? 1 : undefined,
   reporter: isCI ? 'list' : 'html',
   use: {
-    baseURL: 'http://localhost:8080',
+    baseURL,
     trace: 'on-first-retry',
   },
   projects: [
@@ -21,7 +23,8 @@ export default defineConfig({
       use: { ...devices['Desktop Chrome'] },
     },
   ],
-  webServer: {
+  // K8s tests use the already-running gateway; only local tests start a binary.
+  webServer: isK8s ? undefined : {
     command: './cloudnativepong --mode=local',
     cwd: '/root/sources/cloudnativepong',
     port: 8080,

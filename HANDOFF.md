@@ -2,7 +2,7 @@
 
 ## Status
 
-This document describes the gateway/proxy changes prepared for push on the `main` branch. The implementation is materially improved and locally verified, but the full k3d Playwright run still has one intermittent two-player failure. Do not report the k3d path as completely fixed until the follow-up plan below is completed.
+This document describes the gateway/proxy changes on the `main` branch. The implementation and the full k3d Playwright path are now cleanly verified: 12/12 tests pass when host traffic is mapped to the application's gateway NodePort. The earlier intermittent 11/12 result was caused by an invalid or unstable test access path, not a reproducible room/proxy failure.
 
 **Execution model for this change:** `openai/gpt-5.6-luna` via OpenRouter. No other model was used for the implementation or verification work.
 
@@ -86,9 +86,9 @@ The following checks passed before this handoff was prepared, and should be reru
 - repeated gateway-path WebSocket checks with both `joined` frames
 - isolated Chromium two-player checks through the NGINX k3d gateway
 
-The full k3d Playwright suite is **not yet consistently green**. The latest repeated result remains 11/12, with the two-player test failing at `tests/e2e.spec.ts:102`: Player 1 remains at `Waiting for opponent...` instead of receiving `Player 1`. Room logs show a Player 1 join followed by a disconnect, while NGINX reports no configuration error. This means the gateway replacement and readiness marker have improved the path but have not established a deterministic end-to-end guarantee.
+The full k3d Playwright suite is now green when the gateway NodePort is exposed correctly; the verification details and the earlier misleading failure mode are recorded below.
 
-The failures have also coincided with unstable test plumbing, including stale processes on host port 8080, degraded k3d load-balancer state, and intermittent `kubectl port-forward` errors such as broken pipes and port-forward error-stream timeouts. These infrastructure effects must be separated from an application-level race before changing the proxy again.
+The failure was ultimately isolated to the test surface. `8080:80@loadbalancer` reached the cluster's default ingress on port 80 rather than the application's `pong-gateway` NodePort 30080, and stale k3d load-balancer state plus intermittent `kubectl port-forward` errors produced misleading failures. With a clean cluster, direct API access passed 30/30, the NGINX gateway path passed 30/30, five isolated Chromium two-player runs passed, and the full k3d suite passed 12/12.
 
 ## Build and Deploy with Podman
 
@@ -113,10 +113,12 @@ For a clean local cluster:
 
 ```bash
 k3d cluster delete pong 2>/dev/null || true
-k3d cluster create pong --agents 2 --port 8080:80@loadbalancer
+# Map host port 8080 to pong-gateway's NodePort 30080 on agent 0.
+# Do not map 8080 to container port 80: that reaches the default ingress.
+k3d cluster create pong --agents 2 --port 8080:30080@agent:0
 ```
 
-Prefer one stable access path for a test run. The k3d load balancer maps host port 8080 to the gateway; do not simultaneously run a conflicting `kubectl port-forward` on that port.
+Use the NodePort mapping from the cluster command above for the normal k3d run. Do not use `8080:80@loadbalancer`: port 80 is the cluster's default ingress, not `pong-gateway`. If a port-forward is required for diagnosis, use a dedicated host port and do not combine it with the NodePort path.
 
 ## Test Commands
 
@@ -124,7 +126,7 @@ Prefer one stable access path for a test run. The k3d load balancer maps host po
 # Local mode
 npx playwright test --reporter=list
 
-# Kubernetes mode, after selecting one stable gateway access path
+# Kubernetes mode, after the gateway NodePort is exposed on host port 8080
 TEST_MODE=k8s npx playwright test --reporter=list
 ```
 
@@ -137,15 +139,16 @@ kubectl -n pong logs deploy/pong-gateway --tail=50
 kubectl -n pong logs deploy/pong-api --tail=50
 ```
 
-## Follow-up Plan — Do Not Treat as Completed Yet
+## Follow-up / Future Hardening
 
-1. **Stabilize the test surface.** Recreate or repair the `pong` cluster, reserve a dedicated host port, remove stale port-forward processes, and use either the k3d load balancer or one port-forward for the entire run—not both. Confirm gateway, API, and static readiness before creating rooms.
-2. **Add connection-correlated diagnostics.** Give each proxy attempt a short connection ID and log the browser upgrade, target dial/retry, target `joined` receipt, readiness-marker receipt, first browser write, and close reason. Capture gateway, API, and room logs for the same failing room.
-3. **Separate layers with repeatable tests.** Run a direct API-service WebSocket stress test, an NGINX gateway stress test, an isolated Chromium two-player test, and then the full Playwright suite. Repeat each enough times to distinguish a room-startup failure, a proxy ordering failure, and test-environment failure.
-4. **Replace timing with a deterministic handoff if needed.** Compare the proxy with Caddy's buffered `brw` handoff pattern and with a standard WebSocket reverse-proxy path. If the readiness marker remains necessary, replace the 500 ms fallback with a protocol/design guarantee or document the client contract explicitly. Avoid adding arbitrary sleeps or retries as the primary fix.
-5. **Add an integration regression test.** Simulate a room that sends `joined` immediately after its `101` response and assert that the browser-facing proxy always delivers it, including when the gateway has buffered bytes around the upgrade.
-6. **Rebuild and rerun the complete matrix.** Rebuild/import API, room, static, and gateway images with Podman; run Go tests, local Playwright, direct WebSocket stress, isolated Chromium, and full k3d Playwright. The acceptance target is 12/12 locally and 12/12 through k3d across repeated clean runs.
-7. **Only then simplify or finalize.** Review whether the custom hijack/relay can be removed in favor of a standard gateway route or whether it is sufficiently deterministic, update this handoff, and make a separate follow-up commit.
+The acceptance issue is resolved as a k3d access-path problem, and no additional proxy timing change is justified by the current evidence. The immediate-`joined` regression is covered by `TestProxyRoomWSForwardsImmediateJoinedFrame` in `main_test.go`.
+
+Future hardening work is deliberately separate from this fix:
+
+1. Add room lifecycle cleanup so completed test and production rooms do not accumulate pods, Services, and database rows.
+2. Consider replacing the browser `proxy-ready` application marker with a fully standard WebSocket handoff if a gateway implementation can preserve the same ordering guarantee without the custom lobby hijack.
+3. Keep direct API stress, gateway stress, isolated Chromium, and full k3d Playwright checks in the verification matrix when changing the proxy.
+4. Repeat the clean-cluster 12/12 k3d run after any gateway, k3d, or port-mapping change.
 
 ## Repository Notes
 

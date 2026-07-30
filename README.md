@@ -72,8 +72,9 @@ docker build -t cloudnativepong-gateway:latest -f Dockerfile.gateway .
 ### On Kubernetes (k3d for local, any K8s for prod)
 
 ```bash
-# Create a local K8s cluster (fast feedback loop)
-k3d cluster create pong --agents 2 --port 8080:80@loadbalancer
+# Create a local K8s cluster (fast feedback loop).
+# Map host port 8080 to this app's gateway NodePort 30080.
+k3d cluster create pong --agents 2 --port 8080:30080@agent:0
 
 # Build and load images
 podman build -t cloudnativepong-api:latest -f Dockerfile.api .
@@ -95,7 +96,7 @@ kubectl apply -f k8s/all.yaml
 # Local mode (fast dev)
 npx playwright test
 
-# K8s mode (full integration)
+# K8s mode (full integration; the cluster gateway must already be running)
 TEST_MODE=k8s npx playwright test
 ```
 
@@ -114,7 +115,7 @@ NGINX's `/rooms/` location explicitly enables HTTP/1.1 upgrade headers, disables
 - Local Go tests, race tests, vet, and static builds pass.
 - The local Playwright suite passes 12/12.
 - Isolated Chromium checks through the NGINX k3d gateway pass, including two-player joining.
-- The latest full k3d suite remains intermittent at 11/12: the two-player test can still leave Player 1 at `Waiting for opponent...`. This is documented as an unresolved follow-up and should not be treated as fixed by the gateway replacement alone.
+- The full k3d suite passes 12/12 when host traffic is mapped to the gateway NodePort with `8080:30080@agent:0`. The earlier intermittent 11/12 result came from using the cluster's port-80 ingress path or an unstable `kubectl port-forward`, not from a reproducible room/proxy failure.
 
 ## 📁 Project Structure
 

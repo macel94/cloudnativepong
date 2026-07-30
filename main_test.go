@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cloudnativepong/db"
+	"github.com/cloudnativepong/lobby"
 	"github.com/gorilla/websocket"
 )
 
@@ -84,6 +86,71 @@ func TestWriteWebSocketFramePayloadLengths(t *testing.T) {
 				t.Fatalf("decoded payload length = %d, want %d", len(decoded.payload), size)
 			}
 		})
+	}
+}
+
+func TestProxyRoomWSForwardsImmediateJoinedFrame(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+
+		// Send the first application frame immediately after the target 101.
+		// This is the ordering that previously exposed the lost-frame bug.
+		if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"joined","player":1}`)); err != nil {
+			return
+		}
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}))
+	defer target.Close()
+
+	store, err := db.New(":memory:")
+	if err != nil {
+		t.Fatalf("db.New() error = %v", err)
+	}
+	defer store.Close()
+
+	lobbySrv := lobby.NewServer(store, "local", "", "")
+	room, err := lobbySrv.CreateRoom("immediate-joined")
+	if err != nil {
+		t.Fatalf("CreateRoom() error = %v", err)
+	}
+	lobbySrv.RegisterLocalRoom(room.ID, &lobby.RoomHandler{
+		ID:   room.ID,
+		Addr: strings.TrimPrefix(target.URL, "http://"),
+	})
+
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxyRoomWS(w, r, lobbySrv, store)
+	}))
+	defer proxy.Close()
+
+	client, _, err := websocket.DefaultDialer.Dial(
+		"ws"+strings.TrimPrefix(proxy.URL, "http")+"/rooms/"+room.ID+"/ws",
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("proxy Dial() error = %v", err)
+	}
+	defer client.Close()
+
+	if err := client.WriteJSON(map[string]string{"type": "proxy-ready"}); err != nil {
+		t.Fatalf("WriteJSON(proxy-ready) error = %v", err)
+	}
+
+	messageType, payload, err := client.ReadMessage()
+	if err != nil {
+		t.Fatalf("ReadMessage() error = %v", err)
+	}
+	if messageType != websocket.TextMessage || string(payload) != `{"type":"joined","player":1}` {
+		t.Fatalf("received message type=%d payload=%s, want immediate joined frame", messageType, payload)
 	}
 }
 

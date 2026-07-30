@@ -86,7 +86,8 @@ jobs:
       - name: Setup k3d
         run: |
           curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
-          k3d cluster create pong --agents 2 --port 8080:80@loadbalancer
+          # Expose the pong-gateway NodePort (30080), not the default ingress on port 80.
+          k3d cluster create pong --agents 2 --port 8080:30080@agent:0
 
       - name: Import images to k3d
         run: |
