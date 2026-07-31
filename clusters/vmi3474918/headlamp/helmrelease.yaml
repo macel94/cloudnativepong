@@ -26,6 +26,9 @@ spec:
       inCluster: true
       unsafeUseServiceAccountToken: false
       enableHelm: false
+      oidc:
+        secret:
+          create: false
       clusterInventory:
         enabled: false
     serviceAccount:

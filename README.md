@@ -222,7 +222,7 @@ browser:
 
 ```bash
 kubectl config use-context k3d-pong
-kubectl -n headlamp port-forward service/headlamp 8080:80
+kubectl -n headlamp port-forward --address 127.0.0.1 service/headlamp 8080:80
 ```
 
 Then open **[http://127.0.0.1:8080/](http://127.0.0.1:8080/)** on the machine. Headlamp
