@@ -202,35 +202,43 @@ patches are under `k8s/overlays/server/`.
 
 ### Kubernetes dashboards and administrative access
 
-#### Recommended dashboard if one is needed
+#### Installed dashboard: Headlamp
 
-For a future dashboard, the recommended open-source choice is
-[Headlamp](https://headlamp.dev/), the Kubernetes SIGs project. It supports
-Kubernetes RBAC and bearer-token authentication and can run in-cluster or as a
-desktop application. Do not grant it `cluster-admin` by default: create a
-dedicated ServiceAccount with the smallest read-only `Role`/`ClusterRole` that
-matches the operator's needs, and review that access periodically.
+[Headlamp](https://headlamp.dev/) is installed by Flux from the pinned official
+Headlamp Helm chart (`0.44.0`). Its Service is `ClusterIP` only, there is no
+Ingress or NodePort, and it is not connected to the public Pong route. The
+installation is declared under `clusters/vmi3474918/headlamp/`; do not install
+or upgrade it manually with `kubectl` or Helm.
 
-Install it only through the documented
-[official manifest](https://raw.githubusercontent.com/kubernetes-sigs/headlamp/main/kubernetes-headlamp.yaml)
-or a pinned, reviewed Helm chart version. Keep its Service internal and use
-Headlamp's documented local port-forward when accessing this machine:
+The dashboard's pod uses a dedicated ServiceAccount bound to the
+`headlamp-read-only` ClusterRole. That role permits `get`, `list`, and `watch`
+for cluster observability, including Flux resources, but no create/update/delete
+operations. It does not grant access to Secret values. Headlamp's own
+`unsafeUseServiceAccountToken` and Helm-operation features are disabled.
+
+To access it securely from this machine, use the existing kubeconfig context
+and a localhost-only port-forward. Keep this command running while using the
+browser:
 
 ```bash
 kubectl config use-context k3d-pong
-kubectl apply -f https://raw.githubusercontent.com/kubernetes-sigs/headlamp/main/kubernetes-headlamp.yaml
-kubectl -n kube-system port-forward service/headlamp 8080:80
+kubectl -n headlamp port-forward service/headlamp 8080:80
 ```
 
-The port-forward binds to localhost by default; do not replace it with a public
-Ingress, NodePort, or load-balancer endpoint unless an identity-aware proxy,
-HTTPS, network restriction, and audited RBAC policy are in place. Treat the
-Headlamp bearer token as a credential and never commit it to this repository.
+Then open **[http://127.0.0.1:8080/](http://127.0.0.1:8080/)** on the machine. Headlamp
+will ask for a Kubernetes bearer token. Generate a short-lived token locally
+and paste it directly into the browser; do not print, log, commit, or send the
+token anywhere:
 
-No Kubernetes web dashboard (Kubernetes Dashboard, Headlamp, Lens server, or
-similar) is installed in the current cluster. Consequently there is no
-browser dashboard URL for either a separate dev cluster or a separate public
-cluster. The project currently has one cluster, and it is administered with
+```bash
+kubectl -n headlamp create token headlamp --duration=1h
+```
+
+The port-forward binds to localhost by default. Do not expose it with a public
+Ingress, NodePort, or load balancer. If remote access is ever required, use an
+authenticated private tunnel or identity-aware proxy with HTTPS and audited
+RBAC instead. The public game URL remains intentionally separate and provides
+no cluster-administration access. The project currently has one cluster, and it is administered with
 `kubectl` and observed with Flux:
 
 ```bash
