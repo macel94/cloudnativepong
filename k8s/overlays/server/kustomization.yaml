@@ -12,16 +12,16 @@ resources:
 images:
   - name: cloudnativepong-api
     newName: ghcr.io/macel94/cloudnativepong-api
-    newTag: sha-a6bef0498bde6454c1b20ba054f0aa973e26c6df
+    newTag: sha-ae0614f5bcab92948fcc4cb98770365f7b5b538c
   - name: cloudnativepong-room
     newName: ghcr.io/macel94/cloudnativepong-room
-    newTag: sha-a6bef0498bde6454c1b20ba054f0aa973e26c6df
+    newTag: sha-ae0614f5bcab92948fcc4cb98770365f7b5b538c
   - name: cloudnativepong-static
     newName: ghcr.io/macel94/cloudnativepong-static
-    newTag: sha-a6bef0498bde6454c1b20ba054f0aa973e26c6df
+    newTag: sha-ae0614f5bcab92948fcc4cb98770365f7b5b538c
   - name: cloudnativepong-gateway
     newName: ghcr.io/macel94/cloudnativepong-gateway
-    newTag: sha-a6bef0498bde6454c1b20ba054f0aa973e26c6df
+    newTag: sha-ae0614f5bcab92948fcc4cb98770365f7b5b538c
 
 patches:
   - path: deployment-pull-policy.yaml
