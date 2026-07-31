@@ -1,0 +1,37 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pong-gateway
+  namespace: pong
+spec:
+  template:
+    spec:
+      containers:
+        - name: gateway
+          imagePullPolicy: Always
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pong-static
+  namespace: pong
+spec:
+  template:
+    spec:
+      containers:
+        - name: static
+          imagePullPolicy: Always
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pong-api
+  namespace: pong
+spec:
+  strategy:
+    type: Recreate
+  template:
+    spec:
+      containers:
+        - name: api
+          imagePullPolicy: Always

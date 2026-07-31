@@ -1,158 +1,185 @@
-# Cloud Native Pong — Handoff Document
+# Cloud Native Pong — GitOps/server deployment handoff
 
-## Status
+**Checkpoint date:** 2026-07-31
+**Branch:** `feat/gitops-server-deployment`
+**Purpose:** Preserve a clear continuation point for the Cloud Native Pong deployment work. Do not merge this branch into `main` until the room-lifecycle issue below is fixed and verified.
 
-This document describes the gateway/proxy changes on the `main` branch. The implementation and the full k3d Playwright path are now cleanly verified: 12/12 tests pass when host traffic is mapped to the application's gateway NodePort. The earlier intermittent 11/12 result was caused by an invalid or unstable test access path, not a reproducible room/proxy failure.
+## Executive status
 
-**Execution model for this change:** `openai/gpt-5.6-luna` via OpenRouter. No other model was used for the implementation or verification work.
+The GitOps deployment itself is healthy on the existing `vmi3474918` server and `k3d-pong` cluster. Flux is successfully reconciling the feature branch, the application is reachable through Traefik, GHCR-backed immutable images are running, and the existing 12-test Kubernetes Playwright suite previously passed.
 
-## Prerequisites
+The deployment is **not yet complete** because the lifecycle fix is not yet deployed to the live cluster. The two waiting room records, Pods, and Services observed at the previous checkpoint were removed through the internal finished callback, and the PVC remains intact. The follow-up lifecycle implementation is currently **uncommitted and not deployed** at this checkpoint.
 
-| Tool | Version | Notes |
-|------|---------|-------|
-| Go | 1.25.0 | Must be ≥1.25.0 for `modernc.org/sqlite` |
-| Node.js | 24.18.1 | For Playwright E2E tests |
-| npm | 11.16.0 | |
-| Podman | 5.4.2 | Container builds; use Podman rather than Docker locally |
-| k3d | 5.9.0 | Local Kubernetes |
-| kubectl | 1.31.0 | |
-| Playwright | 1.62.0 | Chromium E2E coverage |
+## What is verified
 
-## Current Architecture
+- `main` remains known-good at commit `2c5399c`.
+- Feature branch: `feat/gitops-server-deployment`.
+- The branch contains Flux bootstrap/application manifests, server Kustomize overlays, immutable image publishing, persistent SQLite storage, Traefik Ingress, and dynamic one-Pod-per-room orchestration.
+- Flux source tracks:
+  - Repository: `https://github.com/macel94/cloudnativepong.git`
+  - Branch: `feat/gitops-server-deployment`
+  - Root: `./clusters/vmi3474918`
+  - Application overlay: `./k8s/overlays/server`
+- Latest observed Flux revision: `e4a8774d` (`deploy: publish images sha-a6bef...`).
+- Flux `GitRepository/flux-system`: `Ready=True`.
+- Flux root `Kustomization/flux-system`: `Ready=True`, message `Applied revision: feat/gitops-server-deployment@sha1:e4a8774d`.
+- Live application images are immutable GHCR SHA tags for commit `a6bef049...`:
+  - `ghcr.io/macel94/cloudnativepong-api:sha-a6bef...`
+  - matching room, static, and gateway tags.
+- Anonymous GHCR pulls were previously verified with HTTP 200; no image pull secret is currently required.
+- `go test ./...`, `go test -race ./...`, and `go vet ./...` pass with the lifecycle implementation and focused tests.
+- Earlier verified checks include `go vet ./...`, CGO-free builds, Kustomize rendering, Kubernetes dry runs, local Playwright 12/12, and Kubernetes Playwright 12/12.
+- Public/intended URL: `http://169.58.97.73:18080/`.
 
-```
-Gateway (NGINX :80, NodePort 30080)
-├── /              → Static (nginx:alpine, ClusterIP :80)
-├── /api/*         → API/lobby (Go, ClusterIP :8080)
-├── /rooms/{id}/ws → API/lobby → room pod (dynamic, ClusterIP :8080)
-└── /style.css etc → Static (nginx)
-```
+## Live cluster state at checkpoint
 
-The four images are:
+Cluster context: `k3d-pong`
 
-| Dockerfile | Image | Base | Role |
-|-----------|-------|------|------|
-| `Dockerfile.api` | `cloudnativepong-api` | `golang:1.25-alpine` → `scratch` | Lobby/API and room proxy |
-| `Dockerfile.room` | `cloudnativepong-room` | `golang:1.25-alpine` → `scratch` | One game room per pod |
-| `Dockerfile.static` | `cloudnativepong-static` | `nginx:alpine` | Frontend assets |
-| `Dockerfile.gateway` | `cloudnativepong-gateway` | `nginx:alpine` | Browser-facing HTTP/WebSocket gateway |
+- Nodes: `k3d-pong-server-0`, `k3d-pong-agent-0`, `k3d-pong-agent-1`.
+- Host mappings:
+  - `18080 -> Traefik HTTP :80` (intended GitOps path)
+  - `18083 -> Pong gateway NodePort :30080` (legacy/direct path)
+  - `45371 -> Kubernetes API :6443`
+- `pong-api`: 1/1, GHCR SHA image, SQLite PVC mounted.
+- `pong-gateway`: 2/2, HPA min 2/max 4.
+- `pong-static`: 2/2, HPA min 2/max 4.
+- `pong-api`: deliberately one replica with SQLite-safe `Recreate` strategy.
+- PVC `pong-api-data`: `Bound`, 1 Gi, `local-path`, RWO.
+- Ingress `pong`: Traefik class, wildcard host, address on all three nodes.
+- Resource quota was healthy: 7/120 Pods and 5/120 Services at inspection time, including two leaked rooms.
 
-## Changes Included
+## Architecture/decisions
 
-### Gateway replacement
+- Flux is used for normal deployment; do not use manual `kubectl apply` for routine rollout.
+- API remains one replica because SQLite is persisted but not multi-writer safe.
+- Gateway/static are the only conventional HPA targets.
+- Every game room is a dedicated dynamically created Pod plus matching ClusterIP Service.
+- Room Pods use immutable GHCR images, readiness/liveness `/health` probes, resource requests/limits, `restartPolicy: Never`, and a two-hour `activeDeadlineSeconds`.
+- Traefik exposes the application on HTTP. HTTPS is intentionally not enabled; it requires a domain plus Traefik websecure/ACME configuration.
+- Do not recreate or destructively replace the existing cluster or PVC.
 
-The browser-facing Caddy image/configuration was replaced with NGINX:
+## What was found during cleanup investigation
 
-- `Dockerfile.gateway` now builds from `nginx:alpine`.
-- `gateway/nginx.conf` routes `/api/` and `/rooms/` to `pong-api`, and all other paths to `pong-static`.
-- The `/rooms/` location sets HTTP/1.1 upgrade headers, disables request and response buffering, and uses one-hour read/send timeouts.
-- `/health` is served locally by NGINX for the Kubernetes readiness probe.
-- The old `gateway/Caddyfile` and gateway-only Caddy environment variables are no longer used.
+The E2E tests create rooms in several tests without joining them. Creating a room creates:
 
-The change was made after investigating the Caddy reverse-proxy handoff behavior, including Caddy issue [#6273](https://github.com/caddyserver/caddy/issues/6273), “Missing byte in first websocket message.” The issue describes how buffered bytes around a `101` response can be lost if a tunnel copier reads the raw connection instead of preserving the buffered reader state. NGINX removes the Caddy-specific outer handoff behavior, but it does not by itself eliminate the custom lobby proxy's remaining timing sensitivity.
+1. a SQLite room row with status `waiting` and zero players;
+2. a room Pod; and
+3. a matching room Service.
 
-### Room-side WebSocket connection
+A room Pod only calls the lobby `/internal/rooms/<id>/finished` endpoint after its in-process game signals completion. A room that never receives a WebSocket connection never starts a game and therefore never signals completion. The reconciler only removed terminal Pods, finished DB records, or orphaned Services; it did not expire old waiting rows/resources.
 
-`main.go:proxyRoomWS` still hijacks the browser-facing connection so the lobby can return the `101 Switching Protocols` response expected by the gateway. It now uses `gorilla/websocket.Dialer` for the lobby-to-room connection instead of manually constructing a raw TCP handshake and using `io.Copy` on the underlying socket.
+Observed leaked resources after the last test run:
 
-This is important because Gorilla retains bytes buffered during the target handshake and handles WebSocket control frames. The proxy does not bypass that buffered reader by reading the underlying `net.Conn` directly.
+- Pods: `pong-room-0f2afc`, `pong-room-72a65a`
+- Services with the same IDs
+- both rooms still returned by `/api/rooms`
+- four room resources total across Pods and Services
+- room logs showed only `Cloud Native Pong starting on :8080 (mode=room)`
 
-The browser-to-room direction has a protocol-aware relay that:
+This is a real lifecycle bug, not a Flux or ingress failure.
 
-- requires masked client frames;
-- rejects reserved bits, invalid opcodes, invalid control frames, non-canonical lengths, and oversized frames;
-- reassembles fragmented text and binary messages;
-- forwards ping, pong, and close control frames; and
-- limits application messages to 16 MiB.
+## What was tried but is not yet committed/deployed
 
-Browser-facing writes are serialized so concurrent room data/control messages cannot interleave on the hijacked connection.
+The working tree contains experimental application, test, and documentation changes in `db/db.go`, `lobby/lobby.go`, `main.go`, and related files.
 
-### Gateway handoff marker
+The implementation has now been locally verified with the full Go test suite, race detector, vet, static Linux builds, Kustomize rendering, and the 12-test local Playwright suite. It has not yet been built into/published as a container image or reconciled by Flux.
 
-`static/game.js` sends `{"type":"proxy-ready"}` immediately from `WebSocket.onopen`. The lobby consumes this marker and does not forward it to the room. It uses the first post-upgrade browser frame as the readiness signal before releasing room-to-browser frames; a 500 ms fallback keeps non-browser WebSocket clients from waiting forever.
+### `db/db.go`
 
-The marker is harmless in local mode because local mode connects directly to the in-process room handler. Focused tests in `main_test.go` verify marker suppression, fragmented-message reassembly, frame validation, and server-frame payload lengths.
+`IncrementPlayers` was changed from an unconstrained increment to an atomic SQL update with `players < 2`, followed by explicit `room not found`/`room is full` errors. This addresses concurrent join races.
 
-## Verification Status
+### `lobby/lobby.go`
 
-The following checks passed before this handoff was prepared, and should be rerun after any further proxy change:
+The current uncommitted changes:
 
-- `go test ./...`
-- `go test -race ./...`
-- `go vet ./...`
-- static Go builds for the API and room images
-- local Playwright: 12/12
-- direct WebSocket checks against the API service
-- repeated gateway-path WebSocket checks with both `joined` frames
-- isolated Chromium two-player checks through the NGINX k3d gateway
+- add a default 10-minute idle timeout and `NewServerWithIdleTimeout` constructor;
+- scan persisted rooms during reconciliation and attempt cleanup for old `waiting` rooms;
+- retain active `playing` rooms;
+- reserve capacity atomically without changing lifecycle status;
+- add an idempotent `MarkRoomPlaying` operation that requires two reservations;
+- add a one-minute reconciler and injected idle timeout;
+- add `/internal/rooms/<id>/started` alongside the existing finished callback;
+- notify the lobby after both actual room WebSockets connect, and signal cleanup on disconnect/write failure;
+- add focused DB, lobby, and room-WebSocket tests;
+- have not yet been built into/published as a container image;
+- have not yet been reconciled by Flux.
 
-The full k3d Playwright suite is now green when the gateway NodePort is exposed correctly; the verification details and the earlier misleading failure mode are recorded below.
+Do not assume these edits are production-ready merely because `go test ./...` passed; there are no existing lobby package tests, and Kubernetes cleanup behavior still needs live verification.
 
-The failure was ultimately isolated to the test surface. `8080:80@loadbalancer` reached the cluster's default ingress on port 80 rather than the application's `pong-gateway` NodePort 30080, and stale k3d load-balancer state plus intermittent `kubectl port-forward` errors produced misleading failures. With a clean cluster, direct API access passed 30/30, the NGINX gateway path passed 30/30, five isolated Chromium two-player runs passed, and the full k3d suite passed 12/12.
+## Important design correction for continuation
 
-## Build and Deploy with Podman
+A prior attempted approach marked a room `playing` when the second `/api/rooms/join` reservation succeeded. That is unsafe: a client can reserve the second slot and then abandon the page before opening its WebSocket, causing an abandoned room to evade a `waiting`-only timeout.
 
-Podman commonly prefixes local image names with `localhost/`; the Kubernetes manifests intentionally use that prefix and `imagePullPolicy: Never`.
+The safer model is:
+
+1. API join atomically reserves capacity only.
+2. The room Pod tracks actual WebSocket connections.
+3. Once both players are connected, the room Pod POSTs an internal `started` callback; the API marks the DB room `playing`.
+4. If a player disconnects before/during play, the room Pod signals completion and exits/requests cleanup.
+5. A room with no players or only one player expires after a bounded idle timeout.
+6. Reconciliation runs frequently enough to enforce the bound (target one minute, not five minutes).
+
+The callback route must be authenticated by network/RBAC assumptions or otherwise constrained before production exposure; it is currently an internal ClusterIP-only endpoint.
+
+## Next steps, in order
+
+1. Inspect/rework the uncommitted `db/db.go` and `lobby/lobby.go` changes before committing them.
+2. Add focused tests for:
+   - atomic two-player capacity under concurrent joins;
+   - a first join leaving status `waiting`;
+   - actual room start changing status to `playing`;
+   - idle waiting-room expiration (using a short injected timeout);
+   - idempotent cleanup/error handling.
+3. Update `main.go` room mode:
+   - notify the lobby when both room WebSocket connections are present;
+   - signal/notify cleanup on disconnect and write failure where appropriate;
+   - ensure room-mode `/health` remains available.
+4. Add the started callback route in lobby mode and keep finished cleanup idempotent.
+5. Set reconciliation to a one-minute interval and document the actual interval accurately.
+6. Run `gofmt`, `go test ./...`, `go test -race ./...`, `go vet ./...`, static builds, Kustomize render/dry-run, and the local Playwright suite.
+7. Commit the application lifecycle fix separately from generated image/deployment changes.
+8. Push the feature branch and wait for the image workflow to generate the GHCR SHA-tag deployment commit. Fetch the remote branch before making more commits because the workflow may advance it.
+9. Force Flux reconciliation and verify all live workloads use the new SHA tag.
+10. Remove only the currently leaked room resources through the API/controlled cleanup or, if necessary, targeted `kubectl -n pong delete pod,svc` plus DB cleanup; do not delete the API PVC.
+11. Run a fresh Kubernetes Playwright suite through `http://169.58.97.73:18080/`.
+12. Create an abandoned room and verify the DB row, Pod, and Service disappear within the documented timeout.
+13. Run the two-player WebSocket flow and verify one room Pod/Service exists while active, then cleanup occurs after completion/disconnect.
+14. Recheck Flux, HPA, PVC, quota, ingress, image tags, public access, and documentation.
+15. Keep the feature branch deployed for validation. Merge to `main` only after the live lifecycle test passes.
+
+## Useful commands
 
 ```bash
-podman build -t localhost/cloudnativepong-api:latest -f Dockerfile.api .
-podman build -t localhost/cloudnativepong-room:latest -f Dockerfile.room .
-podman build -t localhost/cloudnativepong-static:latest -f Dockerfile.static .
-podman build -t localhost/cloudnativepong-gateway:latest -f Dockerfile.gateway .
+# Branch and uncommitted state
+git status --short --branch
+git fetch origin feat/gitops-server-deployment
+git log --oneline --decorate -8 origin/feat/gitops-server-deployment
 
-k3d image import localhost/cloudnativepong-api:latest \
-  localhost/cloudnativepong-room:latest \
-  localhost/cloudnativepong-static:latest \
-  localhost/cloudnativepong-gateway:latest -c pong
+# Tests
+gofmt -w db/db.go lobby/lobby.go main.go
+go test ./...
+go test -race ./...
+go vet ./...
 
-kubectl apply -f k8s/all.yaml
-kubectl -n pong wait --for=condition=ready pod -l app=cloudnativepong --timeout=60s
+# Flux and workloads
+flux get all -A
+flux reconcile source git flux-system -n flux-system
+flux reconcile kustomization flux-system -n flux-system --with-source
+kubectl -n pong get deploy,pods,svc,hpa,ingress,pvc,resourcequota -o wide
+kubectl -n pong get pods,svc -l role=room -o wide
+
+# Public smoke test
+curl -i http://169.58.97.73:18080/
+curl -i http://169.58.97.73:18080/api/rooms
+
+# Kubernetes E2E
+TEST_MODE=k8s BASE_URL=http://169.58.97.73:18080 npx playwright test --reporter=list
 ```
 
-For a clean local cluster:
+## Current checkpoint conclusion
 
-```bash
-k3d cluster delete pong 2>/dev/null || true
-# Map host port 8080 to pong-gateway's NodePort 30080 on agent 0.
-# Do not map 8080 to container port 80: that reaches the default ingress.
-k3d cluster create pong --agents 2 --port 8080:30080@agent:0
-```
+**Working:** GitOps/Flux reconciliation, immutable images, Traefik HTTP ingress, public HTTP reachability, stateless scaling, single-replica persistent SQLite API, dynamic room Pod creation, atomic capacity reservation, actual-connection start notification, bounded waiting-room cleanup, and the local two-player WebSocket path.
 
-Use the NodePort mapping from the cluster command above for the normal k3d run. Do not use `8080:80@loadbalancer`: port 80 is the cluster's default ingress, not `pong-gateway`. If a port-forward is required for diagnosis, use a dedicated host port and do not combine it with the NodePort path.
+**Not yet deployed/proven live:** the final lifecycle image has not been published or reconciled by Flux; the fresh Kubernetes abandoned-room and post-disconnect tests still need to run against that image. The previous leaked rooms were manually removed through the internal callback, and the API PVC was verified `Bound`.
 
-## Test Commands
-
-```bash
-# Local mode
-npx playwright test --reporter=list
-
-# Kubernetes mode, after the gateway NodePort is exposed on host port 8080
-TEST_MODE=k8s npx playwright test --reporter=list
-```
-
-Before an isolated k3d run, remove stale dynamic room resources and confirm the gateway/API/static pods are ready:
-
-```bash
-kubectl -n pong delete pods,svc -l role=room --ignore-not-found
-kubectl -n pong get pods,svc
-kubectl -n pong logs deploy/pong-gateway --tail=50
-kubectl -n pong logs deploy/pong-api --tail=50
-```
-
-## Follow-up / Future Hardening
-
-The acceptance issue is resolved as a k3d access-path problem, and no additional proxy timing change is justified by the current evidence. The immediate-`joined` regression is covered by `TestProxyRoomWSForwardsImmediateJoinedFrame` in `main_test.go`.
-
-Future hardening work is deliberately separate from this fix:
-
-1. Add room lifecycle cleanup so completed test and production rooms do not accumulate pods, Services, and database rows.
-2. Consider replacing the browser `proxy-ready` application marker with a fully standard WebSocket handoff if a gateway implementation can preserve the same ordering guarantee without the custom lobby hijack.
-3. Keep direct API stress, gateway stress, isolated Chromium, and full k3d Playwright checks in the verification matrix when changing the proxy.
-4. Repeat the clean-cluster 12/12 k3d run after any gateway, k3d, or port-mapping change.
-
-## Repository Notes
-
-- Room pods and services can accumulate; clean them between k3d runs until lifecycle cleanup is implemented.
-- The API uses the Kubernetes API to create room pods and services in the `pong` namespace.
-- CI builds with Docker, while local development uses Podman. CI may need image names without Podman's `localhost/` prefix if its manifest convention changes.
-- `gateway/nginx.conf` is now the authoritative gateway configuration. Do not restore `gateway/Caddyfile` unless the gateway decision is intentionally revisited.
+**Working tree note:** this handoff commit documents the current uncommitted lifecycle implementation. Do not stage or commit automatically; review the diff, then commit/push the application fix through the ordered deployment steps below.

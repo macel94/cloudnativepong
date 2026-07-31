@@ -1,5 +1,5 @@
 # Binaries
-cloudnativepong
+/cloudnativepong
 *.exe
 *.test
 
