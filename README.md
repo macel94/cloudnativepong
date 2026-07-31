@@ -202,6 +202,31 @@ patches are under `k8s/overlays/server/`.
 
 ### Kubernetes dashboards and administrative access
 
+#### Recommended dashboard if one is needed
+
+For a future dashboard, the recommended open-source choice is
+[Headlamp](https://headlamp.dev/), the Kubernetes SIGs project. It supports
+Kubernetes RBAC and bearer-token authentication and can run in-cluster or as a
+desktop application. Do not grant it `cluster-admin` by default: create a
+dedicated ServiceAccount with the smallest read-only `Role`/`ClusterRole` that
+matches the operator's needs, and review that access periodically.
+
+Install it only through the documented
+[official manifest](https://raw.githubusercontent.com/kubernetes-sigs/headlamp/main/kubernetes-headlamp.yaml)
+or a pinned, reviewed Helm chart version. Keep its Service internal and use
+Headlamp's documented local port-forward when accessing this machine:
+
+```bash
+kubectl config use-context k3d-pong
+kubectl apply -f https://raw.githubusercontent.com/kubernetes-sigs/headlamp/main/kubernetes-headlamp.yaml
+kubectl -n kube-system port-forward service/headlamp 8080:80
+```
+
+The port-forward binds to localhost by default; do not replace it with a public
+Ingress, NodePort, or load-balancer endpoint unless an identity-aware proxy,
+HTTPS, network restriction, and audited RBAC policy are in place. Treat the
+Headlamp bearer token as a credential and never commit it to this repository.
+
 No Kubernetes web dashboard (Kubernetes Dashboard, Headlamp, Lens server, or
 similar) is installed in the current cluster. Consequently there is no
 browser dashboard URL for either a separate dev cluster or a separate public
