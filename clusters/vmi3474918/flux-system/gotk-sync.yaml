@@ -8,7 +8,7 @@ metadata:
 spec:
   interval: 1m0s
   ref:
-    branch: feat/gitops-server-deployment
+    branch: main
   secretRef:
     name: flux-system
   url: https://github.com/macel94/cloudnativepong.git

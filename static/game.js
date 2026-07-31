@@ -15,6 +15,12 @@
     let ws;
     let player = 0; // 1 or 2, assigned by server
     let gameState = null;
+    // Network delivery is not perfectly periodic, especially through the
+    // Kubernetes WebSocket proxy. Keep a short authoritative-state buffer and
+    // render it continuously so packet bursts do not become visible stutter.
+    const stateBuffer = [];
+    const interpolationDelay = 50;
+    let lastRenderedState = null;
 
     // Canvas setup
     const canvas = document.getElementById('pongCanvas');
@@ -58,7 +64,12 @@
 
             if (msg.type === 'state') {
                 gameState = msg.state;
-                render(msg.state);
+                const receivedAt = performance.now();
+                stateBuffer.push({ state: msg.state, receivedAt });
+                while (stateBuffer.length > 8 ||
+                    stateBuffer.length > 2 && receivedAt - stateBuffer[0].receivedAt > 250) {
+                    stateBuffer.shift();
+                }
 
                 if (msg.state.status === 'playing') {
                     document.getElementById('status').textContent = 'Playing!';
@@ -172,15 +183,59 @@
         }
     }
 
-    // Initial render
-    render({
+    // Render continuously. Interpolating a short time behind the newest
+    // authoritative state absorbs network jitter without changing gameplay
+    // decisions, which remain entirely server-side.
+    function interpolatedState(now) {
+        if (stateBuffer.length === 0) return lastRenderedState;
+
+        const target = now - interpolationDelay;
+        let older = stateBuffer[0];
+        let newer = stateBuffer[stateBuffer.length - 1];
+        for (let i = 1; i < stateBuffer.length; i++) {
+            if (stateBuffer[i].receivedAt >= target) {
+                newer = stateBuffer[i];
+                older = stateBuffer[i - 1];
+                break;
+            }
+        }
+
+        const span = newer.receivedAt - older.receivedAt;
+        const amount = span > 0
+            ? Math.max(0, Math.min(1, (target - older.receivedAt) / span))
+            : 1;
+        const lerp = (a, b) => a + (b - a) * amount;
+        const a = older.state;
+        const b = newer.state;
+        const result = {
+            ...b,
+            ball: {
+                ...b.ball,
+                x: lerp(a.ball.x, b.ball.x),
+                y: lerp(a.ball.y, b.ball.y),
+            },
+            p1: { y: lerp(a.p1.y, b.p1.y) },
+            p2: { y: lerp(a.p2.y, b.p2.y) },
+        };
+        lastRenderedState = result;
+        return result;
+    }
+
+    function renderLoop(now) {
+        const state = interpolatedState(now);
+        if (state) render(state);
+        window.requestAnimationFrame(renderLoop);
+    }
+
+    lastRenderedState = {
         ball: { x: 0.5, y: 0.5 },
         p1: { y: 0.5 },
         p2: { y: 0.5 },
         score1: 0, score2: 0,
         status: 'waiting', winner: 0,
         p1_ready: false, p2_ready: false,
-    });
-
+    };
+    render(lastRenderedState);
+    window.requestAnimationFrame(renderLoop);
     connect();
 })();
