@@ -259,6 +259,7 @@ func handleRoomWS(w http.ResponseWriter, r *http.Request, roomID, lobbyAddr stri
 		return
 	}
 	defer conn.Close()
+	enableTCPNoDelay(conn.UnderlyingConn())
 
 	// Get or create the local room
 	room := getOrCreateLocalRoom(roomID)
@@ -543,6 +544,7 @@ func proxyRoomWS(w http.ResponseWriter, r *http.Request, lobbySrv *lobby.Server,
 		return
 	}
 	defer clientConn.Close()
+	enableTCPNoDelay(clientConn)
 
 	// ── Step 2: open a real WebSocket connection to the room pod ───
 	// Establish and read the first target message before acknowledging the
@@ -567,6 +569,7 @@ func proxyRoomWS(w http.ResponseWriter, r *http.Request, lobbySrv *lobby.Server,
 		return
 	}
 	defer target.Close()
+	enableTCPNoDelay(target.UnderlyingConn())
 	target.SetReadLimit(maxProxyMessageSize)
 
 	// ── Step 3: acknowledge the browser and start both relays ──────
@@ -647,6 +650,20 @@ func proxyRoomWS(w http.ResponseWriter, r *http.Request, lobbySrv *lobby.Server,
 
 const maxProxyMessageSize = 16 << 20
 const proxyReadyMessage = `{"type":"proxy-ready"}`
+
+// enableTCPNoDelay prevents the small, frequent game-state frames from being
+// coalesced by Nagle's algorithm. This matters for the Kubernetes path, where
+// each browser connection crosses the gateway and the lobby proxy before it
+// reaches the room pod.
+func enableTCPNoDelay(conn net.Conn) {
+	tcpConn, ok := conn.(*net.TCPConn)
+	if !ok {
+		return
+	}
+	if err := tcpConn.SetNoDelay(true); err != nil {
+		log.Printf("proxy: enable TCP_NODELAY: %v", err)
+	}
+}
 
 // relayBrowserToTarget reads client-to-server WebSocket frames from the
 // hijacked browser connection and sends equivalent messages through Gorilla.
