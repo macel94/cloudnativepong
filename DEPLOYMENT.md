@@ -40,23 +40,28 @@ Ingress uses class `traefik` and the `web` entrypoint, forwarding all paths to
 `pong-gateway`; NGINX in that gateway handles static files, API calls, and
 WebSocket upgrades. The k3d load balancer maps:
 
-- Host `18080` → Traefik HTTP port 80
+- Host `80` and `18080` → Traefik HTTP port 80
+- Host `443` → Traefik HTTPS port 443
 - Host `18083` → the legacy Pong NodePort 30080
 - Host `45371` → the Kubernetes API
 
 The GitOps ingress is the intended application path. The room Pod callbacks at
 `/internal/rooms/<id>/started` and `/internal/rooms/<id>/finished` are only
 reachable through the `pong-api` ClusterIP Service; the gateway does not route
-that path publicly. After reconciliation the experimental site is reachable at:
+that path publicly.
+
+The public site is available at:
 
 ```text
-http://169.58.97.73:18080/
+https://belacca.com/
+https://www.belacca.com/
 ```
 
-A DNS A/AAAA record can point at `169.58.97.73` later. HTTPS requires adding a
-Traefik `websecure` entrypoint and an ACME/Let's Encrypt configuration; it is
-not silently enabled by this POC. WebSockets work over the same HTTP ingress
-and will also work over HTTPS once TLS is configured.
+DNS A records for both names point at `169.58.97.73`. Traefik exposes the
+`websecure` entrypoint on public port 443 and obtains certificates from
+Let's Encrypt using HTTP-01 validation on port 80. The certificate store is
+persisted in `kube-system/traefik-acme`, so certificates renew automatically
+across Traefik restarts. WebSockets use the same HTTPS ingress.
 
 ## Project clusters on this server
 

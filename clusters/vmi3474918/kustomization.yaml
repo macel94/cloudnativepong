@@ -3,3 +3,5 @@ kind: Kustomization
 resources:
   - cloudnativepong
   - headlamp
+  - traefik-acme-pvc.yaml
+  - traefik-config.yaml

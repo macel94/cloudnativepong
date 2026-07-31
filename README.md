@@ -96,18 +96,20 @@ kubectl apply -f k8s/all.yaml
 
 The currently deployed public application is available at:
 
-**[http://169.58.97.73:18080/](http://169.58.97.73:18080/)**
+- **[https://belacca.com/](https://belacca.com/)**
+- **[https://www.belacca.com/](https://www.belacca.com/)**
 
-Open that URL, enter a display name, and create or join a room. This endpoint
-supports the browser WebSocket connection used by the game. It is HTTP-only at
-present; HTTPS/TLS has not been configured.
+HTTP requests redirect to HTTPS. Open either URL, enter a display name, and
+create or join a room. Browser WebSocket connections are served over TLS.
+Let's Encrypt certificates are issued and renewed automatically by Traefik,
+with certificate state stored in the `kube-system/traefik-acme` PVC.
 
-The endpoint was checked on 2026-07-31 and returned HTTP 200. The application
-health and lobby API also returned successfully:
+The public endpoints were checked on 2026-07-31 and returned HTTP 200. The
+application health and lobby API also returned successfully:
 
 ```text
-GET http://169.58.97.73:18080/health    → 200 OK
-GET http://169.58.97.73:18080/api/rooms  → 200 OK
+GET https://belacca.com/health    → 200 OK
+GET https://belacca.com/api/rooms → 200 OK
 ```
 
 ### Cluster layout
@@ -122,7 +124,7 @@ always-on public environment.
 flowchart TB
     internet((Players / Internet))
     machine["Current machine: vmi3474918\nPublic IP: 169.58.97.73"]
-    publicLB["k3d load balancer\n18080 → Traefik :80\n18083 → NodePort :30080\n45371 → Kubernetes API"]
+    publicLB["k3d load balancer\n80/18080 → Traefik HTTP\n443 → Traefik HTTPS\n18083 → NodePort :30080\n45371 → Kubernetes API"]
     publicCluster["Persistent k3d cluster: pong\nContext: k3d-pong\n1 server + 2 agents"]
     traefik["Traefik Ingress\nweb entrypoint"]
     gateway["pong-gateway\nNGINX"]
@@ -133,7 +135,7 @@ flowchart TB
     ciCluster["Ephemeral dev/test k3d cluster\nCreated per CI run\nDestroyed after E2E"]
     ciApp["Kubernetes E2E\nthrough gateway"]
 
-    internet -->|"Play here: http://169.58.97.73:18080/"| machine
+    internet -->|"Play here: https://belacca.com/"| machine
     machine --> publicLB --> publicCluster
     publicCluster --> traefik --> gateway --> app
     git -->|"Flux watches main"| flux

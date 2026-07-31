@@ -6,6 +6,7 @@ namespace: pong
 resources:
   - ../../base
   - ingress.yaml
+  - ingress-tls.yaml
   - resource-quota.yaml
   - hpa.yaml
 
