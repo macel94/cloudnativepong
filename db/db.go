@@ -123,12 +123,72 @@ func (s *Store) UpdateRoomStatus(id, status, podIP string) error {
 	return err
 }
 
-// IncrementPlayers atomically increments the player count.
+// IncrementPlayers atomically increments the player count without allowing a
+// room to exceed its two-player capacity.
 func (s *Store) IncrementPlayers(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, err := s.db.Exec("UPDATE rooms SET players = players + 1 WHERE id = ?", id)
-	return err
+
+	result, err := s.db.Exec("UPDATE rooms SET players = players + 1 WHERE id = ? AND players < 2", id)
+	if err != nil {
+		return err
+	}
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if updated == 1 {
+		return nil
+	}
+
+	var exists bool
+	if err := s.db.QueryRow("SELECT EXISTS(SELECT 1 FROM rooms WHERE id = ?)", id).Scan(&exists); err != nil {
+		return err
+	}
+	if !exists {
+		return fmt.Errorf("room not found")
+	}
+	return fmt.Errorf("room is full")
+}
+
+// MarkRoomPlaying records that both reserved players have actually connected
+// to the room WebSocket. It is idempotent for an already-playing room and does
+// not transition a room until its two-player reservation is complete.
+func (s *Store) MarkRoomPlaying(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	result, err := s.db.Exec(
+		"UPDATE rooms SET status = 'playing' WHERE id = ? AND status = 'waiting' AND players = 2",
+		id,
+	)
+	if err != nil {
+		return err
+	}
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if updated == 1 {
+		return nil
+	}
+
+	var status string
+	var players int
+	err = s.db.QueryRow("SELECT status, players FROM rooms WHERE id = ?", id).Scan(&status, &players)
+	if err == sql.ErrNoRows {
+		return fmt.Errorf("room not found")
+	}
+	if err != nil {
+		return err
+	}
+	if status == "playing" {
+		return nil
+	}
+	if status == "finished" {
+		return fmt.Errorf("room is finished")
+	}
+	return fmt.Errorf("room is not ready: %d/2 players", players)
 }
 
 // DeleteRoom removes a room from the database.

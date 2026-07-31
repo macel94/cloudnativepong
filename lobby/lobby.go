@@ -30,23 +30,36 @@ type RoomHandler struct {
 }
 
 // Server handles HTTP requests for the lobby.
+const defaultRoomIdleTimeout = 10 * time.Minute
+
 type Server struct {
-	store     *db.Store
-	mu        sync.RWMutex
-	rooms     map[string]*RoomHandler // local mode: in-process rooms
-	mode      string                  // "local" or "kubernetes"
-	k8sNS     string
-	roomImage string
+	store           *db.Store
+	mu              sync.RWMutex
+	rooms           map[string]*RoomHandler // local mode: in-process rooms
+	mode            string                  // "local" or "kubernetes"
+	k8sNS           string
+	roomImage       string
+	roomIdleTimeout time.Duration
 }
 
-// NewServer creates a new lobby server.
+// NewServer creates a new lobby server with the default abandoned-room timeout.
 func NewServer(store *db.Store, mode, k8sNS, roomImage string) *Server {
+	return NewServerWithIdleTimeout(store, mode, k8sNS, roomImage, defaultRoomIdleTimeout)
+}
+
+// NewServerWithIdleTimeout creates a lobby server with an explicit timeout for
+// rooms that never reach the playing state.
+func NewServerWithIdleTimeout(store *db.Store, mode, k8sNS, roomImage string, idleTimeout time.Duration) *Server {
+	if idleTimeout <= 0 {
+		idleTimeout = defaultRoomIdleTimeout
+	}
 	return &Server{
-		store:     store,
-		rooms:     make(map[string]*RoomHandler),
-		mode:      mode,
-		k8sNS:     k8sNS,
-		roomImage: roomImage,
+		store:           store,
+		rooms:           make(map[string]*RoomHandler),
+		mode:            mode,
+		k8sNS:           k8sNS,
+		roomImage:       roomImage,
+		roomIdleTimeout: idleTimeout,
 	}
 }
 
@@ -121,7 +134,8 @@ func (s *Server) ListRooms() ([]db.Room, error) {
 	return s.store.ListRooms()
 }
 
-// JoinRoom increments the player count. Returns error if room is full.
+// JoinRoom reserves one of the room's two player slots. The room remains in
+// waiting status until the room process confirms both WebSocket connections.
 func (s *Server) JoinRoom(id string) error {
 	room, err := s.store.GetRoom(id)
 	if err != nil || room == nil {
@@ -131,6 +145,12 @@ func (s *Server) JoinRoom(id string) error {
 		return fmt.Errorf("room is full")
 	}
 	return s.store.IncrementPlayers(id)
+}
+
+// MarkRoomStarted records that both players have connected to the room
+// WebSocket. Reservations made through JoinRoom alone never start a room.
+func (s *Server) MarkRoomStarted(id string) error {
+	return s.store.MarkRoomPlaying(id)
 }
 
 // CleanupRoom removes the Kubernetes Pod and Service for a room and deletes
@@ -190,9 +210,29 @@ func (s *Server) k8sConfig() (token []byte, apiHost, apiPort, ns string, err err
 // ReconcileRooms removes terminal or orphaned room resources after an API
 // restart. Active rooms remain untouched.
 func (s *Server) ReconcileRooms() error {
+	// Remove waiting rooms that never received a second player. This also
+	// handles rooms whose Pod was created successfully but never accepted a
+	// WebSocket connection, such as abandoned lobby tabs.
+	rooms, err := s.store.ListRooms()
+	if err != nil {
+		return err
+	}
+	now := time.Now().UTC()
+	for _, room := range rooms {
+		if room.Status != "waiting" || room.CreatedAt.IsZero() || now.Sub(room.CreatedAt) < s.roomIdleTimeout {
+			continue
+		}
+		log.Printf("reconcile: expiring idle room %s (age=%s)", room.ID, now.Sub(room.CreatedAt).Round(time.Second))
+		if err := s.CleanupRoom(room.ID); err != nil {
+			log.Printf("reconcile: cleanup idle room %s: %v", room.ID, err)
+		}
+	}
+
+	// Kubernetes resource reconciliation is not needed for in-process rooms.
 	if s.mode == "local" {
 		return nil
 	}
+
 	token, apiHost, apiPort, ns, err := s.k8sConfig()
 	if err != nil {
 		return err
@@ -295,6 +335,20 @@ func (s *Server) ReconcileRooms() error {
 
 // ---- HTTP Handlers ----
 
+// HandleRoomStarted marks a room as playing after both room WebSocket
+// connections have been accepted.
+func (s *Server) HandleRoomStarted(w http.ResponseWriter, r *http.Request, roomID string) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := s.MarkRoomStarted(roomID); err != nil {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // HandleRoomFinished removes a completed room's Pod, Service, and record.
 func (s *Server) HandleRoomFinished(w http.ResponseWriter, r *http.Request, roomID string) {
 	if r.Method != http.MethodPost {
@@ -337,6 +391,17 @@ func (s *Server) HandleCreateRoom(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 500)
 		return
 	}
+	// Creating a room is the creator's reservation. The browser opens the
+	// creator's WebSocket after this response, so reserving here keeps the
+	// database capacity model aligned with the public create workflow.
+	if err := s.JoinRoom(room.ID); err != nil {
+		if cleanupErr := s.CleanupRoom(room.ID); cleanupErr != nil {
+			log.Printf("create room %s: cleanup after reservation failure: %v", room.ID, cleanupErr)
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	room.Players = 1
 	writeJSON(w, room)
 }
 

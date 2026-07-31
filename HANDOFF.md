@@ -8,7 +8,7 @@
 
 The GitOps deployment itself is healthy on the existing `vmi3474918` server and `k3d-pong` cluster. Flux is successfully reconciling the feature branch, the application is reachable through Traefik, GHCR-backed immutable images are running, and the existing 12-test Kubernetes Playwright suite previously passed.
 
-The deployment is **not yet complete** because room lifecycle cleanup is not proven. The last full E2E run left two waiting room records, Pods, and Services behind. The root cause is understood, but the follow-up lifecycle code is currently **uncommitted and not deployed** at this checkpoint.
+The deployment is **not yet complete** because the lifecycle fix is not yet deployed to the live cluster. The two waiting room records, Pods, and Services observed at the previous checkpoint were removed through the internal finished callback, and the PVC remains intact. The follow-up lifecycle implementation is currently **uncommitted and not deployed** at this checkpoint.
 
 ## What is verified
 
@@ -27,7 +27,7 @@ The deployment is **not yet complete** because room lifecycle cleanup is not pro
   - `ghcr.io/macel94/cloudnativepong-api:sha-a6bef...`
   - matching room, static, and gateway tags.
 - Anonymous GHCR pulls were previously verified with HTTP 200; no image pull secret is currently required.
-- `go test ./...` passed at this checkpoint.
+- `go test ./...`, `go test -race ./...`, and `go vet ./...` pass with the lifecycle implementation and focused tests.
 - Earlier verified checks include `go vet ./...`, CGO-free builds, Kustomize rendering, Kubernetes dry runs, local Playwright 12/12, and Kubernetes Playwright 12/12.
 - Public/intended URL: `http://169.58.97.73:18080/`.
 
@@ -80,7 +80,9 @@ This is a real lifecycle bug, not a Flux or ingress failure.
 
 ## What was tried but is not yet committed/deployed
 
-The working tree contains experimental application changes in `db/db.go` and `lobby/lobby.go`.
+The working tree contains experimental application, test, and documentation changes in `db/db.go`, `lobby/lobby.go`, `main.go`, and related files.
+
+The implementation has now been locally verified with the full Go test suite, race detector, vet, static Linux builds, Kustomize rendering, and the 12-test local Playwright suite. It has not yet been built into/published as a container image or reconciled by Flux.
 
 ### `db/db.go`
 
@@ -93,9 +95,12 @@ The current uncommitted changes:
 - add a default 10-minute idle timeout and `NewServerWithIdleTimeout` constructor;
 - scan persisted rooms during reconciliation and attempt cleanup for old `waiting` rooms;
 - retain active `playing` rooms;
-- currently leave `JoinRoom` behavior partly changed from the intended final design and do not yet add room-start notification;
-- have not yet changed the internal HTTP routes to support a room-start callback;
-- have not yet been covered by focused lobby tests;
+- reserve capacity atomically without changing lifecycle status;
+- add an idempotent `MarkRoomPlaying` operation that requires two reservations;
+- add a one-minute reconciler and injected idle timeout;
+- add `/internal/rooms/<id>/started` alongside the existing finished callback;
+- notify the lobby after both actual room WebSockets connect, and signal cleanup on disconnect/write failure;
+- add focused DB, lobby, and room-WebSocket tests;
 - have not yet been built into/published as a container image;
 - have not yet been reconciled by Flux.
 
@@ -173,8 +178,8 @@ TEST_MODE=k8s BASE_URL=http://169.58.97.73:18080 npx playwright test --reporter=
 
 ## Current checkpoint conclusion
 
-**Working:** GitOps/Flux reconciliation, immutable images, Traefik HTTP ingress, public HTTP reachability, stateless scaling, single-replica persistent SQLite API, dynamic room Pod creation, and the previously verified two-player WebSocket path.
+**Working:** GitOps/Flux reconciliation, immutable images, Traefik HTTP ingress, public HTTP reachability, stateless scaling, single-replica persistent SQLite API, dynamic room Pod creation, atomic capacity reservation, actual-connection start notification, bounded waiting-room cleanup, and the local two-player WebSocket path.
 
-**Not working/proven:** automatic cleanup of rooms created but never joined; robust cleanup on abandoned WebSocket reservations; final lifecycle implementation and live post-fix verification.
+**Not yet deployed/proven live:** the final lifecycle image has not been published or reconciled by Flux; the fresh Kubernetes abandoned-room and post-disconnect tests still need to run against that image. The previous leaked rooms were manually removed through the internal callback, and the API PVC was verified `Bound`.
 
-**Working tree note:** this handoff commit documents the current uncommitted lifecycle experiment. The next agent/session must inspect it before implementing further changes.
+**Working tree note:** this handoff commit documents the current uncommitted lifecycle implementation. Do not stage or commit automatically; review the diff, then commit/push the application fix through the ordered deployment steps below.

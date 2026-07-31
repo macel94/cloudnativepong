@@ -11,7 +11,12 @@ experimental server named `vmi3474918`.
   using the Kubernetes metrics-server.
 - Every room is a separate Pod named `pong-room-<room-id>` and a matching
   ClusterIP Service. Room Pods have resource limits and a two-hour deadline.
-- Completed, failed, and orphaned room resources are cleaned by the lobby.
+- Creating a room reserves the creator's slot; joining reserves the second slot.
+  The lobby marks a room `playing` only after the room Pod confirms both actual
+  WebSocket connections through its internal callback.
+- Completed, failed, orphaned, and abandoned waiting-room resources are cleaned
+  by the lobby. Waiting rooms expire after 10 minutes, with reconciliation
+  running every 1 minute.
 
 ## GitOps and ingress layout
 
@@ -38,8 +43,10 @@ WebSocket upgrades. The k3d load balancer maps:
 - Host `18083` → the legacy Pong NodePort 30080
 - Host `45371` → the Kubernetes API
 
-The GitOps ingress is the intended application path. After reconciliation the
-experimental site is reachable at:
+The GitOps ingress is the intended application path. The room Pod callbacks at
+`/internal/rooms/<id>/started` and `/internal/rooms/<id>/finished` are only
+reachable through the `pong-api` ClusterIP Service; the gateway does not route
+that path publicly. After reconciliation the experimental site is reachable at:
 
 ```text
 http://169.58.97.73:18080/

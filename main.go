@@ -78,11 +78,18 @@ func main() {
 		})
 		mux.HandleFunc("/internal/rooms/", func(w http.ResponseWriter, r *http.Request) {
 			parts := splitPath(r.URL.Path)
-			if len(parts) != 4 || parts[0] != "internal" || parts[1] != "rooms" || parts[3] != "finished" {
+			if len(parts) != 4 || parts[0] != "internal" || parts[1] != "rooms" {
 				http.NotFound(w, r)
 				return
 			}
-			lobbySrv.HandleRoomFinished(w, r, parts[2])
+			switch parts[3] {
+			case "started":
+				lobbySrv.HandleRoomStarted(w, r, parts[2])
+			case "finished":
+				lobbySrv.HandleRoomFinished(w, r, parts[2])
+			default:
+				http.NotFound(w, r)
+			}
 		})
 		go reconcileLobbyRooms(lobbySrv)
 		// WebSocket proxy: /rooms/{id}/ws -> room pod
@@ -164,6 +171,14 @@ func setupLocalRoutes(mux *http.ServeMux, lobbySrv *lobby.Server, store *db.Stor
 			http.Error(w, err.Error(), 500)
 			return
 		}
+		// Room creation reserves the creator's player slot; the browser opens
+		// the corresponding WebSocket after receiving this response.
+		if err := lobbySrv.JoinRoom(room.ID); err != nil {
+			_ = lobbySrv.CleanupRoom(room.ID)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		room.Players = 1
 
 		// Register in-process handler
 		handler := &lobby.RoomHandler{
@@ -207,7 +222,7 @@ func setupLocalRoutes(mux *http.ServeMux, lobbySrv *lobby.Server, store *db.Stor
 			http.NotFound(w, r)
 			return
 		}
-		handleRoomWS(w, r, parts[1])
+		handleRoomWS(w, r, parts[1], "")
 	})
 
 	// Gateway WebSocket route: /rooms/{id}/ws
@@ -219,7 +234,7 @@ func setupLocalRoutes(mux *http.ServeMux, lobbySrv *lobby.Server, store *db.Stor
 			http.NotFound(w, r)
 			return
 		}
-		handleRoomWS(w, r, parts[1])
+		handleRoomWS(w, r, parts[1], "")
 	})
 
 	// Static files (local mode only — served by nginx in K8s)
@@ -228,7 +243,7 @@ func setupLocalRoutes(mux *http.ServeMux, lobbySrv *lobby.Server, store *db.Stor
 
 func setupRoomRoutes(mux *http.ServeMux, roomID, lobbyAddr string) {
 	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
-		handleRoomWS(w, r, roomID)
+		handleRoomWS(w, r, roomID, lobbyAddr)
 	})
 	// Health check
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
@@ -237,7 +252,7 @@ func setupRoomRoutes(mux *http.ServeMux, roomID, lobbyAddr string) {
 	})
 }
 
-func handleRoomWS(w http.ResponseWriter, r *http.Request, roomID string) {
+func handleRoomWS(w http.ResponseWriter, r *http.Request, roomID, lobbyAddr string) {
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Printf("ws upgrade: %v", err)
@@ -266,14 +281,28 @@ func handleRoomWS(w http.ResponseWriter, r *http.Request, roomID string) {
 
 	log.Printf("Player %d joined room %s", player, roomID)
 
-	// Notify player of their assignment
-	conn.WriteJSON(map[string]interface{}{
+	// Notify player of their assignment.
+	if err := conn.WriteJSON(map[string]interface{}{
 		"type":   "joined",
 		"player": player,
-	})
+	}); err != nil {
+		room.signalFinished()
+		return
+	}
 
-	// Mark ready
+	// Mark ready. The lobby's playing transition is deliberately based on
+	// actual WebSocket connections, not only on API reservations.
 	room.engine.PlayerReady(player)
+	if player == 2 {
+		if err := notifyRoomStarted(roomID, lobbyAddr); err != nil {
+			// Do not leave a live game in waiting state: reconciliation would
+			// eventually expire it as an abandoned room. The room process will
+			// report finished and the lobby will clean up its resources.
+			log.Printf("room %s: failed to notify lobby that it started: %v", roomID, err)
+			room.signalFinished()
+			return
+		}
+	}
 
 	// Read loop: handle input from this player
 	go func() {
@@ -283,6 +312,7 @@ func handleRoomWS(w http.ResponseWriter, r *http.Request, roomID string) {
 			if err != nil {
 				log.Printf("Player %d disconnected: %v", player, err)
 				room.engine.PlayerLeft(player)
+				room.signalFinished()
 				// Close the other player's connection
 				room.mu.Lock()
 				other := 0
@@ -300,12 +330,9 @@ func handleRoomWS(w http.ResponseWriter, r *http.Request, roomID string) {
 		}
 	}()
 
-	// Player 2 joining triggers game start (or the existing waiting loop will
-	// observe both ready players). The loop is started once for every room so
-	// a single-player disconnect can also terminate an abandoned room.
-	if player == 2 {
-		room.engine.PlayerReady(2)
-	}
+	// Start the loop once for every room so a single-player disconnect can
+	// also terminate an abandoned room. PlayerReady above starts the engine
+	// when the second actual WebSocket has connected.
 	room.loopOnce.Do(func() { go runGameLoop(room) })
 
 	// Keep connection alive (read loop above will exit on disconnect)
@@ -320,6 +347,7 @@ func handleRoomWS(w http.ResponseWriter, r *http.Request, roomID string) {
 			"state": state,
 		})
 		if err != nil {
+			room.signalFinished()
 			return
 		}
 		if state.Status == game.StatusFinished {
@@ -367,17 +395,44 @@ func (r *localRoom) signalFinished() {
 	r.doneOnce.Do(func() { close(r.done) })
 }
 
+const roomReconcileInterval = time.Minute
+
 func reconcileLobbyRooms(lobbySrv *lobby.Server) {
 	if err := lobbySrv.ReconcileRooms(); err != nil {
 		log.Printf("room reconciliation: %v", err)
 	}
-	ticker := time.NewTicker(5 * time.Minute)
+	ticker := time.NewTicker(roomReconcileInterval)
 	defer ticker.Stop()
 	for range ticker.C {
 		if err := lobbySrv.ReconcileRooms(); err != nil {
 			log.Printf("room reconciliation: %v", err)
 		}
 	}
+}
+
+func notifyRoomStarted(roomID, lobbyAddr string) error {
+	if lobbyAddr == "" {
+		return nil
+	}
+	url := "http://" + lobbyAddr + "/internal/rooms/" + roomID + "/started"
+	client := &http.Client{Timeout: 5 * time.Second}
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		resp, err := client.Post(url, "application/json", nil)
+		if err == nil {
+			resp.Body.Close()
+			if resp.StatusCode < 300 {
+				return nil
+			}
+			lastErr = fmt.Errorf("lobby start notification returned HTTP %d", resp.StatusCode)
+		} else {
+			lastErr = err
+		}
+		if attempt < 2 {
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+	return lastErr
 }
 
 func notifyRoomFinished(roomID, lobbyAddr string) {

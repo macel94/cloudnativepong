@@ -89,6 +89,83 @@ func TestWriteWebSocketFramePayloadLengths(t *testing.T) {
 	}
 }
 
+func TestRoomWebSocketsNotifyLobbyWhenBothPlayersConnect(t *testing.T) {
+	store, err := db.New(":memory:")
+	if err != nil {
+		t.Fatalf("db.New() error = %v", err)
+	}
+	defer store.Close()
+
+	lobbySrv := lobby.NewServer(store, "local", "", "")
+	room, err := lobbySrv.CreateRoom("actual-start")
+	if err != nil {
+		t.Fatalf("CreateRoom() error = %v", err)
+	}
+	if err := lobbySrv.JoinRoom(room.ID); err != nil {
+		t.Fatalf("first JoinRoom() error = %v", err)
+	}
+	if err := lobbySrv.JoinRoom(room.ID); err != nil {
+		t.Fatalf("second JoinRoom() error = %v", err)
+	}
+
+	callback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		parts := splitPath(r.URL.Path)
+		if len(parts) != 4 || parts[3] != "started" {
+			http.NotFound(w, r)
+			return
+		}
+		lobbySrv.HandleRoomStarted(w, r, parts[2])
+	}))
+	defer callback.Close()
+
+	mux := http.NewServeMux()
+	setupRoomRoutes(mux, room.ID, strings.TrimPrefix(callback.URL, "http://"))
+	roomServer := httptest.NewServer(mux)
+	defer roomServer.Close()
+
+	dial := func() *websocket.Conn {
+		conn, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(roomServer.URL, "http")+"/ws", nil)
+		if err != nil {
+			t.Fatalf("room WebSocket dial error = %v", err)
+		}
+		return conn
+	}
+	player1 := dial()
+	defer player1.Close()
+	if _, _, err := player1.ReadMessage(); err != nil {
+		t.Fatalf("player 1 joined message error = %v", err)
+	}
+
+	got, err := store.GetRoom(room.ID)
+	if err != nil {
+		t.Fatalf("GetRoom() after player 1 error = %v", err)
+	}
+	if got.Status != "waiting" {
+		t.Fatalf("status after player 1 = %q, want waiting", got.Status)
+	}
+
+	player2 := dial()
+	defer player2.Close()
+	if _, _, err := player2.ReadMessage(); err != nil {
+		t.Fatalf("player 2 joined message error = %v", err)
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		got, err = store.GetRoom(room.ID)
+		if err != nil {
+			t.Fatalf("GetRoom() after player 2 error = %v", err)
+		}
+		if got.Status == "playing" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("status after player 2 = %q, want playing", got.Status)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 func TestProxyRoomWSForwardsImmediateJoinedFrame(t *testing.T) {
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
