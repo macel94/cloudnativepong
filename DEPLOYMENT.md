@@ -66,9 +66,9 @@ https://www.belacca.com/        → redirect to the personal site
 DNS A records for the two subdomains and both existing apex names point at
 `169.58.97.73`. Traefik exposes the
 `websecure` entrypoint on public port 443 and obtains certificates from
-Let's Encrypt using HTTP-01 validation on port 80. The certificate store is
-persisted in `kube-system/traefik-acme`, so certificates renew automatically
-across Traefik restarts. WebSockets use the same HTTPS ingress.
+Let's Encrypt using the TLS-ALPN-01 challenge on port 443. The certificate
+store is persisted in `kube-system/traefik-acme`, so certificates renew
+automatically across Traefik restarts. WebSockets use the same HTTPS ingress.
 
 ## Project clusters on this server
 
