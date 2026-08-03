@@ -94,23 +94,22 @@ kubectl apply -f k8s/all.yaml
 
 ### Public play URL
 
-The currently deployed public application is available at:
+Cloud Native Pong is hosted at:
 
-- **[https://belacca.com/](https://belacca.com/)**
-- **[https://www.belacca.com/](https://www.belacca.com/)**
+- **[https://pong.belacca.com/](https://pong.belacca.com/)**
 
-HTTP requests redirect to HTTPS. Open either URL, enter a display name, and
-create or join a room. Browser WebSocket connections are served over TLS.
-Let's Encrypt certificates are issued and renewed automatically by Traefik,
-with certificate state stored in the `kube-system/traefik-acme` PVC.
+The apex names `belacca.com` and `www.belacca.com` redirect to the personal
+site at `https://francesco.belacca.com/`. Open the Pong subdomain, enter a
+display name, and create or join a room. Browser WebSocket connections are
+served over TLS. Let's Encrypt certificates are issued and renewed
+automatically by Traefik, with certificate state stored in the
+`kube-system/traefik-acme` PVC.
 
-The public endpoints were checked on 2026-07-31 and returned HTTP 200. The
-application health and lobby API also returned successfully:
-
-```text
-GET https://belacca.com/health    → 200 OK
-GET https://belacca.com/api/rooms → 200 OK
-```
+Host-based routing is owned by the public
+[`macel94/belacca-gitops`](https://github.com/macel94/belacca-gitops) repository;
+this repository owns Pong workloads and immutable images. DNS must contain A
+records for `pong.belacca.com` and `francesco.belacca.com` pointing to
+`169.58.97.73` before ACME can issue certificates.
 
 ### Cluster layout
 
@@ -135,7 +134,7 @@ flowchart TB
     ciCluster["Ephemeral dev/test k3d cluster\nCreated per CI run\nDestroyed after E2E"]
     ciApp["Kubernetes E2E\nthrough gateway"]
 
-    internet -->|"Play here: https://belacca.com/"| machine
+    internet -->|"Play here: https://pong.belacca.com/"| machine
     machine --> publicLB --> publicCluster
     publicCluster --> traefik --> gateway --> app
     git -->|"Flux watches main"| flux
@@ -156,8 +155,10 @@ cluster. Only `pong` is currently running on the machine and exposed publicly.
 
 The cluster has one server, two agents, and a load balancer. The `pong`
 namespace contains the game, while `flux-system` contains the GitOps
-controllers. The public route is Traefik → `pong-gateway` → the static/API
-services. The NodePort remains available for local diagnostics at port `30080`.
+controllers. The Pong route is Traefik → `pong-gateway` → the static/API
+services. Host-based routing is declared in
+`macel94/belacca-gitops`; this repository does not expose a wildcard or apex
+Ingress. The NodePort remains available for local diagnostics at port `30080`.
 
 To inspect the cluster when the k3d host is available:
 
@@ -176,7 +177,9 @@ it should have its own kubeconfig context and a separate directory under
 
 Kubernetes application changes are managed with **Flux v2 GitOps**. Git is the
 source of truth; do not use a manual `kubectl apply` as the permanent production
-deployment mechanism.
+deployment mechanism. The cluster-level source of truth is
+[`macel94/belacca-gitops`](https://github.com/macel94/belacca-gitops); this
+repository is one independently reconciled application source.
 
 1. Work locally and run the Go, lint, and Playwright tests. Pull requests run
    local-mode E2E tests and build all four container images. The Kubernetes E2E

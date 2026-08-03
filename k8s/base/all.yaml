@@ -16,6 +16,10 @@ apiVersion: v1
 kind: Namespace
 metadata:
   name: pong
+  annotations:
+    # The namespace contains the SQLite PVC. Protect both from Flux garbage
+    # collection during future source/Kustomization ownership changes.
+    kustomize.toolkit.fluxcd.io/prune: disabled
 
 # ──────────────────────────────────────────────
 # Gateway — reverse proxy / entry point
@@ -159,6 +163,9 @@ kind: PersistentVolumeClaim
 metadata:
   name: pong-api-data
   namespace: pong
+  annotations:
+    # Never delete the database claim as part of application reconciliation.
+    kustomize.toolkit.fluxcd.io/prune: disabled
   labels:
     app: cloudnativepong
     component: api

@@ -1,14 +1,21 @@
-# Cloud Native Pong — GitOps/server deployment handoff
+# Cloud Native Pong — historical GitOps/server deployment handoff
+
+> **Superseded:** This checkpoint describes the former single-repository Flux
+> setup. The current multi-project hosting plan moves cluster ownership to
+> [`macel94/belacca-gitops`](https://github.com/macel94/belacca-gitops), keeps Pong
+> at [`pong.belacca.com`](https://pong.belacca.com), and hosts the personal site
+> at [`francesco.belacca.com`](https://francesco.belacca.com). Use
+> `belacca-gitops/MIGRATION.md` for the staged cutover procedure.
 
 **Checkpoint date:** 2026-07-31
 **Branch:** `feat/gitops-server-deployment`
-**Purpose:** Preserve a clear continuation point for the Cloud Native Pong deployment work. Do not merge this branch into `main` until the room-lifecycle issue below is fixed and verified.
+**Purpose:** Preserve historical context for the prior Cloud Native Pong deployment work.
 
 ## Executive status
 
-The GitOps deployment itself is healthy on the existing `vmi3474918` server and `k3d-pong` cluster. Flux is successfully reconciling the feature branch, the application is reachable through Traefik, GHCR-backed immutable images are running, and the existing 12-test Kubernetes Playwright suite previously passed.
+The former GitOps deployment was healthy on the existing `vmi3474918` server and `k3d-pong` cluster. The live cluster has since been observed on `main`; the platform repository migration is documented separately.
 
-The deployment is **not yet complete** because the lifecycle fix is not yet deployed to the live cluster. The two waiting room records, Pods, and Services observed at the previous checkpoint were removed through the internal finished callback, and the PVC remains intact. The follow-up lifecycle implementation is currently **uncommitted and not deployed** at this checkpoint.
+This document is retained for lifecycle investigation history only. Do not use its former branch/source instructions for the multi-project cutover.
 
 ## What is verified
 

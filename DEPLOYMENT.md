@@ -20,25 +20,29 @@ experimental server named `vmi3474918`.
 
 ## GitOps and ingress layout
 
-Flux v2.9.3 is installed in the `flux-system` namespace. Its source controller
-watches this repository over HTTPS using the `flux-system` Secret:
+Flux v2.9.3 is installed in the `flux-system` namespace. The cluster-level
+source controller watches
+[`macel94/belacca-gitops`](https://github.com/macel94/belacca-gitops) over HTTPS
+using the `flux-system` Secret. That platform repository declares this
+repository as an independent child source:
 
-- Repository: `https://github.com/macel94/cloudnativepong.git`
-- Branch: `main` (the production source of truth)
-- Flux path: `./clusters/vmi3474918`
-- Application path: `./k8s/overlays/server`
+- Platform repository: `https://github.com/macel94/belacca-gitops.git`
+- Application repository: `https://github.com/macel94/cloudnativepong.git`
+- Branch: `main`
+- Flux application path: `./k8s/overlays/server`
 - Source refresh interval: 1 minute
-- Application reconciliation interval: 10 minutes (force it for immediate validation with `flux reconcile kustomization`)
+- Application reconciliation interval: 10 minutes (force it for immediate validation with `flux reconcile kustomization pong -n flux-system --with-source`)
 
 The Flux controllers are `source-controller`, `kustomize-controller`,
 `helm-controller`, and `notification-controller`. The generated Flux
 bootstrap manifests live under `clusters/vmi3474918/flux-system` and should be
 changed only through the documented Flux upgrade/bootstrap process.
 
-Traefik is the existing k3s ingress controller in `kube-system`. The Pong
-Ingress uses class `traefik` and the `web` entrypoint, forwarding all paths to
-`pong-gateway`; NGINX in that gateway handles static files, API calls, and
-WebSocket upgrades. The k3d load balancer maps:
+Traefik is the existing k3s ingress controller in `kube-system`. The
+cluster-level platform repository owns the host-based Pong Ingress for
+`pong.belacca.com`, using class `traefik` and the `web,websecure` entrypoints.
+It forwards all paths to `pong-gateway`; NGINX in that gateway handles static
+files, API calls, and WebSocket upgrades. The k3d load balancer maps:
 
 - Host `80` and `18080` → Traefik HTTP port 80
 - Host `443` → Traefik HTTPS port 443
@@ -50,14 +54,17 @@ The GitOps ingress is the intended application path. The room Pod callbacks at
 reachable through the `pong-api` ClusterIP Service; the gateway does not route
 that path publicly.
 
-The public site is available at:
+The public endpoints are:
 
 ```text
-https://belacca.com/
-https://www.belacca.com/
+https://pong.belacca.com/       → Cloud Native Pong
+https://francesco.belacca.com/  → personal site
+https://belacca.com/            → redirect to the personal site
+https://www.belacca.com/        → redirect to the personal site
 ```
 
-DNS A records for both names point at `169.58.97.73`. Traefik exposes the
+DNS A records for the two subdomains and both existing apex names point at
+`169.58.97.73`. Traefik exposes the
 `websecure` entrypoint on public port 443 and obtains certificates from
 Let's Encrypt using HTTP-01 validation on port 80. The certificate store is
 persisted in `kube-system/traefik-acme`, so certificates renew automatically
