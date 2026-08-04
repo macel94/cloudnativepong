@@ -6,7 +6,7 @@
     "test:ui": "npx playwright test --ui"
   },
   "devDependencies": {
-    "@playwright/test": "^1.55.0",
+    "@playwright/test": "^1.62.1",
     "typescript": "^7.0.2"
   },
   "dependencies": {
