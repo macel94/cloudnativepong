@@ -61,6 +61,10 @@ jobs:
           ignore-unfixed: true
           exit-code: ${{ env.STRICT == 'true' && '1' || '0' }}
 
+      - name: Validate immutable release contract
+        if: matrix.component == 'api'
+        run: python3 scripts/validate-release.py
+
       - name: Upload vulnerability report
         uses: actions/upload-artifact@v4
         if: always()

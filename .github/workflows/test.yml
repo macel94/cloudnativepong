@@ -25,6 +25,9 @@ jobs:
           go-version: "1.25"
           cache: true
 
+      - name: Validate immutable release metadata
+        run: python3 scripts/validate-release.py
+
       - name: Build binary
         run: CGO_ENABLED=0 go build -ldflags="-s -w" -o cloudnativepong .
 

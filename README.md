@@ -319,9 +319,13 @@ cosign verify-attestation "$DIGEST" || true  # only for Cosign-signed attestatio
 ```
 
 A digest is evidence of exact image bytes; provenance describes how they were
-built; a Cosign signature verifies the publisher identity. The signing workflow
-is not automatically invoked because normal CI must not require external
-identity credentials. Treat a failed verification as a release-policy decision,
+built; a Cosign signature verifies the publisher identity. `release-metadata.json`
+and `scripts/validate-release.py` make the current pending/verified state
+explicit. `scripts/promote-digests.sh` accepts only four exact GHCR
+`IMAGE@sha256:<digest>` references and updates the production Kustomize overlay;
+it never resolves mutable tags or signs artifacts. The signing workflow is not
+automatically invoked because normal CI must not require external identity
+credentials. Treat a failed verification as a release-policy decision,
 not as permission to fall back to a mutable tag.
 
 ### SQLite backup and restore verification

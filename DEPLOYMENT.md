@@ -191,7 +191,11 @@ exact deployment. `.github/workflows/publish-images.yml` adds BuildKit SBOM and
 or `--load` cannot retain registry attestations.
 
 `.github/workflows/supply-chain.yml` creates local images, uploads CycloneDX
-SBOMs, and stores Trivy HIGH/CRITICAL reports. It is report-only by default so
+SBOMs, stores Trivy HIGH/CRITICAL reports, and validates the immutable
+`release-metadata.json` contract. `scripts/validate-release.py` fails closed if
+production references are not full SHA tags or promoted digests. The manual
+`scripts/promote-digests.sh` helper requires four exact GHCR digest references;
+it does not resolve tags or claim signatures. It is report-only by default so
 normal CI does not fail because of a newly published advisory; a manually
 requested `strict=true` run turns those findings into a gate. There are no
 registry credentials or vulnerability exceptions in this repository.

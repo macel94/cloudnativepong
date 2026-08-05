@@ -1,0 +1,18 @@
+{
+  "schema_version": "belacca.release-metadata.v1",
+  "source_commit": "212244a936984afc191f65fa93b36f45c4e6b5d8",
+  "release_tag": "sha-212244a936984afc191f65fa93b36f45c4e6b5d8",
+  "promotion": "production-overlay",
+  "resolution_status": "pending_registry_resolution",
+  "images": [
+    {"component": "api", "image": "ghcr.io/macel94/cloudnativepong-api", "digest": null, "provenance": "required", "signature": "not_yet_verified"},
+    {"component": "room", "image": "ghcr.io/macel94/cloudnativepong-room", "digest": null, "provenance": "required", "signature": "not_yet_verified"},
+    {"component": "static", "image": "ghcr.io/macel94/cloudnativepong-static", "digest": null, "provenance": "required", "signature": "not_yet_verified"},
+    {"component": "gateway", "image": "ghcr.io/macel94/cloudnativepong-gateway", "digest": null, "provenance": "required", "signature": "not_yet_verified"}
+  ],
+  "notes": [
+    "The pending resolution state is intentional until the publish/promotion workflow records registry-resolved digests; a release is not supply-chain verified while any digest is null.",
+    "BuildKit SBOM/provenance is generated at push time; Cosign signature verification requires a separate OIDC-enabled workflow or admission policy.",
+    "Do not treat a commit tag as a cryptographic image digest."
+  ]
+}
