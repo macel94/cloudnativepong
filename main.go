@@ -31,8 +31,11 @@ import (
 	"github.com/cloudnativepong/game"
 	"github.com/cloudnativepong/lobby"
 	"github.com/cloudnativepong/metrics"
+	"github.com/cloudnativepong/telemetry"
 
 	"github.com/gorilla/websocket"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 )
 
 type originAllowlist map[string]struct{}
@@ -40,6 +43,7 @@ type originAllowlist map[string]struct{}
 var websocketOrigins = defaultOriginAllowlist("local")
 var publicAdmission = admission.NewController(admission.DefaultConfig)
 var appMetrics = metrics.NewRegistry()
+var appTelemetry = &telemetry.Provider{}
 
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool { return websocketOrigins.allowed(r.Header.Get("Origin")) },
@@ -121,6 +125,18 @@ func main() {
 
 	configureOriginPolicy(*mode, *allowedOrigins)
 	publicAdmission = admission.NewController(admission.ConfigFromEnv(os.Getenv))
+	tracing, err := telemetry.Setup(context.Background(), os.Getenv)
+	if err != nil {
+		log.Fatalf("telemetry setup: %v", err)
+	}
+	appTelemetry = tracing
+	defer func() {
+		shutdownCtx, cancel := telemetry.ShutdownContext()
+		defer cancel()
+		if err := appTelemetry.Shutdown(shutdownCtx); err != nil {
+			log.Printf("telemetry shutdown failed: %v", err)
+		}
+	}()
 
 	store, err := db.NewWithMetrics(*dbPath, appMetrics)
 	if err != nil {
@@ -453,7 +469,7 @@ func handleRoomWS(w http.ResponseWriter, r *http.Request, roomID, lobbyAddr stri
 				startErr = start()
 			}
 		} else {
-			startErr = notifyRoomStarted(roomID, lobbyAddr, requestID(r))
+			startErr = notifyRoomStartedContext(r.Context(), roomID, lobbyAddr, requestID(r))
 		}
 		if startErr != nil {
 			// Do not leave a live game in waiting state: reconciliation would
@@ -592,17 +608,25 @@ func reconcileLobbyRooms(lobbySrv *lobby.Server) {
 }
 
 func notifyRoomStarted(roomID, lobbyAddr, correlationID string) error {
+	return notifyRoomStartedContext(context.Background(), roomID, lobbyAddr, correlationID)
+}
+
+func notifyRoomStartedContext(ctx context.Context, roomID, lobbyAddr, correlationID string) error {
 	if lobbyAddr == "" {
 		return nil
 	}
+	ctx, span := appTelemetry.Start(ctx, "room.callback.start", attribute.String("room.callback", "started"))
+	defer span.End()
 	url := "http://" + lobbyAddr + "/internal/rooms/" + roomID + "/started"
 	client := &http.Client{Timeout: 5 * time.Second}
 	for attempt := 0; attempt < 3; attempt++ {
 		appMetrics.Inc("pong_room_start_callback_attempt")
 		req, err := http.NewRequest(http.MethodPost, url, nil)
 		if err == nil {
+			req = req.WithContext(ctx)
 			req.Header.Set(requestIDHeader, correlationID)
 			req.Header.Set(correlationIDHeader, correlationID)
+			telemetry.Inject(ctx, req.Header)
 			resp, requestErr := client.Do(req)
 			if requestErr == nil {
 				resp.Body.Close()
@@ -622,9 +646,15 @@ func notifyRoomStarted(roomID, lobbyAddr, correlationID string) error {
 }
 
 func notifyRoomFinished(roomID, lobbyAddr, correlationID string) {
+	notifyRoomFinishedContext(context.Background(), roomID, lobbyAddr, correlationID)
+}
+
+func notifyRoomFinishedContext(ctx context.Context, roomID, lobbyAddr, correlationID string) {
 	if lobbyAddr == "" {
 		return
 	}
+	ctx, span := appTelemetry.Start(ctx, "room.callback.finish", attribute.String("room.callback", "finished"))
+	defer span.End()
 	url := "http://" + lobbyAddr + "/internal/rooms/" + roomID + "/finished"
 	client := &http.Client{Timeout: 5 * time.Second}
 	req, err := http.NewRequest(http.MethodPost, url, nil)
@@ -632,8 +662,10 @@ func notifyRoomFinished(roomID, lobbyAddr, correlationID string) {
 		appMetrics.Inc("pong_room_finish_callback_failure")
 		return
 	}
+	req = req.WithContext(ctx)
 	req.Header.Set(requestIDHeader, correlationID)
 	req.Header.Set(correlationIDHeader, correlationID)
+	telemetry.Inject(ctx, req.Header)
 	resp, err := client.Do(req)
 	if err != nil {
 		appMetrics.Inc("pong_room_finish_callback_failure")
@@ -862,6 +894,10 @@ func (w *responseRecorder) Unwrap() http.ResponseWriter { return w.ResponseWrite
 
 func requestMetrics(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := telemetry.Extract(r.Context(), r.Header)
+		ctx, span := appTelemetry.Start(ctx, "http.request", attribute.String("http.route", telemetry.HTTPRoute(r.URL.Path)), attribute.String("http.method", r.Method))
+		defer span.End()
+		r = r.WithContext(ctx)
 		r = withRequestID(r)
 		id := requestID(r)
 		w.Header().Set(requestIDHeader, id)
@@ -869,7 +905,12 @@ func requestMetrics(next http.Handler) http.Handler {
 		recorder := &responseRecorder{ResponseWriter: w}
 		appMetrics.Inc("pong_http_requests")
 		next.ServeHTTP(recorder, r)
-		switch status := recorder.statusCode(); {
+		status := recorder.statusCode()
+		span.SetAttributes(attribute.Int("http.status_code", status))
+		if status >= 400 {
+			span.SetStatus(codes.Error, "http request failed")
+		}
+		switch {
 		case status >= 500:
 			appMetrics.Inc("pong_http_responses_5xx")
 			appMetrics.Inc("pong_http_requests_failure")
@@ -974,6 +1015,7 @@ func proxyRoomWS(w http.ResponseWriter, r *http.Request, lobbySrv *lobby.Server,
 	}
 	targetHeader.Set(requestIDHeader, requestID(r))
 	targetHeader.Set(correlationIDHeader, requestID(r))
+	telemetry.Inject(r.Context(), targetHeader)
 	for i := 0; i < 10; i++ {
 		target, _, err = dialer.Dial("ws://"+addr+"/ws", targetHeader)
 		if err == nil {

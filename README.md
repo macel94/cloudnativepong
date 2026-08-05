@@ -389,6 +389,8 @@ NGINX's `/rooms/` location explicitly enables HTTP/1.1 upgrade headers, disables
 
 ## 📈 Application observability and reliability contract
 
+`/metrics` exposes dependency-free Prometheus text format. Optional OpenTelemetry OTLP/HTTP tracing is available through `OTEL_EXPORTER_OTLP_ENDPOINT` or `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`; without either variable, tracing is a no-op and no collector is contacted. HTTP spans and W3C propagation use bounded route/status metadata only and never include room IDs, names, IPs, tokens, URLs, or request bodies. See `DEPLOYMENT.md` for the private collector contract.
+
 `/metrics` exposes dependency-free Prometheus text format. Metrics are aggregate
 fixed-name counters and gauges only: there are no labels, room IDs, names, IPs,
 tokens, URLs, or request contents in telemetry. The registry also caps the

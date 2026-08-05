@@ -271,6 +271,35 @@ destroyed or overwritten for this rehearsal.
 
 ## Observability, failure handling, and bounded smoke
 
+### Optional OpenTelemetry tracing
+
+Pong includes OpenTelemetry Go `v1.45.0` tracing with OTLP/HTTP export. It is
+opt-in: without an OTLP endpoint, the process uses the SDK no-op provider and
+has no collector dependency or export traffic. Enable it only after an
+approved private collector is available:
+
+```bash
+OTEL_EXPORTER_OTLP_ENDPOINT=https://otel-collector.example.invalid:4318 \
+  OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=https://otel-collector.example.invalid:4318/v1/traces \
+  ./cloudnativepong --mode=local
+```
+
+The endpoint must be supplied out of band and must use TLS unless the operator
+explicitly sets the documented OTLP insecure variable for a private local test.
+The process flushes and shuts down the provider within a bounded timeout.
+HTTP spans use only normalized route names, methods, and status codes. W3C
+trace context is propagated to internal room callbacks and proxy WebSocket
+connections. Room IDs, player names, client IPs, tokens, arbitrary URLs, and
+request bodies are never span attributes.
+
+The implementation follows the official OpenTelemetry Go API/SDK and OTLP/HTTP
+exporter documentation:
+
+- <https://opentelemetry.io/docs/languages/go/>
+- <https://opentelemetry.io/docs/languages/go/exporters/>
+- <https://opentelemetry.io/docs/languages/go/instrumentation/>
+- <https://pkg.go.dev/go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp>
+
 Scrape `/metrics` through the existing private/cluster monitoring path. Do not
 add labels or relabel rules containing room IDs, names, IPs, tokens, URLs, or
 request IDs. Alerting should use the aggregate success/failure counters and
