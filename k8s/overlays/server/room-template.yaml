@@ -16,11 +16,24 @@ data:
         }
       },
       "spec": {
+        "automountServiceAccountToken": false,
+        "securityContext": {
+          "runAsNonRoot": true,
+          "runAsUser": 65532,
+          "runAsGroup": 65532,
+          "seccompProfile": { "type": "RuntimeDefault" }
+        },
         "containers": [
           {
             "name": "pong-room",
             "image": "ghcr.io/macel94/cloudnativepong-room:sha-212244a936984afc191f65fa93b36f45c4e6b5d8",
             "imagePullPolicy": "Always",
+            "securityContext": {
+              "allowPrivilegeEscalation": false,
+              "capabilities": { "drop": ["ALL"] },
+              "readOnlyRootFilesystem": true,
+              "runAsNonRoot": true
+            },
             "args": [
               "--mode=room",
               "--room-id=${ROOM_ID}",

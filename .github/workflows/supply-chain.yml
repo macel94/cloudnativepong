@@ -1,0 +1,70 @@
+name: Supply chain checks
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'Dockerfile.*'
+      - 'go.mod'
+      - 'go.sum'
+      - '**.go'
+      - 'static/**'
+      - 'gateway/**'
+      - 'scripts/supply-chain.sh'
+      - '.github/workflows/supply-chain.yml'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      strict:
+        description: 'Fail on HIGH or CRITICAL findings (reviewed security run)'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    name: SBOM and vulnerability scan (${{ matrix.component }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        component: [api, room, static, gateway]
+    env:
+      IMAGE: cloudnativepong-${{ matrix.component }}:supply-chain
+      STRICT: ${{ inputs.strict || false }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build local image
+        run: docker build --file "Dockerfile.${{ matrix.component }}" --tag "$IMAGE" .
+
+      - name: Generate image SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          image: ${{ env.IMAGE }}
+          format: cyclonedx-json
+          artifact-name: cloudnativepong-${{ matrix.component }}.sbom.cdx.json
+          output-file: cloudnativepong-${{ matrix.component }}.sbom.cdx.json
+          upload-artifact: true
+
+      - name: Scan image with Trivy (report-only by default)
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE }}
+          format: json
+          output: cloudnativepong-${{ matrix.component }}.trivy.json
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: ${{ env.STRICT == 'true' && '1' || '0' }}
+
+      - name: Upload vulnerability report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cloudnativepong-${{ matrix.component }}-trivy
+          path: cloudnativepong-${{ matrix.component }}.trivy.json
+          if-no-files-found: warn

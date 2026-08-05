@@ -33,8 +33,8 @@ A minimalist, horizontally-scalable PONG game running on Kubernetes. Each game r
 
 | Component | Image | Replicas | Purpose |
 |-----------|-------|----------|---------|
-| **Gateway** | `cloudnativepong-gateway` | 1 | NGINX entry point, routes by path |
-| **Static** | `cloudnativepong-static` | 1 | Serves HTML, CSS, JS via nginx |
+| **Gateway** | `cloudnativepong-gateway` | 2 production / 1 local | NGINX entry point, routes by path |
+| **Static** | `cloudnativepong-static` | 2 production / 1 local | Serves HTML, CSS, JS via nginx |
 | **API** | `cloudnativepong-api` | 1 | Room CRUD, K8s pod orchestration, WebSocket proxy |
 | **Room** | `cloudnativepong-room` | N (dynamic) | One pod per game, runs PONG engine |
 
@@ -109,7 +109,9 @@ Host-based routing is owned by the public
 [`macel94/belacca-gitops`](https://github.com/macel94/belacca-gitops) repository;
 this repository owns Pong workloads and immutable images. DNS must contain A
 records for `pong.belacca.com` and `francesco.belacca.com` pointing to
-`169.58.97.73` before ACME can issue certificates.
+`169.58.97.73` for normal traffic. ACME uses the platform's Cloudflare DNS-01
+configuration and its out-of-band `kube-system/traefik-cloudflare` Secret; no
+DNS/API value is stored here.
 
 ### Cluster layout
 
@@ -141,7 +143,8 @@ flowchart TB
     flux -->|"reconciles ./clusters/vmi3474918"| publicCluster
     git --> actions -->|"k3d + kubectl apply"| ciCluster --> ciApp
     actions -->|"build/publish immutable GHCR images"| git
-    flux -. "No dashboard installed; use kubectl/Flux" .-> publicCluster
+    dashboard["Headlamp operations dashboard\nprivate port-forward only"]
+    publicCluster --> dashboard
 ```
 
 The diagram's two Kubernetes boxes represent two different roles: the
@@ -243,8 +246,9 @@ The port-forward binds to localhost by default. Do not expose it with a public
 Ingress, NodePort, or load balancer. If remote access is ever required, use an
 authenticated private tunnel or identity-aware proxy with HTTPS and audited
 RBAC instead. The public game URL remains intentionally separate and provides
-no cluster-administration access. The project currently has one cluster, and it is administered with
-`kubectl` and observed with Flux:
+no cluster-administration access. The persistent project target is administered
+with `kubectl` and observed with Flux; CI and the guarded restore rehearsal use
+only explicitly disposable k3d clusters:
 
 ```bash
 kubectl config use-context k3d-pong
@@ -260,6 +264,106 @@ provide cluster-administration access. If a dashboard is installed in the
 future, expose it through an authenticated, private access path (for example,
 port-forwarding or an identity-aware proxy) rather than adding it to the public
 Pong ingress.
+
+## 🔐 Supply-chain, synthetic checks, and recovery
+
+The repository provides reusable helpers under `scripts/` and opt-in GitHub
+workflows:
+
+- `.github/workflows/supply-chain.yml` builds each image locally, uploads a
+  CycloneDX SBOM, and uploads a Trivy JSON report for HIGH/CRITICAL findings.
+  Normal runs are report-only and ignore unfixed findings; use the manual
+  `strict=true` input for a reviewed security run that fails on those findings.
+- `.github/workflows/publish-images.yml` pushes the four immutable
+  `sha-<commit>` tags with BuildKit `--provenance=mode=max` and `--sbom=true`.
+  Attestations require a registry push and are not produced by local `docker
+  build` or `--load`.
+- `.github/workflows/sign-images.yml` is deliberately manual. Supply an
+  `IMAGE@sha256:<digest>` reference; `scripts/sign-image.sh` rejects mutable
+  tags and uses Sigstore keyless signing. It requires GitHub OIDC
+  (`id-token: write`) and registry access at execution time. No signing key or
+  credential is stored in this repository. `scripts/verify-image.sh` provides the
+matching digest-only Cosign verification hook; pass the expected repository
+workflow identity regexp rather than accepting any signer.
+- `.github/workflows/synthetic-check.yml` is a scheduled/manual external check.
+  Set the out-of-band repository or organization variable
+  `SYNTHETIC_PONG_URL` and, only if required by a front door, the optional
+  `SYNTHETIC_AUTH_TOKEN` secret. The check validates health, room API CRUD,
+  two-player WebSocket assignment, and state delivery. Without the variable it
+  exits as an explicit safe skip; it does not claim an external monitor exists.
+
+Useful local dry runs do not require a registry, credentials, or scanners:
+
+```bash
+./scripts/supply-chain.sh sbom --target . --dry-run
+./scripts/supply-chain.sh scan-fs --target . --dry-run
+./scripts/supply-chain.sh scan-image cloudnativepong-api:local --dry-run
+./scripts/sign-image.sh ghcr.io/macel94/cloudnativepong-api@sha256:$(printf '0%.0s' {1..64}) --dry-run
+./scripts/verify-image.sh ghcr.io/macel94/cloudnativepong-api@sha256:$(printf '0%.0s' {1..64}) --certificate-identity-regexp 'repo:macel94/cloudnativepong:.*' --dry-run
+./scripts/synthetic-check.sh --dry-run
+```
+
+For a pushed image, resolve the digest from GHCR rather than relying on its
+mutable tag, then inspect its BuildKit SBOM/provenance attachments with Docker
+Buildx tooling:
+
+```bash
+IMAGE=ghcr.io/macel94/cloudnativepong-api:sha-<commit>
+docker buildx imagetools inspect "$IMAGE"
+# After recording the displayed digest:
+DIGEST=ghcr.io/macel94/cloudnativepong-api@sha256:<digest>
+./scripts/verify-image.sh "$DIGEST" \
+  --certificate-identity-regexp 'repo:macel94/cloudnativepong:.*'
+cosign tree "$DIGEST"
+cosign verify-attestation "$DIGEST" || true  # only for Cosign-signed attestations
+```
+
+A digest is evidence of exact image bytes; provenance describes how they were
+built; a Cosign signature verifies the publisher identity. The signing workflow
+is not automatically invoked because normal CI must not require external
+identity credentials. Treat a failed verification as a release-policy decision,
+not as permission to fall back to a mutable tag.
+
+### SQLite backup and restore verification
+
+`pong-api` owns `/data/pong.db` on the `pong-api-data` PVC. There is currently
+no configured object-storage bucket, off-cluster backup service, retention
+policy, encryption key, or scheduled backup Job. `scripts/backup-restore.py`
+creates a local operator artifact and verifies it in a temporary directory;
+it does not upload data or modify the live PVC. The opt-in
+`scripts/restore-rehearsal.sh` can seed a copied, verified artifact into a newly
+created `pong-restore-*` k3d cluster and check the restored API through its
+isolated gateway. It refuses `k3d-pong`/`pong` and requires an explicit
+acknowledgement before creating anything.
+
+```bash
+# Safe command preview; no cluster or filesystem changes.
+./scripts/backup-restore.sh backup /path/to/pong.db ./artifacts/pong.db --dry-run
+
+# On a maintenance copy (not a live byte-for-byte copy), create and verify.
+./scripts/backup-restore.sh backup /path/to/pong.db ./artifacts/pong.db
+./scripts/backup-restore.sh verify ./artifacts/pong.db
+./scripts/backup-restore.sh self-test
+
+# Isolated rehearsal; requires k3d, kubectl, Docker images, and explicit opt-in.
+./scripts/restore-rehearsal.sh --backup ./artifacts/pong.db \
+  --build-images \
+  --i-understand-this-creates-an-isolated-cluster
+```
+
+The rehearsal verifies the artifact before cluster creation, copies it to a new
+PVC, compares the source/PVC SHA-256, starts the app from that PVC, and checks
+`/health` plus `/api/rooms` through a localhost-only gateway mapping. It cleans
+up only its exact `pong-restore-*` cluster unless `--keep-cluster` is used.
+The source file is never modified. The script uses SQLite's online backup API
+when given a readable database and runs `PRAGMA integrity_check` on source,
+backup, and restored databases. Because
+the scratch API image contains no SQLite CLI, obtaining a copy from the live
+PVC requires an operator-controlled maintenance window (see `DEPLOYMENT.md`).
+Do not delete/recreate the cluster or PVC, and do not run restore against
+`/data/pong.db` in place. A stronger rehearsal uses a separate disposable k3d
+cluster and only a copied database/PVC; these helpers never destroy the existing
+`k3d-pong` cluster.
 
 ## 🧪 Testing
 
@@ -282,6 +386,48 @@ Room capacity reservations and actual connections are separate lifecycle events:
 The browser sends a small `{"type":"proxy-ready"}` message immediately after `WebSocket.onopen`. The lobby consumes that marker, releases the first room-to-browser frames only after the outer gateway handoff, and forwards all subsequent application messages. The browser-to-room relay validates masked client frames, reassembles fragmented messages, handles control frames, and enforces a 16 MiB message limit. The marker is harmless in local mode, where the browser connects directly to the in-process room handler.
 
 NGINX's `/rooms/` location explicitly enables HTTP/1.1 upgrade headers, disables request/response buffering, and uses one-hour WebSocket timeouts. See `gateway/nginx.conf` and `main.go` for the two sides of the handoff.
+
+## 📈 Application observability and reliability contract
+
+`/metrics` exposes dependency-free Prometheus text format. Metrics are aggregate
+fixed-name counters and gauges only: there are no labels, room IDs, names, IPs,
+tokens, URLs, or request contents in telemetry. The registry also caps the
+number of distinct metric names. The main metric families cover:
+
+- HTTP request totals and 1xx/2xx/3xx/4xx/5xx outcomes;
+- room create, join, start, finish, active/waiting/playing, and cleanup;
+- Pod/Service create, list, delete, reconciliation, and failure outcomes;
+- SQLite open/migrate/read/write/delete operation outcomes;
+- admission rejection and WebSocket upgrade, active, assignment, disconnect,
+  relay, callback, and write outcomes.
+
+Every HTTP response receives `X-Request-ID` and `X-Correlation-ID`. IDs are
+server-generated 128-bit lowercase hexadecimal values; inbound values are used
+only when they match that exact format. IDs are not derived from client data and
+are not written to application logs. Room callback requests forward only this
+opaque correlation value. Application logs contain event/status information and
+never log client IPs, names, tokens, room IDs, addresses, or response bodies.
+
+Room lifecycle state is deliberately restart-safe. API joins reserve capacity
+without starting a game; actual WebSocket connections trigger `playing`. Failed
+Pod/Service deletion retains the database row for retry, while terminal Pods,
+missing-Pod Services, and stale waiting rooms are cleaned by reconciliation.
+The local and Kubernetes paths use the same idempotent lifecycle contract.
+
+For a dependency-light bounded journey test, use the harness below. It measures
+health, create, join, WebSocket, and cleanup latency, limits iterations,
+concurrency, timeout, and total duration, emits aggregate JSON only, and never
+prints a room identifier. `--dry-run` performs no network activity:
+
+```bash
+./scripts/load-smoke.sh --dry-run
+LOAD_SMOKE_BASE_URL=http://localhost:8080 \
+  ./scripts/load-smoke.sh --iterations=3 --concurrency=2
+```
+
+The harness is intended for local smoke/load checks and external test targets,
+not as a replacement for a production rate limiter. Existing public synthetic
+checks remain in `scripts/synthetic-check.sh`.
 
 ## 📊 Verification Status
 

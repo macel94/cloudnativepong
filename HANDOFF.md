@@ -19,6 +19,12 @@ This document is retained for lifecycle investigation history only. Do not use i
 
 ## What is verified
 
+The current uncommitted follow-up adds bounded aggregate application metrics,
+opaque request/correlation IDs, cluster-free orchestration failure injection,
+and the dependency-light `scripts/load-smoke.sh` harness. It does not edit
+`plan.md` or undo the origin, admission, Pod security, or SQLite single-writer
+changes.
+
 - `main` remains known-good at commit `2c5399c`.
 - Feature branch: `feat/gitops-server-deployment`.
 - The branch contains Flux bootstrap/application manifests, server Kustomize overlays, immutable image publishing, persistent SQLite storage, Traefik Ingress, and dynamic one-Pod-per-room orchestration.
@@ -35,6 +41,14 @@ This document is retained for lifecycle investigation history only. Do not use i
   - matching room, static, and gateway tags.
 - Anonymous GHCR pulls were previously verified with HTTP 200; no image pull secret is currently required.
 - `go test ./...`, `go test -race ./...`, and `go vet ./...` pass with the lifecycle implementation and focused tests.
+- Focused tests cover request-ID validation/headers, HTTP status metrics,
+  callback retry/failure behavior, bounded metric names, SQLite legacy
+  timestamp restart compatibility, capacity/admission rejection, Pod create
+  and deletion failure, terminal Pod cleanup, orphan Services, and restart /
+  reconcile behavior without a live cluster.
+- `./scripts/load-smoke.sh --dry-run` passes. A real local run with two
+  concurrent journeys passed health/create/join/WebSocket/cleanup and left
+  zero rooms and zero active WebSockets.
 - Earlier verified checks include `go vet ./...`, CGO-free builds, Kustomize rendering, Kubernetes dry runs, local Playwright 12/12, and Kubernetes Playwright 12/12.
 - Public/intended URL: `http://169.58.97.73:18080/`.
 
@@ -85,11 +99,14 @@ Observed leaked resources after the last test run:
 
 This is a real lifecycle bug, not a Flux or ingress failure.
 
-## What was tried but is not yet committed/deployed
+## Current uncommitted implementation state
 
 The working tree contains experimental application, test, and documentation changes in `db/db.go`, `lobby/lobby.go`, `main.go`, and related files.
 
-The implementation has now been locally verified with the full Go test suite, race detector, vet, static Linux builds, Kustomize rendering, and the 12-test local Playwright suite. It has not yet been built into/published as a container image or reconciled by Flux.
+The application-side implementation is locally verified with the full Go test
+suite, race detector, vet, Node syntax/dry-run checks, and the bounded local
+smoke harness. It has not yet been built into/published as a container image or
+reconciled by Flux.
 
 ### `db/db.go`
 
@@ -111,7 +128,9 @@ The current uncommitted changes:
 - have not yet been built into/published as a container image;
 - have not yet been reconciled by Flux.
 
-Do not assume these edits are production-ready merely because `go test ./...` passed; there are no existing lobby package tests, and Kubernetes cleanup behavior still needs live verification.
+The cluster-free tests do not claim live-cluster verification. Kubernetes
+cleanup, quota behavior, metrics scraping, callback network policy, image
+publication, and Flux reconciliation remain operator gates.
 
 ## Important design correction for continuation
 
@@ -128,31 +147,22 @@ The safer model is:
 
 The callback route must be authenticated by network/RBAC assumptions or otherwise constrained before production exposure; it is currently an internal ClusterIP-only endpoint.
 
-## Next steps, in order
+## Remaining operator gates
 
-1. Inspect/rework the uncommitted `db/db.go` and `lobby/lobby.go` changes before committing them.
-2. Add focused tests for:
-   - atomic two-player capacity under concurrent joins;
-   - a first join leaving status `waiting`;
-   - actual room start changing status to `playing`;
-   - idle waiting-room expiration (using a short injected timeout);
-   - idempotent cleanup/error handling.
-3. Update `main.go` room mode:
-   - notify the lobby when both room WebSocket connections are present;
-   - signal/notify cleanup on disconnect and write failure where appropriate;
-   - ensure room-mode `/health` remains available.
-4. Add the started callback route in lobby mode and keep finished cleanup idempotent.
-5. Set reconciliation to a one-minute interval and document the actual interval accurately.
-6. Run `gofmt`, `go test ./...`, `go test -race ./...`, `go vet ./...`, static builds, Kustomize render/dry-run, and the local Playwright suite.
-7. Commit the application lifecycle fix separately from generated image/deployment changes.
-8. Push the feature branch and wait for the image workflow to generate the GHCR SHA-tag deployment commit. Fetch the remote branch before making more commits because the workflow may advance it.
-9. Force Flux reconciliation and verify all live workloads use the new SHA tag.
-10. Remove only the currently leaked room resources through the API/controlled cleanup or, if necessary, targeted `kubectl -n pong delete pod,svc` plus DB cleanup; do not delete the API PVC.
-11. Run a fresh Kubernetes Playwright suite through `http://169.58.97.73:18080/`.
-12. Create an abandoned room and verify the DB row, Pod, and Service disappear within the documented timeout.
-13. Run the two-player WebSocket flow and verify one room Pod/Service exists while active, then cleanup occurs after completion/disconnect.
-14. Recheck Flux, HPA, PVC, quota, ingress, image tags, public access, and documentation.
-15. Keep the feature branch deployed for validation. Merge to `main` only after the live lifecycle test passes.
+1. Build/publish the application image and reconcile it through the intended
+   GitOps path; do not stage or commit automatically.
+2. Run the final local manifest/rendering and browser checks listed below; the
+   application-side Go/race/vet and bounded smoke checks already pass.
+3. Publish the image through the reviewed workflow, reconcile it through Flux,
+   and verify the live image digest and rollout.
+4. Verify `/metrics` scraping, resource quota/admission behavior, callback
+   network reachability, abandoned-room cleanup, and post-disconnect cleanup
+   on the intended cluster without deleting the existing cluster or PVC.
+5. Run the public/cluster Playwright and synthetic journeys only in an approved
+   test window, then recheck Flux, HPA, PVC, quota, ingress, image tags, public
+   access, and documentation.
+6. Do not stage or commit automatically; merge only after the live lifecycle
+   and deployment checks pass through the normal review process.
 
 ## Useful commands
 
@@ -185,7 +195,7 @@ TEST_MODE=k8s BASE_URL=http://169.58.97.73:18080 npx playwright test --reporter=
 
 ## Current checkpoint conclusion
 
-**Working:** GitOps/Flux reconciliation, immutable images, Traefik HTTP ingress, public HTTP reachability, stateless scaling, single-replica persistent SQLite API, dynamic room Pod creation, atomic capacity reservation, actual-connection start notification, bounded waiting-room cleanup, and the local two-player WebSocket path.
+**Working:** GitOps/Flux reconciliation, immutable images, Traefik HTTP ingress, public HTTP reachability, stateless scaling, single-replica persistent SQLite API, dynamic room Pod creation, atomic capacity reservation, actual-connection start notification, bounded waiting-room cleanup, aggregate no-label application metrics, opaque request/correlation IDs, cluster-free failure-injection tests, bounded load/smoke tooling, and the local two-player WebSocket path.
 
 **Not yet deployed/proven live:** the final lifecycle image has not been published or reconciled by Flux; the fresh Kubernetes abandoned-room and post-disconnect tests still need to run against that image. The previous leaked rooms were manually removed through the internal callback, and the API PVC was verified `Bound`.
 

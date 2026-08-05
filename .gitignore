@@ -12,6 +12,11 @@
 *.swp
 *.swo
 
+# Generated reports and local recovery artifacts
+/artifacts/
+__pycache__/
+*.pyc
+
 # Playwright
 /node_modules/
 /test-results/

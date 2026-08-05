@@ -1,33 +1,111 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha1"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
+	"sort"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
+	"github.com/cloudnativepong/admission"
+
 	"github.com/cloudnativepong/db"
 	"github.com/cloudnativepong/game"
 	"github.com/cloudnativepong/lobby"
+	"github.com/cloudnativepong/metrics"
 
 	"github.com/gorilla/websocket"
 )
 
+type originAllowlist map[string]struct{}
+
+var websocketOrigins = defaultOriginAllowlist("local")
+var publicAdmission = admission.NewController(admission.DefaultConfig)
+var appMetrics = metrics.NewRegistry()
+
 var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool { return true },
+	CheckOrigin: func(r *http.Request) bool { return websocketOrigins.allowed(r.Header.Get("Origin")) },
+}
+
+func defaultOriginAllowlist(mode string) originAllowlist {
+	if mode == "lobby" || mode == "kubernetes" || mode == "room" {
+		return originAllowlist{"https://pong.belacca.com": {}}
+	}
+	return originAllowlist{
+		"http://localhost:8080": {},
+		"http://127.0.0.1:8080": {},
+		"http://[::1]:8080":     {},
+	}
+}
+
+func loadOriginAllowlist(mode, configured string) originAllowlist {
+	if strings.TrimSpace(configured) == "" {
+		configured = os.Getenv("PONG_ALLOWED_ORIGINS")
+	}
+	if strings.TrimSpace(configured) == "" {
+		return defaultOriginAllowlist(mode)
+	}
+	origins := make(originAllowlist)
+	for _, raw := range strings.Split(configured, ",") {
+		if origin, ok := normalizeOrigin(raw); ok {
+			origins[origin] = struct{}{}
+		}
+	}
+	if len(origins) == 0 {
+		return defaultOriginAllowlist(mode)
+	}
+	return origins
+}
+
+func normalizeOrigin(raw string) (string, bool) {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil || u.Path != "" && u.Path != "/" || u.RawQuery != "" || u.Fragment != "" {
+		return "", false
+	}
+	return strings.ToLower(u.Scheme) + "://" + strings.ToLower(u.Host), true
+}
+
+func (a originAllowlist) allowed(origin string) bool {
+	canonical, ok := normalizeOrigin(origin)
+	if !ok {
+		return false
+	}
+	_, ok = a[canonical]
+	return ok
+}
+
+func (a originAllowlist) first() string {
+	origins := make([]string, 0, len(a))
+	for origin := range a {
+		origins = append(origins, origin)
+	}
+	sort.Strings(origins)
+	if len(origins) == 0 {
+		return ""
+	}
+	return origins[0]
+}
+
+func configureOriginPolicy(mode, configured string) {
+	websocketOrigins = loadOriginAllowlist(mode, configured)
 }
 
 func main() {
@@ -38,15 +116,19 @@ func main() {
 	k8sNS := flag.String("namespace", "default", "Kubernetes namespace")
 	roomImage := flag.String("room-image", "cloudnativepong-room:latest", "Room container image")
 	dbPath := flag.String("db-path", ":memory:", "SQLite database path")
+	allowedOrigins := flag.String("allowed-origins", "", "Comma-separated exact browser origins (or PONG_ALLOWED_ORIGINS)")
 	flag.Parse()
 
-	store, err := db.New(*dbPath)
+	configureOriginPolicy(*mode, *allowedOrigins)
+	publicAdmission = admission.NewController(admission.ConfigFromEnv(os.Getenv))
+
+	store, err := db.NewWithMetrics(*dbPath, appMetrics)
 	if err != nil {
 		log.Fatalf("db init: %v", err)
 	}
 	defer store.Close()
 
-	lobbySrv := lobby.NewServer(store, *mode, *k8sNS, *roomImage)
+	lobbySrv := lobby.NewServerWithMetrics(store, *mode, *k8sNS, *roomImage, appMetrics)
 
 	mux := http.NewServeMux()
 
@@ -55,27 +137,36 @@ func main() {
 		// In local mode, lobby and rooms share one process.
 		// Rooms are spawned as goroutines and addressed via path /room/{id}/ws
 		setupLocalRoutes(mux, lobbySrv, store)
+		go reconcileLobbyRooms(lobbySrv)
 
 	case "lobby":
 		// Lobby-only mode: serves API, delegates rooms to K8s pods.
 		// Static files are served by nginx.
-		apiHandler := corsMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		apiHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			switch {
 			case r.URL.Path == "/api/rooms":
 				lobbySrv.HandleListRooms(w, r)
 			case r.URL.Path == "/api/rooms/create":
+				if !publicAdmission.AllowCreate(clientKey(r)) {
+					appMetrics.Inc("pong_admission_create_rejected")
+					tooManyRequests(w)
+					return
+				}
 				lobbySrv.HandleCreateRoom(w, r)
 			case r.URL.Path == "/api/rooms/join":
+				if !publicAdmission.AllowJoin(clientKey(r)) {
+					appMetrics.Inc("pong_admission_join_rejected")
+					tooManyRequests(w)
+					return
+				}
 				lobbySrv.HandleJoinRoom(w, r)
 			default:
 				http.NotFound(w, r)
 			}
-		}))
-		mux.Handle("/api/", apiHandler)
-		mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte("ok\n"))
 		})
+		mux.Handle("/api/", publicAPIHandler(corsMiddleware(apiHandler)))
+		mux.HandleFunc("/health", healthHandler)
+		mux.Handle("/metrics", appMetrics.Handler())
 		mux.HandleFunc("/internal/rooms/", func(w http.ResponseWriter, r *http.Request) {
 			parts := splitPath(r.URL.Path)
 			if len(parts) != 4 || parts[0] != "internal" || parts[1] != "rooms" {
@@ -111,7 +202,15 @@ func main() {
 	addr := ":" + *port
 	log.Printf("Cloud Native Pong starting on %s (mode=%s)", addr, *mode)
 
-	srv := &http.Server{Addr: addr, Handler: mux}
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           requestMetrics(mux),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    16 << 10,
+	}
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("server: %v", err)
@@ -128,7 +227,7 @@ func main() {
 		case <-room.done:
 			// Let clients receive the final state before the room container exits.
 			time.Sleep(3 * time.Second)
-			notifyRoomFinished(*roomID, *lobbyAddr)
+			notifyRoomFinished(*roomID, *lobbyAddr, newRequestID())
 		case <-quit:
 		}
 	} else {
@@ -143,75 +242,110 @@ func main() {
 // ---- Local mode: lobby + rooms in one process ----
 
 type localRoom struct {
-	engine   *game.Engine
-	players  [2]*websocket.Conn
-	mu       sync.Mutex
-	loopOnce sync.Once
-	done     chan struct{}
-	doneOnce sync.Once
+	engine      *game.Engine
+	players     [2]*websocket.Conn
+	mu          sync.Mutex
+	loopOnce    sync.Once
+	done        chan struct{}
+	doneOnce    sync.Once
+	cleanupOnce sync.Once
+	cleanup     func()
+	start       func() error
 }
 
 var localRooms sync.Map // roomID -> *localRoom
 
 func setupLocalRoutes(mux *http.ServeMux, lobbySrv *lobby.Server, store *db.Store) {
-	// API routes
-	mux.HandleFunc("/api/rooms", lobbySrv.HandleListRooms)
-	mux.HandleFunc("/api/rooms/create", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/health", healthHandler)
+	mux.Handle("/metrics", appMetrics.Handler())
+
+	// API routes use the same admission and CORS contract as lobby mode.
+	mux.Handle("/api/rooms", publicAPIHandler(corsMiddleware(http.HandlerFunc(lobbySrv.HandleListRooms))))
+	mux.Handle("/api/rooms/create", publicAPIHandler(corsMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !publicAdmission.AllowCreate(clientKey(r)) {
+			appMetrics.Inc("pong_admission_create_rejected")
+			tooManyRequests(w)
+			return
+		}
 		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", 405)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 		var req struct {
 			Name string `json:"name"`
 		}
-		json.NewDecoder(r.Body).Decode(&req)
-
-		room, err := lobbySrv.CreateRoom(req.Name)
-		if err != nil {
-			http.Error(w, err.Error(), 500)
+		if err := lobby.DecodeJSONBody(w, r, &req); err != nil {
+			lobbyWriteError(w, err)
 			return
 		}
-		// Room creation reserves the creator's player slot; the browser opens
-		// the corresponding WebSocket after receiving this response.
+		name, err := lobby.ValidRoomName(req.Name)
+		if err != nil {
+			lobbyWriteError(w, err)
+			return
+		}
+		room, err := lobbySrv.CreateRoom(name)
+		if err != nil {
+			appMetrics.Inc("pong_room_create_http_failure")
+			http.Error(w, "room service unavailable", http.StatusServiceUnavailable)
+			return
+		}
 		if err := lobbySrv.JoinRoom(room.ID); err != nil {
 			_ = lobbySrv.CleanupRoom(room.ID)
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			appMetrics.Inc("pong_room_create_http_failure")
+			lobbyWriteError(w, err)
 			return
 		}
 		room.Players = 1
-
-		// Register in-process handler
-		handler := &lobby.RoomHandler{
+		lobbySrv.RegisterLocalRoom(room.ID, &lobby.RoomHandler{
 			ID:   room.ID,
 			Addr: fmt.Sprintf("localhost:%s/room/%s/ws", "8080", room.ID),
+		})
+		setLocalRoomCallbacks(room.ID,
+			func() error {
+				if err := lobbySrv.MarkRoomStarted(room.ID); err != nil {
+					appMetrics.Inc("pong_room_start_callback_failure")
+					return err
+				}
+				appMetrics.Inc("pong_room_start_callback_success")
+				return nil
+			},
+			func() {
+				_ = lobbySrv.CleanupRoom(room.ID)
+				localRooms.Delete(room.ID)
+			},
+		)
+		appMetrics.Inc("pong_room_create_http_success")
+		writeJSON(w, room)
+	}))))
+	mux.Handle("/api/rooms/join", publicAPIHandler(corsMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !publicAdmission.AllowJoin(clientKey(r)) {
+			appMetrics.Inc("pong_admission_join_rejected")
+			tooManyRequests(w)
+			return
 		}
-		lobbySrv.RegisterLocalRoom(room.ID, handler)
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(room)
-	})
-	mux.HandleFunc("/api/rooms/join", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", 405)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 		var req struct {
 			RoomID string `json:"room_id"`
 		}
-		json.NewDecoder(r.Body).Decode(&req)
-
-		if err := lobbySrv.JoinRoom(req.RoomID); err != nil {
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		if err := lobby.DecodeJSONBody(w, r, &req); err != nil {
+			lobbyWriteError(w, err)
 			return
 		}
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{
-			"room_id": req.RoomID,
-			"mode":    "local",
-		})
-	})
+		if !lobby.ValidRoomID(req.RoomID) {
+			lobbyWriteError(w, lobby.ErrInvalidRoomID)
+			return
+		}
+		if err := lobbySrv.JoinRoom(req.RoomID); err != nil {
+			appMetrics.Inc("pong_room_join_http_failure")
+			lobbyWriteError(w, err)
+			return
+		}
+		appMetrics.Inc("pong_room_join_http_success")
+		writeJSON(w, map[string]string{"room_id": req.RoomID, "mode": "local"})
+	}))))
 
 	// Room WebSocket endpoint (both legacy and gateway paths)
 	mux.HandleFunc("/room/", func(w http.ResponseWriter, r *http.Request) {
@@ -245,19 +379,32 @@ func setupRoomRoutes(mux *http.ServeMux, roomID, lobbyAddr string) {
 	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		handleRoomWS(w, r, roomID, lobbyAddr)
 	})
-	// Health check
-	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(200)
-		w.Write([]byte("ok"))
-	})
+	mux.HandleFunc("/health", healthHandler)
+	mux.Handle("/metrics", appMetrics.Handler())
 }
 
 func handleRoomWS(w http.ResponseWriter, r *http.Request, roomID, lobbyAddr string) {
-	conn, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		log.Printf("ws upgrade: %v", err)
+	if !lobby.ValidRoomID(roomID) {
+		appMetrics.Inc("pong_websocket_rejected_invalid")
+		http.Error(w, "invalid room ID", http.StatusBadRequest)
 		return
 	}
+	release, ok := publicAdmission.AcquireWebSocket(clientKey(r))
+	if !ok {
+		appMetrics.Inc("pong_admission_websocket_rejected")
+		tooManyRequests(w)
+		return
+	}
+	defer release()
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		appMetrics.Inc("pong_websocket_upgrade_failure")
+		return
+	}
+	appMetrics.Inc("pong_websocket_upgrade_success")
+	appMetrics.Inc("pong_websocket_accepted")
+	appMetrics.AddGauge("pong_websockets_active", 1)
+	defer appMetrics.AddGauge("pong_websockets_active", -1)
 	defer conn.Close()
 	enableTCPNoDelay(conn.UnderlyingConn())
 
@@ -275,31 +422,42 @@ func handleRoomWS(w http.ResponseWriter, r *http.Request, roomID, lobbyAddr stri
 		room.players[1] = conn
 	} else {
 		room.mu.Unlock()
-		conn.WriteJSON(map[string]string{"type": "error", "message": "room full"})
+		appMetrics.Inc("pong_websocket_room_full")
+		_ = conn.WriteJSON(map[string]string{"type": "error", "message": "room full"})
 		return
 	}
 	room.mu.Unlock()
-
-	log.Printf("Player %d joined room %s", player, roomID)
+	appMetrics.Inc("pong_websocket_player_assigned")
 
 	// Notify player of their assignment.
 	if err := conn.WriteJSON(map[string]interface{}{
 		"type":   "joined",
 		"player": player,
 	}); err != nil {
+		appMetrics.Inc("pong_websocket_joined_write_failure")
 		room.signalFinished()
 		return
 	}
+	appMetrics.Inc("pong_websocket_joined_write_success")
 
 	// Mark ready. The lobby's playing transition is deliberately based on
 	// actual WebSocket connections, not only on API reservations.
 	room.engine.PlayerReady(player)
 	if player == 2 {
-		if err := notifyRoomStarted(roomID, lobbyAddr); err != nil {
+		room.mu.Lock()
+		start := room.start
+		room.mu.Unlock()
+		var startErr error
+		if lobbyAddr == "" {
+			if start != nil {
+				startErr = start()
+			}
+		} else {
+			startErr = notifyRoomStarted(roomID, lobbyAddr, requestID(r))
+		}
+		if startErr != nil {
 			// Do not leave a live game in waiting state: reconciliation would
-			// eventually expire it as an abandoned room. The room process will
-			// report finished and the lobby will clean up its resources.
-			log.Printf("room %s: failed to notify lobby that it started: %v", roomID, err)
+			// eventually expire it as an abandoned room.
 			room.signalFinished()
 			return
 		}
@@ -311,7 +469,7 @@ func handleRoomWS(w http.ResponseWriter, r *http.Request, roomID, lobbyAddr stri
 			var input game.Input
 			err := conn.ReadJSON(&input)
 			if err != nil {
-				log.Printf("Player %d disconnected: %v", player, err)
+				appMetrics.Inc("pong_websocket_disconnect")
 				room.engine.PlayerLeft(player)
 				room.signalFinished()
 				// Close the other player's connection
@@ -348,12 +506,15 @@ func handleRoomWS(w http.ResponseWriter, r *http.Request, roomID, lobbyAddr stri
 			"state": state,
 		})
 		if err != nil {
+			appMetrics.Inc("pong_websocket_state_write_failure")
 			room.signalFinished()
 			return
 		}
+		appMetrics.Inc("pong_websocket_state_write_success")
 		if state.Status == game.StatusFinished {
 			// Send final state and close. The room-mode process also watches the
 			// room completion signal and reports it to the lobby.
+			appMetrics.Inc("pong_room_finished")
 			room.signalFinished()
 			time.Sleep(3 * time.Second)
 			localRooms.Delete(roomID)
@@ -392,65 +553,98 @@ func getOrCreateLocalRoom(id string) *localRoom {
 	return v.(*localRoom)
 }
 
+func setLocalRoomCallbacks(id string, start func() error, cleanup func()) {
+	room := getOrCreateLocalRoom(id)
+	room.mu.Lock()
+	room.start = start
+	room.cleanup = cleanup
+	room.mu.Unlock()
+}
+
 func (r *localRoom) signalFinished() {
-	r.doneOnce.Do(func() { close(r.done) })
+	r.doneOnce.Do(func() {
+		close(r.done)
+		r.mu.Lock()
+		cleanup := r.cleanup
+		r.mu.Unlock()
+		r.cleanupOnce.Do(func() {
+			if cleanup != nil {
+				cleanup()
+				appMetrics.Inc("pong_room_cleanup_callback_success")
+			}
+		})
+	})
 }
 
 const roomReconcileInterval = time.Minute
 
 func reconcileLobbyRooms(lobbySrv *lobby.Server) {
 	if err := lobbySrv.ReconcileRooms(); err != nil {
-		log.Printf("room reconciliation: %v", err)
+		log.Printf("event=room_reconciliation_failed")
 	}
 	ticker := time.NewTicker(roomReconcileInterval)
 	defer ticker.Stop()
 	for range ticker.C {
 		if err := lobbySrv.ReconcileRooms(); err != nil {
-			log.Printf("room reconciliation: %v", err)
+			log.Printf("event=room_reconciliation_failed")
 		}
 	}
 }
 
-func notifyRoomStarted(roomID, lobbyAddr string) error {
+func notifyRoomStarted(roomID, lobbyAddr, correlationID string) error {
 	if lobbyAddr == "" {
 		return nil
 	}
 	url := "http://" + lobbyAddr + "/internal/rooms/" + roomID + "/started"
 	client := &http.Client{Timeout: 5 * time.Second}
-	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
-		resp, err := client.Post(url, "application/json", nil)
+		appMetrics.Inc("pong_room_start_callback_attempt")
+		req, err := http.NewRequest(http.MethodPost, url, nil)
 		if err == nil {
-			resp.Body.Close()
-			if resp.StatusCode < 300 {
-				return nil
+			req.Header.Set(requestIDHeader, correlationID)
+			req.Header.Set(correlationIDHeader, correlationID)
+			resp, requestErr := client.Do(req)
+			if requestErr == nil {
+				resp.Body.Close()
+				if resp.StatusCode < 300 {
+					appMetrics.Inc("pong_room_start_callback_success")
+					return nil
+				}
 			}
-			lastErr = fmt.Errorf("lobby start notification returned HTTP %d", resp.StatusCode)
-		} else {
-			lastErr = err
 		}
 		if attempt < 2 {
+			appMetrics.Inc("pong_room_start_callback_retry")
 			time.Sleep(100 * time.Millisecond)
 		}
 	}
-	return lastErr
+	appMetrics.Inc("pong_room_start_callback_failure")
+	return errors.New("room start callback failed")
 }
 
-func notifyRoomFinished(roomID, lobbyAddr string) {
+func notifyRoomFinished(roomID, lobbyAddr, correlationID string) {
 	if lobbyAddr == "" {
 		return
 	}
 	url := "http://" + lobbyAddr + "/internal/rooms/" + roomID + "/finished"
 	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Post(url, "application/json", nil)
+	req, err := http.NewRequest(http.MethodPost, url, nil)
 	if err != nil {
-		log.Printf("room %s: failed to notify lobby: %v", roomID, err)
+		appMetrics.Inc("pong_room_finish_callback_failure")
+		return
+	}
+	req.Header.Set(requestIDHeader, correlationID)
+	req.Header.Set(correlationIDHeader, correlationID)
+	resp, err := client.Do(req)
+	if err != nil {
+		appMetrics.Inc("pong_room_finish_callback_failure")
 		return
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		log.Printf("room %s: lobby cleanup returned HTTP %d", roomID, resp.StatusCode)
+		appMetrics.Inc("pong_room_finish_callback_failure")
+		return
 	}
+	appMetrics.Inc("pong_room_finish_callback_success")
 }
 
 func splitPath(path string) []string {
@@ -480,19 +674,218 @@ func split(s string, sep byte) []string {
 	return parts
 }
 
-// ---- CORS Middleware ----
+// ---- HTTP policy and metrics ----
 
-// corsMiddleware wraps an http.Handler with CORS headers for API routes.
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("ok\n"))
+}
+
+func clientKey(r *http.Request) string {
+	// NGINX overwrites X-Real-IP with the peer address. Do not trust the first
+	// X-Forwarded-For value: a public caller can supply that header themselves.
+	// Never log or export this key; it exists only in ephemeral limiter state.
+	if realIP := strings.TrimSpace(r.Header.Get("X-Real-IP")); realIP != "" {
+		return realIP
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err == nil && host != "" {
+		return host
+	}
+	return r.RemoteAddr
+}
+
+func tooManyRequests(w http.ResponseWriter) {
+	w.Header().Set("Retry-After", "60")
+	http.Error(w, "too many requests", http.StatusTooManyRequests)
+}
+
+func lobbyWriteError(w http.ResponseWriter, err error) {
+	status := lobby.RequestErrorStatus(err)
+	if status >= 500 {
+		http.Error(w, "internal server error", status)
+		return
+	}
+	http.Error(w, err.Error(), status)
+}
+
+// publicAPIHandler applies a short-lived per-client concurrency bound. The
+// endpoint-specific rate limiters are applied inside create/join handlers.
+func publicAPIHandler(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodOptions {
+			next.ServeHTTP(w, r)
+			return
+		}
+		release, ok := publicAdmission.AcquireHTTP(clientKey(r))
+		if !ok {
+			tooManyRequests(w)
+			return
+		}
+		defer release()
+		next.ServeHTTP(w, r)
+	})
+}
+
+// corsMiddleware only permits the exact configured browser origins. Same-origin
+// requests commonly omit Origin and remain valid; cross-origin requests that
+// are not on the allowlist are rejected before reaching the API.
 func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		origin := r.Header.Get("Origin")
+		if origin != "" {
+			if !websocketOrigins.allowed(origin) {
+				http.Error(w, "origin not allowed", http.StatusForbidden)
+				return
+			}
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Vary", "Origin")
+		}
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusOK)
+			w.WriteHeader(http.StatusNoContent)
 			return
 		}
 		next.ServeHTTP(w, r)
+	})
+}
+
+func writeJSON(w http.ResponseWriter, value interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	if err := json.NewEncoder(w).Encode(value); err != nil {
+		log.Printf("write JSON response: %v", err)
+	}
+}
+
+type requestIDKey struct{}
+
+const (
+	requestIDHeader     = "X-Request-ID"
+	correlationIDHeader = "X-Correlation-ID"
+)
+
+func newRequestID() string {
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		// crypto/rand failure is not a reason to expose request data. The fixed
+		// fallback remains opaque and valid for the bounded correlation contract.
+		return "00000000000000000000000000000000"
+	}
+	return fmt.Sprintf("%x", raw[:])
+}
+
+func validRequestID(value string) bool {
+	if len(value) != 32 {
+		return false
+	}
+	for _, r := range value {
+		if !(r >= '0' && r <= '9' || r >= 'a' && r <= 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+func requestID(r *http.Request) string {
+	if value := r.Context().Value(requestIDKey{}); value != nil {
+		if id, ok := value.(string); ok {
+			return id
+		}
+	}
+	return "00000000000000000000000000000000"
+}
+
+func withRequestID(r *http.Request) *http.Request {
+	inbound := strings.TrimSpace(r.Header.Get(requestIDHeader))
+	if !validRequestID(inbound) {
+		inbound = strings.TrimSpace(r.Header.Get(correlationIDHeader))
+	}
+	if !validRequestID(inbound) {
+		inbound = newRequestID()
+	}
+	return r.WithContext(context.WithValue(r.Context(), requestIDKey{}, inbound))
+}
+
+type responseRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *responseRecorder) WriteHeader(status int) {
+	if w.status != 0 {
+		return
+	}
+	w.status = status
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *responseRecorder) Write(p []byte) (int, error) {
+	if w.status == 0 {
+		w.WriteHeader(http.StatusOK)
+	}
+	return w.ResponseWriter.Write(p)
+}
+
+func (w *responseRecorder) statusCode() int {
+	if w.status == 0 {
+		return http.StatusOK
+	}
+	return w.status
+}
+
+func (w *responseRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	hj, ok := w.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, fmt.Errorf("http hijacking is not supported")
+	}
+	w.status = http.StatusSwitchingProtocols
+	return hj.Hijack()
+}
+
+func (w *responseRecorder) Flush() {
+	if w.status == 0 {
+		w.WriteHeader(http.StatusOK)
+	}
+	if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+func (w *responseRecorder) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+func requestMetrics(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r = withRequestID(r)
+		id := requestID(r)
+		w.Header().Set(requestIDHeader, id)
+		w.Header().Set(correlationIDHeader, id)
+		recorder := &responseRecorder{ResponseWriter: w}
+		appMetrics.Inc("pong_http_requests")
+		next.ServeHTTP(recorder, r)
+		switch status := recorder.statusCode(); {
+		case status >= 500:
+			appMetrics.Inc("pong_http_responses_5xx")
+			appMetrics.Inc("pong_http_requests_failure")
+		case status >= 400:
+			appMetrics.Inc("pong_http_responses_4xx")
+			appMetrics.Inc("pong_http_requests_failure")
+		case status >= 300:
+			appMetrics.Inc("pong_http_responses_3xx")
+			appMetrics.Inc("pong_http_requests_success")
+		case status >= 200:
+			appMetrics.Inc("pong_http_responses_2xx")
+			appMetrics.Inc("pong_http_requests_success")
+		default:
+			appMetrics.Inc("pong_http_responses_1xx")
+			appMetrics.Inc("pong_http_requests_success")
+		}
 	})
 }
 
@@ -516,18 +909,36 @@ func proxyRoomWS(w http.ResponseWriter, r *http.Request, lobbySrv *lobby.Server,
 		return
 	}
 	roomID := parts[1]
+	if !lobby.ValidRoomID(roomID) {
+		appMetrics.Inc("pong_websocket_proxy_rejected_invalid")
+		http.Error(w, "invalid room ID", http.StatusBadRequest)
+		return
+	}
+	if !websocketOrigins.allowed(r.Header.Get("Origin")) {
+		appMetrics.Inc("pong_websocket_proxy_rejected_origin")
+		http.Error(w, "origin not allowed", http.StatusForbidden)
+		return
+	}
+	release, ok := publicAdmission.AcquireWebSocket(clientKey(r))
+	if !ok {
+		appMetrics.Inc("pong_admission_websocket_rejected")
+		tooManyRequests(w)
+		return
+	}
+	defer release()
+	appMetrics.AddGauge("pong_websockets_active", 1)
+	defer appMetrics.AddGauge("pong_websockets_active", -1)
 
 	addr, err := lobbySrv.GetRoomAddr(roomID)
 	if err != nil {
-		log.Printf("proxy: room %s not found: %v", roomID, err)
+		appMetrics.Inc("pong_websocket_proxy_room_not_found")
 		http.Error(w, "room not found", http.StatusNotFound)
 		return
 	}
 
-	log.Printf("proxy: proxying WS for room %s to %s", roomID, addr)
-
 	// Only accept WebSocket upgrade requests
 	if r.Header.Get("Upgrade") != "websocket" {
+		appMetrics.Inc("pong_websocket_proxy_rejected_upgrade")
 		http.Error(w, "websocket only", http.StatusBadRequest)
 		return
 	}
@@ -535,12 +946,13 @@ func proxyRoomWS(w http.ResponseWriter, r *http.Request, lobbySrv *lobby.Server,
 	// ── Step 1: hijack the client connection (from NGINX) ──────────
 	hj, ok := w.(http.Hijacker)
 	if !ok {
+		appMetrics.Inc("pong_websocket_proxy_hijack_failure")
 		http.Error(w, "hijack not supported", http.StatusInternalServerError)
 		return
 	}
 	clientConn, clientBuf, err := hj.Hijack()
 	if err != nil {
-		log.Printf("proxy: hijack error: %v", err)
+		appMetrics.Inc("pong_websocket_proxy_hijack_failure")
 		return
 	}
 	defer clientConn.Close()
@@ -556,18 +968,25 @@ func proxyRoomWS(w http.ResponseWriter, r *http.Request, lobbySrv *lobby.Server,
 		NetDialContext:   (&net.Dialer{Timeout: 2 * time.Second}).DialContext,
 	}
 	var target *websocket.Conn
+	targetHeader := http.Header{}
+	if origin := websocketOrigins.first(); origin != "" {
+		targetHeader.Set("Origin", origin)
+	}
+	targetHeader.Set(requestIDHeader, requestID(r))
+	targetHeader.Set(correlationIDHeader, requestID(r))
 	for i := 0; i < 10; i++ {
-		target, _, err = dialer.Dial("ws://"+addr+"/ws", nil)
+		target, _, err = dialer.Dial("ws://"+addr+"/ws", targetHeader)
 		if err == nil {
 			break
 		}
-		log.Printf("proxy: retry %d connecting to %s: %v", i+1, addr, err)
+		appMetrics.Inc("pong_websocket_proxy_dial_retry")
 		time.Sleep(500 * time.Millisecond)
 	}
 	if err != nil {
-		log.Printf("proxy: failed to connect to %s after retries: %v", addr, err)
+		appMetrics.Inc("pong_websocket_proxy_dial_failure")
 		return
 	}
+	appMetrics.Inc("pong_websocket_proxy_dial_success")
 	defer target.Close()
 	enableTCPNoDelay(target.UnderlyingConn())
 	target.SetReadLimit(maxProxyMessageSize)
@@ -582,7 +1001,7 @@ func proxyRoomWS(w http.ResponseWriter, r *http.Request, lobbySrv *lobby.Server,
 		"Connection: Upgrade\r\n" +
 		"Sec-WebSocket-Accept: " + accept + "\r\n\r\n")
 	if err := clientBuf.Flush(); err != nil {
-		log.Printf("proxy: flush client handshake: %v", err)
+		appMetrics.Inc("pong_websocket_proxy_handshake_failure")
 		return
 	}
 
@@ -645,7 +1064,8 @@ func proxyRoomWS(w http.ResponseWriter, r *http.Request, lobbySrv *lobby.Server,
 		}
 	}()
 	<-errCh
-	log.Printf("proxy: WS connection closed for room %s", roomID)
+	appMetrics.Inc("pong_websocket_proxy_closed")
+	appMetrics.Inc("pong_websocket_proxy_relay_ended")
 }
 
 const maxProxyMessageSize = 16 << 20
@@ -661,7 +1081,7 @@ func enableTCPNoDelay(conn net.Conn) {
 		return
 	}
 	if err := tcpConn.SetNoDelay(true); err != nil {
-		log.Printf("proxy: enable TCP_NODELAY: %v", err)
+		appMetrics.Inc("pong_websocket_tcp_nodelay_failure")
 	}
 }
 

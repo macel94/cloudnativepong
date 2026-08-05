@@ -13,6 +13,9 @@ spec:
             - --namespace=pong
             - --room-image=ghcr.io/macel94/cloudnativepong-room:sha-212244a936984afc191f65fa93b36f45c4e6b5d8
             - --db-path=/data/pong.db
+          env:
+            - name: PONG_ALLOWED_ORIGINS
+              value: https://pong.belacca.com
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim

@@ -5,6 +5,16 @@ metadata:
   namespace: pong
 spec:
   replicas: 2
+  template:
+    spec:
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: cloudnativepong
+              component: gateway
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -13,3 +23,13 @@ metadata:
   namespace: pong
 spec:
   replicas: 2
+  template:
+    spec:
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: cloudnativepong
+              component: static

@@ -1,7 +1,9 @@
 # Cloud Native Pong server deployment
 
 This repository contains both the application and its GitOps deployment for the
-experimental server named `vmi3474918`.
+experimental server named `vmi3474918`. Platform-level failure drills and rollback commands are
+maintained in the [GitOps game-day runbook](https://github.com/macel94/belacca-gitops/blob/main/docs/GAME-DAY-DRILLS.md);
+the backup/object-storage contract is in the [GitOps backup contract](https://github.com/macel94/belacca-gitops/blob/main/docs/BACKUP-CONTRACT.md).
 
 ## Runtime model
 
@@ -17,6 +19,13 @@ experimental server named `vmi3474918`.
 - Completed, failed, orphaned, and abandoned waiting-room resources are cleaned
   by the lobby. Waiting rooms expire after 10 minutes, with reconciliation
   running every 1 minute.
+- The API exposes `/metrics` as aggregate Prometheus text with no labels. The
+  metric names cover HTTP outcomes, room lifecycle, Pod/Service orchestration,
+  SQLite operations, admission, WebSocket lifecycle, callbacks, and cleanup.
+- Each HTTP response includes server-generated `X-Request-ID` and
+  `X-Correlation-ID` values. They are opaque 128-bit hex IDs; invalid inbound
+  values are replaced. IPs, names, tokens, room IDs, URLs, and request bodies
+  are not logged or exported.
 
 ## GitOps and ingress layout
 
@@ -52,7 +61,9 @@ files, API calls, and WebSocket upgrades. The k3d load balancer maps:
 The GitOps ingress is the intended application path. The room Pod callbacks at
 `/internal/rooms/<id>/started` and `/internal/rooms/<id>/finished` are only
 reachable through the `pong-api` ClusterIP Service; the gateway does not route
-that path publicly.
+that path publicly. Callback requests carry only the opaque correlation headers;
+callback retries are bounded, and a failed start callback closes the room path
+so reconciliation can clean it rather than leaving a half-started game.
 
 The public endpoints are:
 
@@ -64,11 +75,12 @@ https://www.belacca.com/        → redirect to the personal site
 ```
 
 DNS A records for the two subdomains and both existing apex names point at
-`169.58.97.73`. Traefik exposes the
-`websecure` entrypoint on public port 443 and obtains certificates from
-Let's Encrypt using the TLS-ALPN-01 challenge on port 443. The certificate
-store is persisted in `kube-system/traefik-acme`, so certificates renew
-automatically across Traefik restarts. WebSockets use the same HTTPS ingress.
+`169.58.97.73`. Traefik exposes the `websecure` entrypoint on public port 443
+and obtains certificates from Let's Encrypt using the committed Cloudflare
+DNS-01 configuration. The out-of-band `kube-system/traefik-cloudflare` Secret
+must provide `CLOUDFLARE_DNS_API_TOKEN`; no value is stored in Git. The
+certificate store is persisted in `kube-system/traefik-acme`, so certificates
+renew across Traefik restarts. WebSockets use the same HTTPS ingress.
 
 ## Project clusters on this server
 
@@ -79,10 +91,13 @@ cluster for this project**:
 |---|---|---|---|
 | `k3d-pong` | `pong` | 1 server, 2 agents, 1 load balancer | Local production-like cluster and Flux target |
 
-There are no other project contexts or k3d clusters configured on the server.
-The `pong` namespace contains the application; `flux-system` contains GitOps.
-Do not create a second cluster or delete/recreate this one during routine
-debugging: the API uses a persistent SQLite PVC.
+The persistent project target is `k3d-pong`; the `pong` namespace contains the
+application and `flux-system` contains GitOps. CI may create a disposable k3d
+cluster for integration tests. The opt-in restore rehearsal may create only a
+new `pong-restore-*` cluster and uses an explicit generated context; it never
+attaches to or deletes `k3d-pong`. Do not create or delete clusters during
+routine debugging, and do not delete/recreate this cluster: the API uses a
+persistent SQLite PVC.
 
 ## Fastest safe debug, local test, and GitOps workflow
 
@@ -166,6 +181,127 @@ The packages are configured for anonymous pulls. The workflow updates the
 server overlay with `sha-<40-hex-commit>` tags and commits the deployment change
 back to the feature branch. A future merge to `main` should use the same
 workflow after the production branch policy is chosen.
+
+## Supply-chain evidence and synthetic checks
+
+The published `sha-<40-hex-commit>` image tags are immutable references to a
+commit build, but operators should record the registry `sha256` digest for the
+exact deployment. `.github/workflows/publish-images.yml` adds BuildKit SBOM and
+`mode=max` provenance attestations while pushing to GHCR. Local `docker build`
+or `--load` cannot retain registry attestations.
+
+`.github/workflows/supply-chain.yml` creates local images, uploads CycloneDX
+SBOMs, and stores Trivy HIGH/CRITICAL reports. It is report-only by default so
+normal CI does not fail because of a newly published advisory; a manually
+requested `strict=true` run turns those findings into a gate. There are no
+registry credentials or vulnerability exceptions in this repository.
+
+`.github/workflows/sign-images.yml` is an explicit manual hook. Provide an
+`IMAGE@sha256:<digest>` input after the image has been pushed. The hook uses
+Sigstore keyless Cosign signing with GitHub OIDC and rejects mutable tags. It
+requires `id-token: write`, registry access, and the external Sigstore services
+at run time; it is intentionally not part of ordinary PR/push CI. Inspect the
+published manifest and attached referrers with `docker buildx imagetools inspect
+IMAGE@sha256:<digest>` and `cosign tree IMAGE@sha256:<digest>`; use the
+repository's `verify-image.sh` with an expected workflow identity regexp before
+accepting a signature. `cosign verify-attestation` applies only to Cosign-signed
+attestations, not automatically to every BuildKit referrer.
+
+To configure the external Pong journey check, set the repository/organization
+variable `SYNTHETIC_PONG_URL` and optional `SYNTHETIC_AUTH_TOKEN` secret outside
+the repository. The scheduled workflow then checks health, room CRUD, both
+WebSocket player assignments, and state delivery. With no URL it performs an
+explicit safe skip. It is not a substitute for a separately managed alerting
+or paging service.
+
+## SQLite backup and isolated restore rehearsal
+
+The only application state is `/data/pong.db` on PVC `pong-api-data`; no S3,
+GCS, bucket, snapshot controller, retention policy, encryption key, or
+off-cluster backup destination is configured here. The names-only future
+object-storage contract is maintained in
+`belacca-gitops/docs/BACKUP-CONTRACT.md`; it is an external prerequisite, not a
+provisioned service. `scripts/backup-restore.py` uses SQLite's online backup
+API, verifies `PRAGMA integrity_check`, and restores only into a temporary
+directory. Run the self-test and verify a protected local artifact before
+relying on it:
+
+```bash
+./scripts/backup-restore.sh self-test
+./scripts/backup-restore.sh backup /path/to/pong.db ./artifacts/pong-$(date -u +%Y%m%dT%H%M%SZ).db
+./scripts/backup-restore.sh verify ./artifacts/pong-<timestamp>.db
+```
+
+A safe operator-controlled copy from the live PVC is intentionally manual:
+
+1. Confirm a maintenance window, notify users, and record the current Flux
+   revision/image digests. Do not delete the cluster, PVC, or namespace.
+2. Scale `pong-api` to zero and wait for its pod to terminate so the
+   ReadWriteOnce claim is not mounted by two pods.
+3. Create a temporary **non-production** helper pod in `pong` that mounts only
+   `pong-api-data` at `/data`, wait for it to be Ready, and use `kubectl cp`
+   to copy `/data/pong.db` to a protected local path. Delete the helper pod.
+4. Run `scripts/backup-restore.sh backup` and `verify` against that local copy.
+   For a restore rehearsal, restore into a temporary file or separate
+   disposable k3d cluster/PVC only; never overwrite `/data/pong.db` in place.
+5. Scale `pong-api` back to one, wait for readiness, and verify the public
+   HTTP/API endpoint plus the two-player synthetic journey. Return control to
+   Flux rather than leaving a manual deployment change in place.
+
+The procedure produces a verified local artifact but does not pretend it is an
+independent backup until an operator copies it to an approved protected
+location out-of-band. For a full rehearsal, use the guarded runner rather than
+hand-writing a second cluster procedure:
+
+```bash
+./scripts/restore-rehearsal.sh self-test
+./scripts/restore-rehearsal.sh --backup /protected/path/pong.db \
+  --build-images \
+  --i-understand-this-creates-an-isolated-cluster
+```
+
+The runner requires a new `pong-restore-*` cluster name, verifies the source
+before creating it, compares the copied PVC file hash, and checks the restored
+API through a localhost-only gateway. It never uses a current kubeconfig
+context for Kubernetes operations, never uploads data, and refuses
+`k3d-pong`/`pong`. `--keep-cluster` is available for inspection; otherwise it
+cleans only the exact disposable cluster it created. The existing `k3d-pong`
+cluster, `pong-api-data` PVC, and production `/data/pong.db` must not be
+destroyed or overwritten for this rehearsal.
+
+## Observability, failure handling, and bounded smoke
+
+Scrape `/metrics` through the existing private/cluster monitoring path. Do not
+add labels or relabel rules containing room IDs, names, IPs, tokens, URLs, or
+request IDs. Alerting should use the aggregate success/failure counters and
+active/waiting/playing gauges; request IDs are for short-lived request
+correlation only and are not a metric dimension.
+
+The orchestration contract is intentionally conservative:
+
+- a Pod/Service create failure removes the database reservation when cleanup is
+  confirmed; quota/admission rejection is surfaced as a bounded HTTP failure;
+- a resource deletion failure retains the room row so a later reconciliation or
+  restart can retry it;
+- terminal Pods and Services without a live matching Pod are candidates for
+  idempotent cleanup; active playing rooms are retained;
+- SQLite remains one-writer and room capacity remains atomically limited to two.
+
+Run the dependency-light harness locally or against a controlled test target.
+It caps iterations at 50, concurrency at 8, per-operation timeout at 30 seconds,
+and total duration at 3 minutes. It reports aggregate latency percentiles and
+failure codes only:
+
+```bash
+./scripts/load-smoke.sh --dry-run
+LOAD_SMOKE_BASE_URL=http://127.0.0.1:8080 \
+  ./scripts/load-smoke.sh --iterations=5 --concurrency=2
+```
+
+Use the existing synthetic script for the public workflow and configure its URL
+out of band. Do not run sustained load against the public endpoint without an
+approved window; the harness is deliberately resource-safe, not an unbounded
+load generator.
 
 ## Useful checks
 

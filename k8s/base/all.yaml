@@ -61,6 +61,12 @@ spec:
             limits:
               cpu: 200m
               memory: 32Mi
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 80
+            failureThreshold: 30
+            periodSeconds: 2
           readinessProbe:
             httpGet:
               path: /health
@@ -126,6 +132,12 @@ spec:
             limits:
               cpu: 100m
               memory: 16Mi
+          startupProbe:
+            httpGet:
+              path: /
+              port: 80
+            failureThreshold: 30
+            periodSeconds: 2
           readinessProbe:
             httpGet:
               path: /
@@ -216,6 +228,8 @@ spec:
                   fieldPath: status.podIP
             - name: ROOM_POD_TEMPLATE
               value: /etc/room-template/template.json
+            - name: PONG_ALLOWED_ORIGINS
+              value: http://localhost:8080
           volumeMounts:
             - name: data
               mountPath: /data
@@ -229,6 +243,12 @@ spec:
             limits:
               cpu: 200m
               memory: 64Mi
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            failureThreshold: 30
+            periodSeconds: 2
           readinessProbe:
             httpGet:
               path: /api/rooms
@@ -338,10 +358,23 @@ data:
         }
       },
       "spec": {
+        "automountServiceAccountToken": false,
+        "securityContext": {
+          "runAsNonRoot": true,
+          "runAsUser": 65532,
+          "runAsGroup": 65532,
+          "seccompProfile": { "type": "RuntimeDefault" }
+        },
         "containers": [
           {
             "name": "pong-room",
             "image": "cloudnativepong-room:latest",
+            "securityContext": {
+              "allowPrivilegeEscalation": false,
+              "capabilities": { "drop": ["ALL"] },
+              "readOnlyRootFilesystem": true,
+              "runAsNonRoot": true
+            },
             "args": [
               "--mode=room",
               "--room-id=${ROOM_ID}",
@@ -373,6 +406,7 @@ data:
           }
         ],
         "restartPolicy": "Never",
+        "activeDeadlineSeconds": 7200,
         "terminationGracePeriodSeconds": 5
       }
     }

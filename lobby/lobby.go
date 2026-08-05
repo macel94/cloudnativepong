@@ -9,12 +9,14 @@ import (
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -29,17 +31,66 @@ type RoomHandler struct {
 	Stop func()
 }
 
+// Recorder is the bounded application metrics surface used by the lobby.
+type Recorder interface {
+	Inc(string)
+	AddGauge(string, int64)
+	SetGauge(string, int64)
+}
+
+// RoomResource is the privacy-safe subset of orchestration state needed for
+// reconciliation tests and production cleanup.
+type RoomResource struct {
+	RoomID string
+	Phase  string
+}
+
+// Orchestrator provisions and removes one room's resources. The interface
+// keeps lifecycle failure tests dependency-light and cluster-free.
+type Orchestrator interface {
+	CreateRoom(string) (string, error)
+	DeletePod(string) error
+	DeleteService(string) error
+	ListPods() ([]RoomResource, error)
+	ListServices() ([]RoomResource, error)
+}
+
 // Server handles HTTP requests for the lobby.
 const defaultRoomIdleTimeout = 10 * time.Minute
 
+const maxJSONBodyBytes int64 = 4 << 10
+const maxRoomNameBytes = 80
+
+var roomIDPattern = regexp.MustCompile(`^[0-9a-f]{6}$`)
+
+var (
+	ErrInvalidJSON     = errors.New("invalid JSON request")
+	ErrBodyTooLarge    = errors.New("request body too large")
+	ErrInvalidRoomID   = errors.New("invalid room ID")
+	ErrInvalidRoomName = errors.New("name must be 1-80 characters")
+)
+
 type Server struct {
-	store           *db.Store
+	store           dbStore
 	mu              sync.RWMutex
 	rooms           map[string]*RoomHandler // local mode: in-process rooms
 	mode            string                  // "local" or "kubernetes"
 	k8sNS           string
 	roomImage       string
 	roomIdleTimeout time.Duration
+	recorder        Recorder
+	orchestrator    Orchestrator
+}
+
+type dbStore interface {
+	CreateRoom(string, string) (*db.Room, error)
+	GetRoom(string) (*db.Room, error)
+	ListRooms() ([]db.Room, error)
+	UpdateRoomStatus(string, string, string) error
+	IncrementPlayers(string) error
+	DecrementPlayers(string) error
+	MarkRoomPlaying(string) error
+	DeleteRoom(string) error
 }
 
 // NewServer creates a new lobby server with the default abandoned-room timeout.
@@ -47,19 +98,51 @@ func NewServer(store *db.Store, mode, k8sNS, roomImage string) *Server {
 	return NewServerWithIdleTimeout(store, mode, k8sNS, roomImage, defaultRoomIdleTimeout)
 }
 
+// NewServerWithMetrics is the production constructor with the shared bounded
+// application metrics recorder.
+func NewServerWithMetrics(store *db.Store, mode, k8sNS, roomImage string, recorder Recorder) *Server {
+	return NewServerWithDependencies(store, mode, k8sNS, roomImage, defaultRoomIdleTimeout, recorder, nil)
+}
+
 // NewServerWithIdleTimeout creates a lobby server with an explicit timeout for
 // rooms that never reach the playing state.
 func NewServerWithIdleTimeout(store *db.Store, mode, k8sNS, roomImage string, idleTimeout time.Duration) *Server {
+	return NewServerWithDependencies(store, mode, k8sNS, roomImage, idleTimeout, nil, nil)
+}
+
+// NewServerWithDependencies is the testable constructor. Nil dependencies use
+// the production SQLite/Kubernetes implementations.
+func NewServerWithDependencies(store dbStore, mode, k8sNS, roomImage string, idleTimeout time.Duration, recorder Recorder, orchestrator Orchestrator) *Server {
 	if idleTimeout <= 0 {
 		idleTimeout = defaultRoomIdleTimeout
 	}
-	return &Server{
+	s := &Server{
 		store:           store,
 		rooms:           make(map[string]*RoomHandler),
 		mode:            mode,
 		k8sNS:           k8sNS,
 		roomImage:       roomImage,
 		roomIdleTimeout: idleTimeout,
+		recorder:        recorder,
+		orchestrator:    orchestrator,
+	}
+	if s.orchestrator == nil && mode != "local" {
+		s.orchestrator = &kubernetesOrchestrator{server: s}
+	}
+	return s
+}
+
+func (s *Server) metric(name string) {
+	if s.recorder != nil {
+		s.recorder.Inc(name)
+	}
+}
+
+func (s *Server) metricResult(operation string, err error) {
+	if err == nil {
+		s.metric("pong_" + operation + "_success")
+	} else {
+		s.metric("pong_" + operation + "_failure")
 	}
 }
 
@@ -71,26 +154,36 @@ func shortID() string {
 }
 
 // CreateRoom creates a new room (locally or via K8s API).
-func (s *Server) CreateRoom(name string) (*db.Room, error) {
+func (s *Server) CreateRoom(name string) (room *db.Room, err error) {
+	defer func() { s.metricResult("room_create", err) }()
 	id := shortID()
-	room, err := s.store.CreateRoom(id, name)
+	room, err = s.store.CreateRoom(id, name)
 	if err != nil {
 		return nil, fmt.Errorf("create room: %w", err)
 	}
 
 	switch s.mode {
 	case "local":
-		// Spawn a room handler in-process (handled by main.go)
+		// Spawn a room handler in-process (handled by main.go).
 		// Just record it — the caller must register the handler.
 	case "lobby", "kubernetes":
-		// Create a K8s pod for this room
-		podIP, err := s.createK8sPod(id)
-		if err != nil {
-			s.store.DeleteRoom(id)
-			return nil, fmt.Errorf("create pod: %w", err)
+		if s.orchestrator == nil {
+			return nil, errors.New("room orchestrator unavailable")
+		}
+		podIP, createErr := s.orchestrator.CreateRoom(id)
+		s.metricResult("pod_create", createErr)
+		if createErr != nil {
+			if cleanupErr := s.cleanupResources(id); cleanupErr == nil {
+				_ = s.store.DeleteRoom(id)
+			}
+			return nil, fmt.Errorf("create pod: %w", createErr)
 		}
 		room.PodIP = podIP
-		s.store.UpdateRoomStatus(id, "waiting", podIP)
+		if updateErr := s.store.UpdateRoomStatus(id, "waiting", podIP); updateErr != nil {
+			_ = s.cleanupResources(id)
+			_ = s.store.DeleteRoom(id)
+			return nil, fmt.Errorf("update room: %w", updateErr)
+		}
 	}
 
 	return room, nil
@@ -101,7 +194,11 @@ func (s *Server) RegisterLocalRoom(id string, handler *RoomHandler) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.rooms[id] = handler
-	s.store.UpdateRoomStatus(id, "waiting", "localhost:8080")
+	if err := s.store.UpdateRoomStatus(id, "waiting", "localhost:8080"); err != nil {
+		s.metric("pong_room_register_failure")
+		return
+	}
+	s.metric("pong_room_register_success")
 }
 
 // GetRoomAddr returns the WebSocket address for a room.
@@ -136,51 +233,63 @@ func (s *Server) ListRooms() ([]db.Room, error) {
 
 // JoinRoom reserves one of the room's two player slots. The room remains in
 // waiting status until the room process confirms both WebSocket connections.
-func (s *Server) JoinRoom(id string) error {
-	room, err := s.store.GetRoom(id)
-	if err != nil || room == nil {
-		return fmt.Errorf("room not found")
+func (s *Server) JoinRoom(id string) (err error) {
+	defer func() { s.metricResult("room_join", err) }()
+	if !ValidRoomID(id) {
+		return ErrInvalidRoomID
 	}
-	if room.Players >= 2 {
-		return fmt.Errorf("room is full")
+	room, err := s.store.GetRoom(id)
+	if err != nil {
+		return err
+	}
+	if room == nil {
+		return db.ErrRoomNotFound
 	}
 	return s.store.IncrementPlayers(id)
 }
 
 // MarkRoomStarted records that both players have connected to the room
 // WebSocket. Reservations made through JoinRoom alone never start a room.
-func (s *Server) MarkRoomStarted(id string) error {
+func (s *Server) MarkRoomStarted(id string) (err error) {
+	defer func() { s.metricResult("room_start", err) }()
 	return s.store.MarkRoomPlaying(id)
 }
 
-// CleanupRoom removes the Kubernetes Pod and Service for a room and deletes
-// its database record. It is safe to call more than once.
-func (s *Server) CleanupRoom(roomID string) error {
+func (s *Server) cleanupResources(roomID string) error {
 	if s.mode == "local" {
-		return s.store.DeleteRoom(roomID)
+		return nil
 	}
+	if s.orchestrator == nil {
+		return errors.New("room orchestrator unavailable")
+	}
+	var firstErr error
+	if err := s.orchestrator.DeletePod(roomID); err != nil {
+		s.metric("pong_pod_delete_failure")
+		firstErr = err
+	} else {
+		s.metric("pong_pod_delete_success")
+	}
+	if err := s.orchestrator.DeleteService(roomID); err != nil {
+		s.metric("pong_service_delete_failure")
+		if firstErr == nil {
+			firstErr = err
+		}
+	} else {
+		s.metric("pong_service_delete_success")
+	}
+	return firstErr
+}
 
-	token, apiHost, apiPort, ns, err := s.k8sConfig()
-	if err != nil {
+// CleanupRoom removes room resources and then deletes its database record. It
+// is safe to call repeatedly; a resource deletion failure retains the row so
+// restart reconciliation can retry it.
+func (s *Server) CleanupRoom(roomID string) (err error) {
+	defer func() { s.metricResult("room_cleanup", err) }()
+	if err = s.cleanupResources(roomID); err != nil {
 		return err
 	}
-	for _, resource := range []string{"pods/pong-room-" + roomID, "services/pong-room-" + roomID} {
-		url := fmt.Sprintf("https://%s:%s/api/v1/namespaces/%s/%s", apiHost, apiPort, ns, resource)
-		req, err := http.NewRequest(http.MethodDelete, url, nil)
-		if err != nil {
-			return err
-		}
-		req.Header.Set("Authorization", "Bearer "+string(token))
-		resp, err := k8sClient().Do(req)
-		if err != nil {
-			return fmt.Errorf("delete %s: %w", resource, err)
-		}
-		resp.Body.Close()
-		if resp.StatusCode >= 300 && resp.StatusCode != http.StatusNotFound {
-			return fmt.Errorf("delete %s returned %d", resource, resp.StatusCode)
-		}
-	}
-	return s.store.DeleteRoom(roomID)
+	err = s.store.DeleteRoom(roomID)
+	return err
 }
 
 func (s *Server) k8sConfig() (token []byte, apiHost, apiPort, ns string, err error) {
@@ -209,10 +318,8 @@ func (s *Server) k8sConfig() (token []byte, apiHost, apiPort, ns string, err err
 
 // ReconcileRooms removes terminal or orphaned room resources after an API
 // restart. Active rooms remain untouched.
-func (s *Server) ReconcileRooms() error {
-	// Remove waiting rooms that never received a second player. This also
-	// handles rooms whose Pod was created successfully but never accepted a
-	// WebSocket connection, such as abandoned lobby tabs.
+func (s *Server) ReconcileRooms() (err error) {
+	defer func() { s.metricResult("reconcile", err) }()
 	rooms, err := s.store.ListRooms()
 	if err != nil {
 		return err
@@ -222,23 +329,299 @@ func (s *Server) ReconcileRooms() error {
 		if room.Status != "waiting" || room.CreatedAt.IsZero() || now.Sub(room.CreatedAt) < s.roomIdleTimeout {
 			continue
 		}
-		log.Printf("reconcile: expiring idle room %s (age=%s)", room.ID, now.Sub(room.CreatedAt).Round(time.Second))
-		if err := s.CleanupRoom(room.ID); err != nil {
-			log.Printf("reconcile: cleanup idle room %s: %v", room.ID, err)
+		if cleanupErr := s.CleanupRoom(room.ID); cleanupErr != nil {
+			s.metric("pong_reconcile_cleanup_failure")
+		} else {
+			s.metric("pong_reconcile_cleanup_success")
 		}
 	}
 
-	// Kubernetes resource reconciliation is not needed for in-process rooms.
 	if s.mode == "local" {
 		return nil
 	}
+	if s.orchestrator == nil {
+		return errors.New("room orchestrator unavailable")
+	}
+	pods, err := s.orchestrator.ListPods()
+	if err != nil {
+		s.metric("pong_pod_list_failure")
+		return err
+	}
+	s.metric("pong_pod_list_success")
+	livePods := make(map[string]struct{}, len(pods))
+	for _, pod := range pods {
+		if pod.RoomID == "" {
+			continue
+		}
+		livePods[pod.RoomID] = struct{}{}
+		room, getErr := s.store.GetRoom(pod.RoomID)
+		if getErr != nil {
+			return getErr
+		}
+		if room == nil || room.Status == "finished" || pod.Phase == "Succeeded" || pod.Phase == "Failed" || pod.Phase == "Unknown" {
+			if cleanupErr := s.CleanupRoom(pod.RoomID); cleanupErr != nil {
+				s.metric("pong_reconcile_cleanup_failure")
+			} else {
+				s.metric("pong_reconcile_cleanup_success")
+			}
+		}
+	}
 
+	services, err := s.orchestrator.ListServices()
+	if err != nil {
+		s.metric("pong_service_list_failure")
+		return err
+	}
+	s.metric("pong_service_list_success")
+	for _, service := range services {
+		if service.RoomID == "" {
+			continue
+		}
+		if _, ok := livePods[service.RoomID]; ok {
+			continue
+		}
+		if cleanupErr := s.CleanupRoom(service.RoomID); cleanupErr != nil {
+			s.metric("pong_reconcile_cleanup_failure")
+		} else {
+			s.metric("pong_reconcile_cleanup_success")
+		}
+	}
+	return nil
+}
+
+// ---- HTTP Handlers ----
+
+// DecodeJSONBody parses one bounded JSON object and rejects unknown fields or
+// trailing data. Public endpoints use this helper for a uniform body contract.
+func DecodeJSONBody(w http.ResponseWriter, r *http.Request, dst interface{}) error {
+	contentType := strings.ToLower(strings.TrimSpace(strings.SplitN(r.Header.Get("Content-Type"), ";", 2)[0]))
+	if contentType != "application/json" {
+		return ErrInvalidJSON
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxJSONBodyBytes)
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(dst); err != nil {
+		if strings.Contains(err.Error(), "request body too large") || errors.Is(err, http.ErrBodyReadAfterClose) {
+			return ErrBodyTooLarge
+		}
+		return ErrInvalidJSON
+	}
+	var extra interface{}
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err != nil && strings.Contains(err.Error(), "request body too large") {
+			return ErrBodyTooLarge
+		}
+		return ErrInvalidJSON
+	}
+	return nil
+}
+
+// ValidRoomID reports whether id is one of the server-generated room IDs.
+func ValidRoomID(id string) bool { return roomIDPattern.MatchString(id) }
+
+// ValidRoomName trims and validates a public display name.
+func ValidRoomName(name string) (string, error) {
+	name = strings.TrimSpace(name)
+	if name == "" || len([]byte(name)) > maxRoomNameBytes {
+		return "", ErrInvalidRoomName
+	}
+	for _, r := range name {
+		if r < 0x20 || r == 0x7f {
+			return "", ErrInvalidRoomName
+		}
+	}
+	return name, nil
+}
+
+// RequestErrorStatus maps a public request error to its HTTP status.
+func RequestErrorStatus(err error) int {
+	switch {
+	case errors.Is(err, ErrBodyTooLarge):
+		return http.StatusRequestEntityTooLarge
+	case errors.Is(err, ErrInvalidJSON), errors.Is(err, ErrInvalidRoomID), errors.Is(err, ErrInvalidRoomName):
+		return http.StatusBadRequest
+	case errors.Is(err, db.ErrRoomNotFound):
+		return http.StatusNotFound
+	case errors.Is(err, db.ErrRoomFull):
+		return http.StatusConflict
+	default:
+		return http.StatusInternalServerError
+	}
+}
+
+func writeError(w http.ResponseWriter, err error) {
+	status := RequestErrorStatus(err)
+	if status >= 500 {
+		http.Error(w, "internal server error", status)
+		return
+	}
+	http.Error(w, err.Error(), status)
+}
+
+// HandleRoomStarted marks a room as playing after both room WebSocket
+// connections have been accepted.
+func (s *Server) HandleRoomStarted(w http.ResponseWriter, r *http.Request, roomID string) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := s.MarkRoomStarted(roomID); err != nil {
+		s.metric("pong_room_start_callback_failure")
+		http.Error(w, "room start rejected", http.StatusConflict)
+		return
+	}
+	s.metric("pong_room_start_callback_success")
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// HandleRoomFinished removes a completed room's Pod, Service, and record.
+func (s *Server) HandleRoomFinished(w http.ResponseWriter, r *http.Request, roomID string) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := s.CleanupRoom(roomID); err != nil {
+		s.metric("pong_room_finish_failure")
+		http.Error(w, "room cleanup unavailable", http.StatusInternalServerError)
+		return
+	}
+	s.metric("pong_room_finish_success")
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// HandleListRooms returns JSON list of active rooms.
+func (s *Server) HandleListRooms(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	rooms, err := s.ListRooms()
+	if err != nil {
+		s.metric("pong_room_list_failure")
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+	s.metric("pong_room_list_success")
+	if rooms == nil {
+		rooms = []db.Room{}
+	}
+	writeJSON(w, rooms)
+}
+
+// HandleCreateRoom creates a new room and returns its info.
+func (s *Server) HandleCreateRoom(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := DecodeJSONBody(w, r, &req); err != nil {
+		writeError(w, err)
+		return
+	}
+	name, err := ValidRoomName(req.Name)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+
+	room, err := s.CreateRoom(name)
+	if err != nil {
+		s.metric("pong_room_create_http_failure")
+		http.Error(w, "room service unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	// Creating a room is the creator's reservation. The browser opens the
+	// creator's WebSocket after this response, so reserving here keeps the
+	// database capacity model aligned with the public create workflow.
+	if err := s.JoinRoom(room.ID); err != nil {
+		if cleanupErr := s.CleanupRoom(room.ID); cleanupErr != nil {
+			log.Printf("event=room_create_cleanup_failed")
+		}
+		s.metric("pong_room_create_http_failure")
+		writeError(w, err)
+		return
+	}
+	room.Players = 1
+	s.metric("pong_room_create_http_success")
+	writeJSON(w, room)
+}
+
+// HandleJoinRoom validates room capacity and returns connection info.
+func (s *Server) HandleJoinRoom(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		RoomID string `json:"room_id"`
+	}
+	if err := DecodeJSONBody(w, r, &req); err != nil {
+		writeError(w, err)
+		return
+	}
+	if !ValidRoomID(req.RoomID) {
+		writeError(w, ErrInvalidRoomID)
+		return
+	}
+
+	if err := s.JoinRoom(req.RoomID); err != nil {
+		s.metric("pong_room_join_http_failure")
+		writeError(w, err)
+		return
+	}
+
+	addr, err := s.GetRoomAddr(req.RoomID)
+	if err != nil {
+		_ = s.store.DecrementPlayers(req.RoomID)
+		s.metric("pong_room_join_http_failure")
+		writeError(w, err)
+		return
+	}
+
+	s.metric("pong_room_join_http_success")
+	writeJSON(w, map[string]string{
+		"room_id": req.RoomID,
+		"ws_addr": addr,
+		"ws_path": "/rooms/" + req.RoomID + "/ws",
+		"mode":    s.mode,
+	})
+}
+
+// ---- Kubernetes integration ----
+
+type kubernetesOrchestrator struct{ server *Server }
+
+func (o *kubernetesOrchestrator) CreateRoom(roomID string) (string, error) {
+	return o.server.createK8sPod(roomID)
+}
+
+func (o *kubernetesOrchestrator) DeletePod(roomID string) error {
+	return o.server.deleteK8sResource("pods/pong-room-" + roomID)
+}
+
+func (o *kubernetesOrchestrator) DeleteService(roomID string) error {
+	return o.server.deleteK8sResource("services/pong-room-" + roomID)
+}
+
+func (o *kubernetesOrchestrator) ListPods() ([]RoomResource, error) {
+	return o.server.listK8sResources("pods", true)
+}
+
+func (o *kubernetesOrchestrator) ListServices() ([]RoomResource, error) {
+	return o.server.listK8sResources("services", false)
+}
+
+func (s *Server) deleteK8sResource(resource string) error {
 	token, apiHost, apiPort, ns, err := s.k8sConfig()
 	if err != nil {
 		return err
 	}
-	url := fmt.Sprintf("https://%s:%s/api/v1/namespaces/%s/pods?labelSelector=role%%3Droom", apiHost, apiPort, ns)
-	req, err := http.NewRequest(http.MethodGet, url, nil)
+	url := fmt.Sprintf("https://%s:%s/api/v1/namespaces/%s/%s", apiHost, apiPort, ns, resource)
+	req, err := http.NewRequest(http.MethodDelete, url, nil)
 	if err != nil {
 		return err
 	}
@@ -247,15 +630,36 @@ func (s *Server) ReconcileRooms() error {
 	if err != nil {
 		return err
 	}
-	body, readErr := io.ReadAll(resp.Body)
-	resp.Body.Close()
-	if readErr != nil {
-		return readErr
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 && resp.StatusCode != http.StatusNotFound {
+		return fmt.Errorf("kubernetes delete returned HTTP %d", resp.StatusCode)
+	}
+	return nil
+}
+
+func (s *Server) listK8sResources(resource string, includePhase bool) ([]RoomResource, error) {
+	token, apiHost, apiPort, ns, err := s.k8sConfig()
+	if err != nil {
+		return nil, err
+	}
+	url := fmt.Sprintf("https://%s:%s/api/v1/namespaces/%s/%s?labelSelector=role%%3Droom", apiHost, apiPort, ns, resource)
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+string(token))
+	resp, err := k8sClient().Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, err
 	}
 	if resp.StatusCode >= 300 {
-		return fmt.Errorf("list room pods returned %d: %s", resp.StatusCode, body)
+		return nil, fmt.Errorf("kubernetes list returned HTTP %d", resp.StatusCode)
 	}
-
 	var result struct {
 		Items []struct {
 			Metadata struct {
@@ -267,175 +671,22 @@ func (s *Server) ReconcileRooms() error {
 		} `json:"items"`
 	}
 	if err := json.Unmarshal(body, &result); err != nil {
-		return err
+		return nil, err
 	}
+	resources := make([]RoomResource, 0, len(result.Items))
 	for _, item := range result.Items {
 		roomID := item.Metadata.Labels["room-id"]
-		if roomID == "" {
+		if !ValidRoomID(roomID) {
 			continue
 		}
-		room, err := s.store.GetRoom(roomID)
-		if err != nil {
-			return err
+		phase := ""
+		if includePhase {
+			phase = item.Status.Phase
 		}
-		if room == nil || room.Status == "finished" || item.Status.Phase == "Succeeded" || item.Status.Phase == "Failed" {
-			if err := s.CleanupRoom(roomID); err != nil {
-				log.Printf("reconcile: cleanup room %s: %v", roomID, err)
-			}
-		}
+		resources = append(resources, RoomResource{RoomID: roomID, Phase: phase})
 	}
-
-	// A crash can leave a Service after its Pod has already disappeared. Clean
-	// those orphan Services as well; active room Services are retained.
-	url = fmt.Sprintf("https://%s:%s/api/v1/namespaces/%s/services?labelSelector=role%%3Droom", apiHost, apiPort, ns)
-	req, err = http.NewRequest(http.MethodGet, url, nil)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Authorization", "Bearer "+string(token))
-	resp, err = k8sClient().Do(req)
-	if err != nil {
-		return err
-	}
-	body, readErr = io.ReadAll(resp.Body)
-	resp.Body.Close()
-	if readErr != nil {
-		return readErr
-	}
-	if resp.StatusCode >= 300 {
-		return fmt.Errorf("list room services returned %d: %s", resp.StatusCode, body)
-	}
-	var services struct {
-		Items []struct {
-			Metadata struct {
-				Labels map[string]string `json:"labels"`
-			} `json:"metadata"`
-		} `json:"items"`
-	}
-	if err := json.Unmarshal(body, &services); err != nil {
-		return err
-	}
-	for _, item := range services.Items {
-		roomID := item.Metadata.Labels["room-id"]
-		if roomID == "" {
-			continue
-		}
-		room, err := s.store.GetRoom(roomID)
-		if err != nil {
-			return err
-		}
-		if room == nil || room.Status == "finished" {
-			if err := s.CleanupRoom(roomID); err != nil {
-				log.Printf("reconcile: cleanup orphan service for room %s: %v", roomID, err)
-			}
-		}
-	}
-	return nil
+	return resources, nil
 }
-
-// ---- HTTP Handlers ----
-
-// HandleRoomStarted marks a room as playing after both room WebSocket
-// connections have been accepted.
-func (s *Server) HandleRoomStarted(w http.ResponseWriter, r *http.Request, roomID string) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	if err := s.MarkRoomStarted(roomID); err != nil {
-		http.Error(w, err.Error(), http.StatusConflict)
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
-}
-
-// HandleRoomFinished removes a completed room's Pod, Service, and record.
-func (s *Server) HandleRoomFinished(w http.ResponseWriter, r *http.Request, roomID string) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	if err := s.CleanupRoom(roomID); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
-}
-
-// HandleListRooms returns JSON list of active rooms.
-func (s *Server) HandleListRooms(w http.ResponseWriter, r *http.Request) {
-	rooms, err := s.ListRooms()
-	if err != nil {
-		http.Error(w, err.Error(), 500)
-		return
-	}
-	if rooms == nil {
-		rooms = []db.Room{}
-	}
-	writeJSON(w, rooms)
-}
-
-// HandleCreateRoom creates a new room and returns its info.
-func (s *Server) HandleCreateRoom(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", 405)
-		return
-	}
-	var req struct {
-		Name string `json:"name"`
-	}
-	json.NewDecoder(r.Body).Decode(&req)
-
-	room, err := s.CreateRoom(req.Name)
-	if err != nil {
-		http.Error(w, err.Error(), 500)
-		return
-	}
-	// Creating a room is the creator's reservation. The browser opens the
-	// creator's WebSocket after this response, so reserving here keeps the
-	// database capacity model aligned with the public create workflow.
-	if err := s.JoinRoom(room.ID); err != nil {
-		if cleanupErr := s.CleanupRoom(room.ID); cleanupErr != nil {
-			log.Printf("create room %s: cleanup after reservation failure: %v", room.ID, cleanupErr)
-		}
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	room.Players = 1
-	writeJSON(w, room)
-}
-
-// HandleJoinRoom validates room capacity and returns connection info.
-func (s *Server) HandleJoinRoom(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", 405)
-		return
-	}
-	var req struct {
-		RoomID string `json:"room_id"`
-	}
-	json.NewDecoder(r.Body).Decode(&req)
-
-	if err := s.JoinRoom(req.RoomID); err != nil {
-		writeJSON(w, map[string]string{"error": err.Error()})
-		return
-	}
-
-	addr, err := s.GetRoomAddr(req.RoomID)
-	if err != nil {
-		writeJSON(w, map[string]string{"error": err.Error()})
-		return
-	}
-
-	writeJSON(w, map[string]string{
-		"room_id": req.RoomID,
-		"ws_addr": addr,
-		"ws_path": "/rooms/" + req.RoomID + "/ws",
-		"mode":    s.mode,
-	})
-}
-
-// ---- Kubernetes integration ----
 
 // createK8sPod creates a new pod for a game room using the K8s REST API.
 func (s *Server) createK8sPod(roomID string) (string, error) {
@@ -479,6 +730,15 @@ func (s *Server) createK8sPod(roomID string) (string, error) {
 			},
 		},
 		"spec": map[string]interface{}{
+			"automountServiceAccountToken": false,
+			"securityContext": map[string]interface{}{
+				"runAsNonRoot": true,
+				"runAsUser":    65532,
+				"runAsGroup":   65532,
+				"seccompProfile": map[string]interface{}{
+					"type": "RuntimeDefault",
+				},
+			},
 			"containers": []map[string]interface{}{
 				{
 					"name":            "pong-room",
@@ -498,7 +758,14 @@ func (s *Server) createK8sPod(roomID string) (string, error) {
 						"initialDelaySeconds": 5,
 						"periodSeconds":       10,
 					},
-					"activeDeadlineSeconds": 7200,
+					"securityContext": map[string]interface{}{
+						"allowPrivilegeEscalation": false,
+						"capabilities": map[string]interface{}{
+							"drop": []string{"ALL"},
+						},
+						"readOnlyRootFilesystem": true,
+						"runAsNonRoot":           true,
+					},
 					"resources": map[string]interface{}{
 						"requests": map[string]string{
 							"cpu":    "50m",
@@ -512,14 +779,18 @@ func (s *Server) createK8sPod(roomID string) (string, error) {
 				},
 			},
 			"restartPolicy":                 "Never",
+			"activeDeadlineSeconds":         7200,
 			"terminationGracePeriodSeconds": 5,
 		},
 	}
 
 	// Create the ClusterIP Service for the room (before the pod, so DNS is ready)
 	if err := s.createK8sService(roomID, apiHost, apiPort, ns, token); err != nil {
-		log.Printf("Warning: failed to create service for room %s: %v", roomID, err)
-		// Non-fatal: the pod IP can still be used directly
+		s.metric("pong_service_create_failure")
+		log.Printf("event=pod_service_create_failed")
+		// Non-fatal: the pod IP can still be used directly.
+	} else {
+		s.metric("pong_service_create_success")
 	}
 
 	body, _ := json.Marshal(pod)
@@ -543,26 +814,30 @@ func (s *Server) createK8sPod(roomID string) (string, error) {
 	}
 	defer resp.Body.Close()
 
-	respBody, _ := io.ReadAll(resp.Body)
+	respBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if readErr != nil {
+		return "", errors.New("kubernetes pod response unreadable")
+	}
 	if resp.StatusCode >= 300 {
-		return "", fmt.Errorf("k8s api returned %d: %s", resp.StatusCode, string(respBody))
+		return "", fmt.Errorf("kubernetes pod create returned HTTP %d", resp.StatusCode)
 	}
-	log.Printf("Created pod for room %s: %s", roomID, string(respBody))
 
-	// Parse the pod IP from the response
-	var result map[string]interface{}
-	json.Unmarshal(respBody, &result)
-	status := result["status"].(map[string]interface{})
-	podIP := ""
-	if ip, ok := status["podIP"]; ok {
-		podIP = ip.(string)
+	// Parse the optional pod IP from the response without trusting its shape.
+	var result struct {
+		Status struct {
+			PodIP string `json:"podIP"`
+		} `json:"status"`
 	}
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return "", errors.New("invalid kubernetes pod response")
+	}
+	podIP := result.Status.PodIP
 
 	// Wait briefly for pod IP to be assigned
 	if podIP == "" {
 		podIP = s.waitForPodIP(roomID, string(token), apiHost, apiPort, ns)
 		if podIP == "" {
-			return "", fmt.Errorf("timed out waiting for pod IP for room %s", roomID)
+			return "", errors.New("timed out waiting for pod IP")
 		}
 	}
 
@@ -619,12 +894,12 @@ func (s *Server) createK8sService(roomID, apiHost, apiPort, ns string, token []b
 	}
 	defer resp.Body.Close()
 
-	respBody, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode >= 300 {
-		return fmt.Errorf("k8s service api returned %d: %s", resp.StatusCode, string(respBody))
+	if _, err := io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20)); err != nil {
+		return errors.New("kubernetes service response unreadable")
 	}
-
-	log.Printf("Created ClusterIP Service for room %s (pong-room-%s.%s.svc.cluster.local)", roomID, roomID, ns)
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("kubernetes service create returned HTTP %d", resp.StatusCode)
+	}
 	return nil
 }
 

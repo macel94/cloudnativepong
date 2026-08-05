@@ -28,6 +28,14 @@ jobs:
       - name: Build binary
         run: CGO_ENABLED=0 go build -ldflags="-s -w" -o cloudnativepong .
 
+      - name: Validate recovery helpers without cluster access
+        run: |
+          bash -n scripts/backup-restore.sh scripts/restore-rehearsal.sh
+          ./scripts/backup-restore.sh self-test
+          ./scripts/restore-rehearsal.sh self-test
+          ./scripts/restore-rehearsal.sh --backup /tmp/example.db --dry-run \
+            --i-understand-this-creates-an-isolated-cluster
+
       - uses: actions/setup-node@v7
         with:
           node-version: "24"

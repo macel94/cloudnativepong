@@ -1,0 +1,67 @@
+name: Dependabot auto-merge
+
+on:
+  pull_request_target:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+
+# This workflow never checks out or executes pull-request code.
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: dependabot-automerge-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  auto-merge:
+    name: Enable safe Dependabot auto-merge
+    if: >-
+      github.event.pull_request.user.login == 'dependabot[bot]' &&
+      !github.event.pull_request.draft &&
+      github.repository == 'macel94/cloudnativepong'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch Dependabot metadata
+        id: dependabot-metadata
+        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
+      - name: Wait for Pong build and tests
+        if: >-
+          steps.dependabot-metadata.outputs.update-type == 'version-update:semver-patch' ||
+          steps.dependabot-metadata.outputs.update-type == 'version-update:semver-minor'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          BUILD_WORKFLOW: Test & Build
+        run: |
+          set -euo pipefail
+          deadline=$((SECONDS + 1800))
+          while (( SECONDS < deadline )); do
+            if ! checks="$(gh pr checks "$PR_URL" --json workflow,bucket 2>/dev/null)"; then
+              checks='[]'
+            fi
+            [[ -n "$checks" ]] || checks='[]'
+            matching="$(jq --arg workflow "$BUILD_WORKFLOW" '[.[] | select(.workflow == $workflow)]' <<<"$checks")"
+            count="$(jq 'length' <<<"$matching")"
+            failed="$(jq '[.[] | select(.bucket == "fail" or .bucket == "cancel")] | length' <<<"$matching")"
+            pending="$(jq '[.[] | select(.bucket == "pending")] | length' <<<"$matching")"
+            if (( failed > 0 )); then
+              echo "${BUILD_WORKFLOW} failed."
+              exit 1
+            fi
+            if (( count > 0 && pending == 0 )); then
+              echo "${BUILD_WORKFLOW} passed."
+              break
+            fi
+            sleep 15
+          done
+          (( SECONDS < deadline )) || { echo "Timed out waiting for ${BUILD_WORKFLOW}."; exit 1; }
+      - name: Enable squash auto-merge for patch and minor updates
+        if: >-
+          steps.dependabot-metadata.outputs.update-type == 'version-update:semver-patch' ||
+          steps.dependabot-metadata.outputs.update-type == 'version-update:semver-minor'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: gh pr merge --auto --squash "$PR_URL"

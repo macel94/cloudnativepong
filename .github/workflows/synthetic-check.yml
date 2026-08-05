@@ -1,0 +1,32 @@
+name: External synthetic checks
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+
+# The endpoint and any bearer token are intentionally out-of-band. Configure
+# the repository/org variable SYNTHETIC_PONG_URL plus the optional
+# SYNTHETIC_AUTH_TOKEN secret. With no URL configured this is a safe no-op, not
+# a false claim that an external monitor exists.
+permissions:
+  contents: read
+
+jobs:
+  public-endpoints:
+    name: Public endpoint and Pong journey
+    runs-on: ubuntu-latest
+    env:
+      SYNTHETIC_BASE_URL: ${{ vars.SYNTHETIC_PONG_URL }}
+      SYNTHETIC_AUTH_TOKEN: ${{ secrets.SYNTHETIC_AUTH_TOKEN }}
+      SYNTHETIC_TIMEOUT_MS: '20000'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install synthetic dependency
+        run: npm ci --ignore-scripts
+      - name: Check configured Pong endpoint and two-player journey
+        run: ./scripts/synthetic-check.sh

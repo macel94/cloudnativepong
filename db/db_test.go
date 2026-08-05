@@ -4,7 +4,30 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
+
+func TestReadsLegacySQLiteTimestampFormatAfterRestart(t *testing.T) {
+	store, err := New(":memory:")
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	defer store.Close()
+	if _, err := store.db.Exec("INSERT INTO rooms (id, name, status, created_at) VALUES (?, ?, ?, ?)", "legacy", "old", "waiting", "2026-08-05T18:00:00Z"); err != nil {
+		t.Fatalf("legacy insert error = %v", err)
+	}
+	room, err := store.GetRoom("legacy")
+	if err != nil {
+		t.Fatalf("GetRoom() error = %v", err)
+	}
+	if room == nil || !room.CreatedAt.Equal(time.Date(2026, 8, 5, 18, 0, 0, 0, time.UTC)) {
+		t.Fatalf("legacy room timestamp = %+v", room)
+	}
+	rooms, err := store.ListRooms()
+	if err != nil || len(rooms) != 1 {
+		t.Fatalf("ListRooms() = %v, %v", rooms, err)
+	}
+}
 
 func TestIncrementPlayersConcurrentCapacity(t *testing.T) {
 	store, err := New(":memory:")
