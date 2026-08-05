@@ -37,7 +37,7 @@ jobs:
       IMAGE: cloudnativepong-${{ matrix.component }}:supply-chain
       STRICT: ${{ inputs.strict || false }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Build local image
         run: docker build --file "Dockerfile.${{ matrix.component }}" --tag "$IMAGE" .
@@ -52,7 +52,7 @@ jobs:
           upload-artifact: true
 
       - name: Scan image with Trivy (report-only by default)
-        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: ${{ env.IMAGE }}
           format: json
@@ -66,7 +66,7 @@ jobs:
         run: python3 scripts/validate-release.py
 
       - name: Upload vulnerability report
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         if: always()
         with:
           name: cloudnativepong-${{ matrix.component }}-trivy
