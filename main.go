@@ -112,6 +112,19 @@ func configureOriginPolicy(mode, configured string) {
 	websocketOrigins = loadOriginAllowlist(mode, configured)
 }
 
+func runHealthcheck(port string) error {
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get("http://127.0.0.1:" + port + "/health")
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("health endpoint returned %s", resp.Status)
+	}
+	return nil
+}
+
 func main() {
 	mode := flag.String("mode", "local", "Mode: local, lobby, room")
 	port := flag.String("port", "8080", "HTTP listen port")
@@ -121,7 +134,16 @@ func main() {
 	roomImage := flag.String("room-image", "cloudnativepong-room:latest", "Room container image")
 	dbPath := flag.String("db-path", ":memory:", "SQLite database path")
 	allowedOrigins := flag.String("allowed-origins", "", "Comma-separated exact browser origins (or PONG_ALLOWED_ORIGINS)")
+	healthcheck := flag.Bool("healthcheck", false, "Check the local health endpoint and exit")
 	flag.Parse()
+
+	if *healthcheck {
+		if err := runHealthcheck(*port); err != nil {
+			log.Printf("healthcheck failed: %v", err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	configureOriginPolicy(*mode, *allowedOrigins)
 	publicAdmission = admission.NewController(admission.ConfigFromEnv(os.Getenv))

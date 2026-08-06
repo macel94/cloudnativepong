@@ -1,5 +1,5 @@
 # ── Cloud Native Pong — API / Lobby Server ─────────────────────────
-# Multi-stage build: Go binary from golang:1.25-alpine → scratch.
+# Multi-stage build: Go binary from golang:1.26-alpine → scratch.
 # Runs in --mode=lobby to serve the API and WebSocket endpoints.
 #
 # Build:
@@ -11,13 +11,21 @@
 # ── Build Stage ────────────────────────────────────────────────────
 FROM docker.io/golang:1.26-alpine AS builder
 
-RUN apk add --no-cache ca-certificates tzdata
+RUN apk add --no-cache \
+    ca-certificates=20260611-r0 \
+    tzdata=2026c-r0
 
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 
-COPY . .
+COPY main.go ./
+COPY admission/ ./admission/
+COPY db/ ./db/
+COPY game/ ./game/
+COPY lobby/ ./lobby/
+COPY metrics/ ./metrics/
+COPY telemetry/ ./telemetry/
 
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
     go build -ldflags="-s -w" -o /pong .
@@ -50,4 +58,8 @@ COPY --from=builder /pong /pong
 
 EXPOSE 8080
 
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD ["/pong", "--healthcheck"]
+
+USER 65532:65532
 ENTRYPOINT ["/pong", "--mode=lobby"]

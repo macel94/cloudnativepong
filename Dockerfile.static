@@ -1,11 +1,11 @@
 # ── Cloud Native Pong — Static File Server ──────────────────────────
-# Serves HTML, CSS, JS via nginx:alpine on port 80.
+# Serves HTML, CSS, JS via nginx:alpine on port 8080.
 #
 # Build:
 #   docker build -t cloudnativepong-static:latest -f Dockerfile.static .
 #
 # Run:
-#   docker run --rm -p 8080:80 cloudnativepong-static:latest
+#   docker run --rm -p 8080:8080 cloudnativepong-static:latest
 
 FROM docker.io/nginx:alpine
 
@@ -30,12 +30,13 @@ RUN rm -rf /usr/share/nginx/html/*
 COPY static/ /usr/share/nginx/html/
 
 # Copy nginx configuration
+COPY nginx-main.conf /etc/nginx/nginx.conf
 COPY static/nginx.conf /etc/nginx/conf.d/default.conf
 
 # Replace the local development marker with the exact source commit used for
 # this image. A production image must carry a full Git SHA so the UI link is
 # unambiguous and reviewable.
-RUN set -eu; \
+RUN set -euo pipefail; \
     printf '%s' "$BUILD_REPOSITORY" | grep -Eq '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'; \
     if [ "$BUILD_SHA" = dev ]; then \
       short_sha=dev; \
@@ -54,7 +55,12 @@ RUN set -eu; \
       /usr/share/nginx/html/build-info.js
 
 # Port exposed to the gateway
-EXPOSE 80
+EXPOSE 8080
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD ["wget", "--spider", "--quiet", "http://127.0.0.1:8080/health"]
+
+USER 101:101
 
 # Run nginx in foreground
 CMD ["nginx", "-g", "daemon off;"]

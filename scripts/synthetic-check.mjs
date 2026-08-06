@@ -455,8 +455,18 @@ async function waitForCleanup(client, roomID, timeoutMs, pollMs) {
   const deadline = Date.now() + timeoutMs;
   const cleanupClient = { ...client, deadline };
   while (true) {
-    const rooms = await getRooms(cleanupClient);
-    if (!rooms.some((room) => room && room.id === roomID)) return;
+    if (Date.now() >= deadline) {
+      throw new SyntheticError('synthetic check exceeded its overall timeout');
+    }
+    try {
+      const rooms = await getRooms(cleanupClient);
+      if (!rooms.some((room) => room && room.id === roomID)) return;
+    } catch (error) {
+      if (Date.now() >= deadline) {
+        throw new SyntheticError('synthetic check exceeded its overall timeout', { cause: error });
+      }
+      throw error;
+    }
     const delay = Math.min(pollMs, remaining(deadline));
     await new Promise((resolve) => setTimeout(resolve, delay));
   }

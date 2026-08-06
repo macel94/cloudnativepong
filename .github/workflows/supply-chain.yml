@@ -5,6 +5,8 @@ on:
     branches: [main]
     paths:
       - 'Dockerfile.*'
+      - '.dockerignore'
+      - 'nginx-main.conf'
       - 'go.mod'
       - 'go.sum'
       - '**.go'

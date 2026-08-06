@@ -52,7 +52,7 @@ spec:
           image: cloudnativepong-gateway:latest
           imagePullPolicy: IfNotPresent
           ports:
-            - containerPort: 80
+            - containerPort: 8080
               name: http
           resources:
             requests:
@@ -64,13 +64,13 @@ spec:
           startupProbe:
             httpGet:
               path: /health
-              port: 80
+              port: 8080
             failureThreshold: 30
             periodSeconds: 2
           readinessProbe:
             httpGet:
               path: /health
-              port: 80
+              port: 8080
             initialDelaySeconds: 2
             periodSeconds: 5
 ---
@@ -88,7 +88,7 @@ spec:
     component: gateway
   ports:
     - port: 80
-      targetPort: 80
+      targetPort: 8080
       nodePort: 30080
       name: http
   type: NodePort
@@ -123,7 +123,7 @@ spec:
           image: cloudnativepong-static:latest
           imagePullPolicy: IfNotPresent
           ports:
-            - containerPort: 80
+            - containerPort: 8080
               name: http
           resources:
             requests:
@@ -135,13 +135,13 @@ spec:
           startupProbe:
             httpGet:
               path: /
-              port: 80
+              port: 8080
             failureThreshold: 30
             periodSeconds: 2
           readinessProbe:
             httpGet:
               path: /
-              port: 80
+              port: 8080
             initialDelaySeconds: 2
             periodSeconds: 5
 ---
@@ -159,7 +159,7 @@ spec:
     component: static
   ports:
     - port: 80
-      targetPort: 80
+      targetPort: 8080
       name: http
   type: ClusterIP
 
@@ -209,6 +209,13 @@ spec:
         component: api
     spec:
       serviceAccountName: pong-lobby
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: api
           image: cloudnativepong-api:latest
@@ -236,6 +243,11 @@ spec:
             - name: room-template
               mountPath: /etc/room-template
               readOnly: true
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+            runAsNonRoot: true
           resources:
             requests:
               cpu: 50m
