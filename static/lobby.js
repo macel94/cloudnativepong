@@ -17,6 +17,7 @@ document.addEventListener('DOMContentLoaded', () => {
     });
 
     document.getElementById('btnNewRoom').addEventListener('click', createRoom);
+    document.getElementById('btnAI').addEventListener('click', playAgainstComputer);
     refreshRooms();
     setInterval(refreshRooms, 3000);
 });
@@ -45,6 +46,11 @@ function renderRooms(rooms) {
             </button>
         </div>
     `).join('');
+}
+
+function playAgainstComputer() {
+    const name = playerName || 'Player';
+    window.location.href = '/game.html?mode=ai&name=' + encodeURIComponent(name);
 }
 
 async function createRoom() {

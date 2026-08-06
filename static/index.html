@@ -7,6 +7,7 @@
     <link rel="stylesheet" href="/style.css">
 </head>
 <body>
+    <a class="build-version" data-build-version href="https://github.com/macel94/cloudnativepong/commits/main" target="_blank" rel="noopener noreferrer">build unknown</a>
     <div class="container">
         <header>
             <h1>🏓 Cloud Native Pong</h1>
@@ -19,6 +20,7 @@
 
         <div class="actions">
             <button id="btnNewRoom" class="btn primary">+ New Room</button>
+            <button id="btnAI" class="btn secondary">🤖 Play vs Computer (AI)</button>
         </div>
 
         <div id="roomList" class="room-list">
@@ -30,6 +32,7 @@
         <div id="error" class="error hidden"></div>
     </div>
 
+    <script src="/build-info.js"></script>
     <script src="/lobby.js"></script>
 </body>
 </html>

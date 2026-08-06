@@ -3,6 +3,7 @@
   "private": true,
   "scripts": {
     "test": "npx playwright test",
+    "test:synthetic": "node --test scripts/synthetic-check.test.mjs",
     "test:ui": "npx playwright test --ui"
   },
   "devDependencies": {

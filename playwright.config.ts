@@ -20,7 +20,18 @@ export default defineConfig({
   projects: [
     {
       name: 'chromium',
+      testIgnore: /mobile\.spec\.ts/,
       use: { ...devices['Desktop Chrome'] },
+    },
+    {
+      name: 'mobile-pixel-7',
+      testMatch: /mobile\.spec\.ts/,
+      use: { ...devices['Pixel 7'] },
+    },
+    {
+      name: 'mobile-iphone-13-webkit',
+      testMatch: /mobile\.spec\.ts/,
+      use: { ...devices['iPhone 13'] },
     },
   ],
   // K8s tests use the already-running gateway; only local tests start a binary.

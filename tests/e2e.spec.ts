@@ -16,6 +16,15 @@ const LOBBY_URL = '/';
 const PLAYER_NAME = 'TestPlayer';
 
 test.describe('Lobby', () => {
+  test('shows the production build link', async ({ page }) => {
+    await page.goto(LOBBY_URL);
+    const build = page.locator('[data-build-version]');
+    await expect(build).toBeVisible();
+    await expect(build).toHaveText('sha-dev');
+    await expect(build).toHaveAttribute('href', /github\.com\/macel94\/cloudnativepong\/commits\/main/);
+    await expect(build).toHaveAttribute('data-build-sha', 'dev');
+  });
+
   test('loads the lobby page', async ({ page }) => {
     await page.goto(LOBBY_URL);
     await expect(page.locator('h1')).toHaveText('🏓 Cloud Native Pong');
@@ -47,6 +56,23 @@ test.describe('Lobby', () => {
   test('create room button is visible', async ({ page }) => {
     await page.goto(LOBBY_URL);
     await expect(page.locator('#btnNewRoom')).toBeVisible();
+    await expect(page.locator('#btnAI')).toHaveText('🤖 Play vs Computer (AI)');
+  });
+
+  test('starts a local computer game without an API room', async ({ page }) => {
+    await page.goto(LOBBY_URL);
+    await page.locator('#playerName').fill('Mobile Pilot');
+    await page.locator('#btnAI').click();
+    await page.waitForURL(/game\.html\?mode=ai/);
+    await expect(page.locator('#roomLabel')).toContainText('vs Computer');
+    await expect(page.locator('#status')).toContainText('Playing vs Computer');
+    await expect(page.locator('#pongCanvas')).toBeVisible();
+    await expect(page.locator('#moveUp')).toHaveAttribute('aria-pressed', 'false');
+
+    const initial = await page.locator('#pongCanvas').screenshot();
+    await page.waitForTimeout(250);
+    const later = await page.locator('#pongCanvas').screenshot();
+    expect(later.equals(initial)).toBeFalsy();
   });
 });
 

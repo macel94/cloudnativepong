@@ -34,26 +34,32 @@ def main() -> int:
             fail("room template must carry an immutable release reference")
 
         metadata = json.loads(RELEASE.read_text())
-        if metadata.get("schema_version") != "belacca.release-metadata.v1":
+        if metadata.get("schema_version") != "belacca.release-metadata.v2":
             fail("unexpected release metadata schema")
         if metadata.get("source_commit") and not re.fullmatch(r"[0-9a-f]{40}", metadata["source_commit"]):
             fail("source_commit must be full lowercase Git SHA")
-        if metadata.get("resolution_status") not in {"pending_registry_resolution", "verified"}:
+        if metadata.get("resolution_status") not in {"pending_registry_resolution", "digests_resolved", "verified"}:
             fail("resolution_status must be explicit")
         images = metadata.get("images")
         if not isinstance(images, list) or {image.get("component") for image in images} != {"api", "room", "static", "gateway"}:
             fail("release metadata must cover all Pong images")
         for image in images:
-            if metadata.get("resolution_status") == "verified" and not DIGEST.fullmatch(image.get("digest", "")):
-                fail(f"{image.get('component')} must record a sha256 digest when verified")
-            if metadata.get("resolution_status") == "pending_registry_resolution" and image.get("digest") is not None:
+            status = metadata.get("resolution_status")
+            if status in {"digests_resolved", "verified"} and not DIGEST.fullmatch(image.get("digest", "")):
+                fail(f"{image.get('component')} must record a sha256 digest when digests are resolved")
+            if status == "pending_registry_resolution" and image.get("digest") is not None:
                 fail(f"{image.get('component')} must remain null until all registry digests are resolved")
-            if metadata.get("resolution_status") == "verified" and image.get("signature") != "verified":
-                fail(f"{image.get('component')} must have a verified signature when release metadata is verified")
+            if status == "verified":
+                if image.get("provenance") != "verified":
+                    fail(f"{image.get('component')} must have verified GitHub provenance")
+                if image.get("attestation") != "verified":
+                    fail(f"{image.get('component')} must have a verified GitHub artifact attestation")
             if image.get("provenance") not in {"required", "verified"}:
                 fail("provenance must be required or verified")
-            if image.get("signature") not in {"required", "verified", "not_yet_verified"}:
-                fail("signature must be explicit")
+            if image.get("attestation") not in {"required", "verified", "not_yet_verified"}:
+                fail("attestation must be explicit")
+            if "signature" in image:
+                fail("use GitHub artifact attestation instead of the legacy signature field")
     except (OSError, json.JSONDecodeError, TypeError, ValueError) as error:
         print(f"release validation failed: {error}", file=sys.stderr)
         return 1

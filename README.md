@@ -10,6 +10,8 @@ A minimalist, horizontally-scalable PONG game running on Kubernetes. Each game r
 - **Embedded SQLite** — Pure Go, CGO-free, no external database needed.
 - **Self-cleaning** — Rooms auto-terminate when the game ends. No orphaned pods.
 - **Multi-service** — Gateway, static, API, room: each scales independently.
+- **Play vs Computer** — A deterministic browser-side heuristic AI works offline; no LLM, model, or network service is required.
+- **Mobile-ready** — Responsive canvas layout and touch paddle controls work alongside keyboard controls.
 
 ## 🏗 Architecture
 
@@ -56,6 +58,17 @@ go run . --mode=local
 
 # Open http://localhost:8080
 ```
+
+The lobby also provides **Play vs Computer (AI)**. This mode runs entirely in
+the browser: it uses a small deterministic prediction heuristic, does not create
+a server room, and does not call an LLM or any external service. Keyboard W/S
+and the on-screen Up/Down touch buttons control the human paddle.
+
+The workspace [fast development-loop guide](https://github.com/macel94/belacca-platform/blob/main/docs/development-loop.md)
+describes why local process mode is the default inner loop, how Kubernetes-
+dependent changes should use an isolated warm development environment, and why
+the public `k3d-pong` cluster and Flux promotion path must not be used for every
+edit.
 
 ### Docker Compose (local multi-service)
 
@@ -275,22 +288,24 @@ workflows:
   Normal runs are report-only and ignore unfixed findings; use the manual
   `strict=true` input for a reviewed security run that fails on those findings.
 - `.github/workflows/publish-images.yml` pushes the four immutable
-  `sha-<commit>` tags with BuildKit `--provenance=mode=max` and `--sbom=true`.
-  Attestations require a registry push and are not produced by local `docker
-  build` or `--load`.
-- `.github/workflows/sign-images.yml` is deliberately manual. Supply an
-  `IMAGE@sha256:<digest>` reference; `scripts/sign-image.sh` rejects mutable
-  tags and uses Sigstore keyless signing. It requires GitHub OIDC
-  (`id-token: write`) and registry access at execution time. No signing key or
-  credential is stored in this repository. `scripts/verify-image.sh` provides the
-matching digest-only Cosign verification hook; pass the expected repository
-workflow identity regexp rather than accepting any signer.
-- `.github/workflows/synthetic-check.yml` is a scheduled/manual external check.
-  Set the out-of-band repository or organization variable
-  `SYNTHETIC_PONG_URL` and, only if required by a front door, the optional
-  `SYNTHETIC_AUTH_TOKEN` secret. The check validates health, room API CRUD,
-  two-player WebSocket assignment, and state delivery. Without the variable it
-  exits as an explicit safe skip; it does not claim an external monitor exists.
+  `sha-<commit>` tags with a registry SBOM and GitHub Artifact Attestations.
+  `actions/attest@v4` creates signed SLSA provenance and pushes it to GHCR;
+  `scripts/verify-attestation.sh` verifies the repository and publish workflow
+  identity with `gh attestation verify`.
+- `scripts/promote-digests.sh` accepts only exact GHCR digest references. Use
+  `--verify-attestations` to verify all four GitHub provenance attestations
+  before the release metadata becomes `verified`; without it the metadata is
+  deliberately only `digests_resolved`. No separate signing executable, signing
+  key, or manual signing workflow is required.
+
+- `.github/workflows/synthetic-check.yml` is a scheduled/manual public check.
+  It exercises `https://pong.belacca.com` by default. An out-of-band
+  repository or organization variable `SYNTHETIC_PONG_URL` may override the
+  target for an approved ingress and the optional `SYNTHETIC_AUTH_TOKEN` secret
+  supports a protected front door. The check validates the homepage, health,
+  room API CRUD, the exact room connection contract, two-player WebSocket
+  assignment, playing state delivery, and post-disconnect room cleanup. It
+  fails closed when the target is missing or any step is not executed.
 
 Useful local dry runs do not require a registry, credentials, or scanners:
 
@@ -298,35 +313,30 @@ Useful local dry runs do not require a registry, credentials, or scanners:
 ./scripts/supply-chain.sh sbom --target . --dry-run
 ./scripts/supply-chain.sh scan-fs --target . --dry-run
 ./scripts/supply-chain.sh scan-image cloudnativepong-api:local --dry-run
-./scripts/sign-image.sh ghcr.io/macel94/cloudnativepong-api@sha256:$(printf '0%.0s' {1..64}) --dry-run
-./scripts/verify-image.sh ghcr.io/macel94/cloudnativepong-api@sha256:$(printf '0%.0s' {1..64}) --certificate-identity-regexp 'repo:macel94/cloudnativepong:.*' --dry-run
+./scripts/verify-attestation.sh ghcr.io/macel94/cloudnativepong-api@sha256:$(printf '0%.0s' {1..64}) --dry-run
 ./scripts/synthetic-check.sh --dry-run
+npm run test:synthetic
 ```
 
 For a pushed image, resolve the digest from GHCR rather than relying on its
-mutable tag, then inspect its BuildKit SBOM/provenance attachments with Docker
-Buildx tooling:
+mutable tag, then verify the GitHub Artifact Attestation against the immutable
+reference:
 
 ```bash
 IMAGE=ghcr.io/macel94/cloudnativepong-api:sha-<commit>
 docker buildx imagetools inspect "$IMAGE"
 # After recording the displayed digest:
 DIGEST=ghcr.io/macel94/cloudnativepong-api@sha256:<digest>
-./scripts/verify-image.sh "$DIGEST" \
-  --certificate-identity-regexp 'repo:macel94/cloudnativepong:.*'
-cosign tree "$DIGEST"
-cosign verify-attestation "$DIGEST" || true  # only for Cosign-signed attestations
+./scripts/verify-attestation.sh "$DIGEST"
 ```
 
-A digest is evidence of exact image bytes; provenance describes how they were
-built; a Cosign signature verifies the publisher identity. `release-metadata.json`
-and `scripts/validate-release.py` make the current pending/verified state
-explicit. `scripts/promote-digests.sh` accepts only four exact GHCR
-`IMAGE@sha256:<digest>` references and updates the production Kustomize overlay;
-it never resolves mutable tags or signs artifacts. The signing workflow is not
-automatically invoked because normal CI must not require external identity
-credentials. Treat a failed verification as a release-policy decision,
-not as permission to fall back to a mutable tag.
+`gh attestation verify` checks the GHCR image, repository identity, publish
+workflow identity, OIDC issuer, and SLSA provenance predicate. A digest
+identifies exact image bytes; the GitHub attestation proves how those bytes were
+built and who published them. `release-metadata.json` and
+`scripts/validate-release.py` make the pending, digest-resolved, and fully
+verified states explicit. Treat a failed attestation as a release-policy
+failure, not as permission to fall back to a mutable tag.
 
 ### SQLite backup and restore verification
 
@@ -372,12 +382,34 @@ cluster and only a copied database/PVC; these helpers never destroy the existing
 ## 🧪 Testing
 
 ```bash
-# Local mode (fast dev)
-npx playwright test
+# Fast local desktop suite (local mode)
+npx playwright test --project=chromium
+
+# Mobile Chromium emulation with touch input
+npx playwright test --project=mobile-pixel-7
+
+# Mobile Safari/WebKit emulation with touch input
+npx playwright test --project=mobile-iphone-13-webkit
 
 # K8s mode (full integration; the cluster gateway must already be running)
-TEST_MODE=k8s npx playwright test
+TEST_MODE=k8s npx playwright test --project=chromium
 ```
+
+The static image build injects the exact source commit into
+`static/build-info.js`:
+
+```bash
+podman build \
+  --build-arg BUILD_SHA="$(git rev-parse HEAD)" \
+  --build-arg BUILD_REPOSITORY=macel94/cloudnativepong \
+  -t cloudnativepong-static:local \
+  -f Dockerfile.static .
+```
+
+Every lobby and game page shows `sha-<short-sha>` in the top-right corner. The
+badge links to the full GitHub commit, and `/build-info.js` is served with
+`Cache-Control: no-store` so a rollout cannot leave the visible release marker
+stale in the browser.
 
 ## 🔌 WebSocket Proxy Design
 
@@ -438,7 +470,9 @@ checks remain in `scripts/synthetic-check.sh`.
 ## 📊 Verification Status
 
 - Local Go tests, race tests, vet, and static builds pass.
-- The local Playwright suite passes 12/12.
+- The local Chromium suite passes 14/14, including build metadata, computer play, and online two-player play.
+- Dedicated Pixel 7 and iPhone 13/WebKit touch emulation cover responsive layout, touch controls, and actual paddle movement.
+- The production-style static image build was verified with a full source SHA, full commit URL, and `Cache-Control: no-store` metadata response.
 - Isolated Chromium checks through the NGINX k3d gateway pass, including two-player joining.
 - The full k3d suite passes 12/12 when host traffic is mapped to the gateway NodePort with `8080:30080@agent:0`. The earlier intermittent 11/12 result came from using the cluster's port-80 ingress path or an unstable `kubectl port-forward`, not from a reproducible room/proxy failure.
 
@@ -452,7 +486,8 @@ checks remain in `scripts/synthetic-check.sh`.
 ├── game/                # PONG game engine (server-side state machine)
 ├── db/                  # SQLite database layer
 ├── static/              # Frontend (HTML, CSS, vanilla JS)
-│   └── nginx.conf       # nginx config for static pod
+│   ├── build-info.js     # Compile-time source SHA marker
+│   └── nginx.conf        # nginx config for static pod
 ├── gateway/             # Gateway config
 │   └── nginx.conf       # NGINX routing and WebSocket upgrade rules
 ├── k8s/                 # Kubernetes manifests

@@ -1,7 +1,11 @@
 # Cloud Native Pong server deployment
 
 This repository contains both the application and its GitOps deployment for the
-experimental server named `vmi3474918`. Platform-level failure drills and rollback commands are
+experimental server named `vmi3474918`. The static frontend image injects the
+full source commit SHA at build time; the lobby and game pages display a
+clickable `sha-<short-sha>` badge linking to that exact GitHub commit. The
+metadata asset is served with `Cache-Control: no-store` so the visible marker
+tracks the deployed static image rather than a stale browser cache. Platform-level failure drills and rollback commands are
 maintained in the [GitOps game-day runbook](https://github.com/macel94/belacca-gitops/blob/main/docs/GAME-DAY-DRILLS.md);
 the backup/object-storage contract is in the [GitOps backup contract](https://github.com/macel94/belacca-gitops/blob/main/docs/BACKUP-CONTRACT.md).
 
@@ -101,6 +105,12 @@ persistent SQLite PVC.
 
 ## Fastest safe debug, local test, and GitOps workflow
 
+The default inner loop is local process mode. See the workspace [fast
+development-loop guide](https://github.com/macel94/belacca-platform/blob/main/docs/development-loop.md)
+for the separation between local development, an isolated Kubernetes
+development plane, and reviewed production GitOps promotion. Do not use the
+public `k3d-pong` cluster as a repeated experiment sandbox.
+
 1. **Inventory and baseline without changing anything.**
    ```bash
    git status --short --branch
@@ -121,12 +131,14 @@ persistent SQLite PVC.
    `go test -race ./...`, `go vet ./...`, `node --check static/game.js`, and
    `git diff --check`. Use local mode for application-only changes:
    `go run . --mode=local` followed by `npx playwright test`.
-4. **Validate the full architecture in the existing cluster.** Build the
-   changed images with Podman, export/import them into k3d, and patch only the
-   live test deployment with temporary `localhost/...` image tags and
-   `IfNotPresent`. Wait for every rollout, run the Kubernetes Playwright suite,
-   and capture logs, events, resource usage, WebSocket cadence, and room cleanup.
-   Restore Flux-managed images immediately after the test.
+4. **Validate the full architecture only in an isolated environment.** Until
+   the separate `pong-dev` interception/container workflow is provisioned, use
+   an explicitly disposable development cluster or another operator-approved
+   isolated environment. Build only the changed images, export/import them,
+   and patch only that environment. Never patch the public `k3d-pong` cluster
+   for routine experiments. Wait for the affected rollout, run the focused
+   Kubernetes Playwright test, and capture logs, events, resource usage,
+   WebSocket cadence, and room cleanup.
 5. **Commit and push the branch.** GitHub Actions builds immutable
    `sha-<commit>` images and commits the generated overlay tag update back to
    the same feature branch. Fetch the branch before any follow-up commit because
@@ -186,37 +198,46 @@ workflow after the production branch policy is chosen.
 
 The published `sha-<40-hex-commit>` image tags are immutable references to a
 commit build, but operators should record the registry `sha256` digest for the
-exact deployment. `.github/workflows/publish-images.yml` adds BuildKit SBOM and
-`mode=max` provenance attestations while pushing to GHCR. Local `docker build`
-or `--load` cannot retain registry attestations.
+exact deployment. `.github/workflows/publish-images.yml` adds a registry SBOM
+and GitHub Artifact Attestation SLSA provenance while pushing to GHCR. Local
+`docker build` or `--load` cannot retain registry attestations.
 
 `.github/workflows/supply-chain.yml` creates local images, uploads CycloneDX
 SBOMs, stores Trivy HIGH/CRITICAL reports, and validates the immutable
 `release-metadata.json` contract. `scripts/validate-release.py` fails closed if
-production references are not full SHA tags or promoted digests. The manual
+production references are not full SHA tags or promoted digests. The
 `scripts/promote-digests.sh` helper requires four exact GHCR digest references;
-it does not resolve tags or claim signatures. It is report-only by default so
-normal CI does not fail because of a newly published advisory; a manually
-requested `strict=true` run turns those findings into a gate. There are no
-registry credentials or vulnerability exceptions in this repository.
+use `--verify-attestations` to run repository/workflow-scoped GitHub Artifact
+Attestation checks before metadata becomes fully `verified`. Without that flag,
+the safe state is `digests_resolved`. It is report-only by default so normal CI
+does not fail because of a newly published advisory; a manually requested
+`strict=true` run turns those findings into a gate. There are no registry
+credentials or vulnerability exceptions in this repository.
 
-`.github/workflows/sign-images.yml` is an explicit manual hook. Provide an
-`IMAGE@sha256:<digest>` input after the image has been pushed. The hook uses
-Sigstore keyless Cosign signing with GitHub OIDC and rejects mutable tags. It
-requires `id-token: write`, registry access, and the external Sigstore services
-at run time; it is intentionally not part of ordinary PR/push CI. Inspect the
-published manifest and attached referrers with `docker buildx imagetools inspect
-IMAGE@sha256:<digest>` and `cosign tree IMAGE@sha256:<digest>`; use the
-repository's `verify-image.sh` with an expected workflow identity regexp before
-accepting a signature. `cosign verify-attestation` applies only to Cosign-signed
-attestations, not automatically to every BuildKit referrer.
+`.github/workflows/publish-images.yml` uses `actions/attest@v4` with
+`id-token: write`, `attestations: write`, and `artifact-metadata: write`. Each
+pushed GHCR image receives GitHub-signed SLSA provenance in the registry. Verify
+one immutable image with:
 
-To configure the external Pong journey check, set the repository/organization
-variable `SYNTHETIC_PONG_URL` and optional `SYNTHETIC_AUTH_TOKEN` secret outside
-the repository. The scheduled workflow then checks health, room CRUD, both
-WebSocket player assignments, and state delivery. With no URL it performs an
-explicit safe skip. It is not a substitute for a separately managed alerting
-or paging service.
+```bash
+./scripts/verify-attestation.sh \
+  ghcr.io/macel94/cloudnativepong-api@sha256:<digest>
+```
+
+The helper runs `gh attestation verify` with the expected repository,
+publish workflow, OIDC issuer, registry bundle, and SLSA provenance predicate.
+This is the native GitHub path; no separate signing executable, key, or manual
+signing workflow is required.
+
+The scheduled/manual Pong journey check runs against
+`https://pong.belacca.com` by default. An approved alternate ingress may be
+provided through the out-of-band repository/organization variable
+`SYNTHETIC_PONG_URL`; `SYNTHETIC_AUTH_TOKEN` is optional and is only needed for
+a protected front door. The runner checks the homepage, health, room CRUD,
+exact connection contract, both WebSocket player assignments, playing state,
+and room disappearance after disconnect. Missing configuration, an HTTP or
+WebSocket failure, a timeout, or failed cleanup is a failed check—not a green
+skip. It is not a substitute for separately managed alerting or paging.
 
 ## SQLite backup and isolated restore rehearsal
 
@@ -331,10 +352,10 @@ LOAD_SMOKE_BASE_URL=http://127.0.0.1:8080 \
   ./scripts/load-smoke.sh --iterations=5 --concurrency=2
 ```
 
-Use the existing synthetic script for the public workflow and configure its URL
-out of band. Do not run sustained load against the public endpoint without an
-approved window; the harness is deliberately resource-safe, not an unbounded
-load generator.
+Use the scheduled synthetic script for the public workflow. For local or
+alternate targets, set `SYNTHETIC_BASE_URL` explicitly; the shell wrapper
+refuses to run without it. The runner is bounded and verifies cleanup, but do
+not run sustained load against the public endpoint without an approved window.
 
 ## Useful checks
 

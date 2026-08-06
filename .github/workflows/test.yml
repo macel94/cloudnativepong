@@ -45,7 +45,7 @@ jobs:
           cache: npm
 
       - name: Install Playwright
-        run: npm ci && npx playwright install chromium --with-deps
+        run: npm ci && npx playwright install chromium webkit --with-deps
 
       - name: Run E2E tests
         run: npx playwright test --reporter=list
@@ -70,7 +70,7 @@ jobs:
         run: docker build -t cloudnativepong-room:latest -f Dockerfile.room .
 
       - name: Build Static image
-        run: docker build -t cloudnativepong-static:latest -f Dockerfile.static .
+        run: docker build --build-arg BUILD_SHA="${GITHUB_SHA}" --build-arg BUILD_REPOSITORY="${GITHUB_REPOSITORY}" -t cloudnativepong-static:latest -f Dockerfile.static .
 
       - name: Build Gateway image
         run: docker build -t cloudnativepong-gateway:latest -f Dockerfile.gateway .
@@ -105,7 +105,7 @@ jobs:
           # Rebuild and import (k3d uses its own containerd)
           docker build -t cloudnativepong-api:latest -f Dockerfile.api .
           docker build -t cloudnativepong-room:latest -f Dockerfile.room .
-          docker build -t cloudnativepong-static:latest -f Dockerfile.static .
+          docker build --build-arg BUILD_SHA="${GITHUB_SHA}" --build-arg BUILD_REPOSITORY="${GITHUB_REPOSITORY}" -t cloudnativepong-static:latest -f Dockerfile.static .
           docker build -t cloudnativepong-gateway:latest -f Dockerfile.gateway .
           k3d image import cloudnativepong-api:latest cloudnativepong-room:latest cloudnativepong-static:latest cloudnativepong-gateway:latest -c pong
 
@@ -129,8 +129,8 @@ jobs:
             -H 'Content-Type: application/json' \
             -d '{"name":"ci-test"}' | grep '"id"'
 
-      - name: Run E2E tests against gateway
-        run: TEST_MODE=k8s npx playwright test --reporter=list
+      - name: Run desktop E2E tests against gateway
+        run: TEST_MODE=k8s npx playwright test --project=chromium --reporter=list
 
       - uses: actions/upload-artifact@v7
         if: always()

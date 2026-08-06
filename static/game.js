@@ -1,142 +1,369 @@
-// Client-side PONG: renders game state from server, sends paddle input via WebSocket.
+// Cloud Native Pong client: online WebSocket play, local heuristic AI, and touch controls.
 (function () {
+    'use strict';
+
     const params = new URLSearchParams(window.location.search);
     const roomId = params.get('room');
     const playerName = params.get('name') || 'Player';
     const mode = params.get('mode') || 'local';
+    const isAI = mode === 'ai';
 
-    if (!roomId) {
+    const roomLabel = document.getElementById('roomLabel');
+    const statusElement = document.getElementById('status');
+    const controlHint = document.getElementById('controlHint');
+    const score1Element = document.getElementById('score1');
+    const score2Element = document.getElementById('score2');
+    const winnerOverlay = document.getElementById('winnerOverlay');
+    const winnerText = document.getElementById('winnerText');
+    const canvas = document.getElementById('pongCanvas');
+
+    if (!canvas || !roomLabel || !statusElement) return;
+
+    if (!isAI && !roomId) {
         document.body.innerHTML = '<h1 style="text-align:center;margin-top:80px">Missing room ID</h1>';
         return;
     }
 
-    document.getElementById('roomLabel').textContent = 'Room: ' + roomId;
+    document.body.dataset.gameMode = isAI ? 'ai' : 'online';
+    roomLabel.textContent = isAI ? 'vs Computer · Local AI' : 'Room: ' + roomId;
 
-    let ws;
-    let player = 0; // 1 or 2, assigned by server
+    let ws = null;
+    let player = isAI ? 1 : 0;
     let gameState = null;
-    // Network delivery is not perfectly periodic, especially through the
-    // Kubernetes WebSocket proxy. Keep a short authoritative-state buffer and
-    // render it continuously so packet bursts do not become visible stutter.
-    const stateBuffer = [];
-    const interpolationDelay = 50;
+    let gameOverShown = false;
     let lastRenderedState = null;
 
-    // Canvas setup
-    const canvas = document.getElementById('pongCanvas');
+    // Network delivery is not perfectly periodic through the Kubernetes
+    // WebSocket proxy. A short authoritative-state buffer hides packet bursts
+    // without changing the server-authoritative game decisions.
+    const stateBuffer = [];
+    const interpolationDelay = 50;
+
+    const keys = Object.create(null);
+    const touchInput = { up: false, down: false };
+    const movementKeys = new Set(['w', 'W', 's', 'S', 'ArrowUp', 'ArrowDown']);
+
     const ctx = canvas.getContext('2d');
     const W = canvas.width;
     const H = canvas.height;
+    const PADDLE_WIDTH = 0.02;
+    const PADDLE_HEIGHT = 0.15;
+    const BALL_SIZE = 0.025;
+    const PADDLE_SPEED = 0.025;
+    const BASE_BALL_SPEED = 0.012;
+    const MAX_BALL_SPEED = 0.025;
+    const WIN_SCORE = 7;
+    const TICK_MS = 16;
 
-    // Build WebSocket URL
-    // Both local and gateway modes use the gateway path: /rooms/{id}/ws
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    let wsURL;
-    if (mode === 'local') {
-        wsURL = protocol + '//' + window.location.host + '/rooms/' + roomId + '/ws';
-    } else {
-        // In K8s mode, the gateway routes /rooms/{id}/ws to the correct room pod.
-        wsURL = protocol + '//' + window.location.host + '/rooms/' + roomId + '/ws';
+    function setControlHint() {
+        if (!controlHint) return;
+        const keyboard = player === 2 ? 'Arrow Up/Down' : 'W/S';
+        controlHint.textContent = isAI
+            ? `Playing vs Computer · ${keyboard} or touch buttons`
+            : `Controls: ${keyboard} or touch buttons`;
+    }
+
+    function updateScore(state) {
+        score1Element.textContent = state.score1;
+        score2Element.textContent = state.score2;
+    }
+
+    function showWinner(winner) {
+        if (gameOverShown || !winnerOverlay || !winnerText) return;
+        gameOverShown = true;
+        winnerText.textContent = winner === player ? '🎉 You Win!' : '💀 You Lose!';
+        winnerOverlay.classList.remove('hidden');
+        statusElement.textContent = 'Game Over';
+        if (ws) ws.close();
+    }
+
+    function bindTouchButton(id, direction) {
+        const button = document.getElementById(id);
+        if (!button) return;
+
+        const setPressed = (pressed) => {
+            touchInput[direction] = pressed;
+            button.setAttribute('aria-pressed', String(pressed));
+        };
+        const release = () => setPressed(false);
+
+        button.addEventListener('pointerdown', (event) => {
+            event.preventDefault();
+            setPressed(true);
+            if (button.setPointerCapture && event.isTrusted) {
+                try {
+                    button.setPointerCapture(event.pointerId);
+                } catch {
+                    // Synthetic test events and older browsers may not expose
+                    // an active pointer to capture; the pressed state still
+                    // remains valid until pointerup/pointercancel.
+                }
+            }
+        });
+        button.addEventListener('pointerup', release);
+        button.addEventListener('pointercancel', release);
+        button.addEventListener('lostpointercapture', release);
+        button.addEventListener('contextmenu', (event) => event.preventDefault());
+    }
+
+    bindTouchButton('moveUp', 'up');
+    bindTouchButton('moveDown', 'down');
+
+    function clearInput() {
+        for (const key of movementKeys) keys[key] = false;
+        touchInput.up = false;
+        touchInput.down = false;
+    }
+
+    document.addEventListener('keydown', (event) => {
+        if (!movementKeys.has(event.key)) return;
+        event.preventDefault();
+        keys[event.key] = true;
+    });
+    document.addEventListener('keyup', (event) => {
+        if (!movementKeys.has(event.key)) return;
+        event.preventDefault();
+        keys[event.key] = false;
+    });
+    window.addEventListener('blur', clearInput);
+    document.addEventListener('visibilitychange', () => {
+        if (document.hidden) clearInput();
+    });
+
+    function readLocalInput() {
+        if (player === 2) {
+            return {
+                up: Boolean(keys.ArrowUp || touchInput.up),
+                down: Boolean(keys.ArrowDown || touchInput.down),
+            };
+        }
+        return {
+            up: Boolean(keys.w || keys.W || touchInput.up),
+            down: Boolean(keys.s || keys.S || touchInput.down),
+        };
     }
 
     function connect() {
+        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const wsURL = `${protocol}//${window.location.host}/rooms/${encodeURIComponent(roomId)}/ws`;
         ws = new WebSocket(wsURL);
 
         ws.onopen = function () {
-            document.getElementById('status').textContent = 'Connected. Waiting for opponent...';
+            statusElement.textContent = 'Connected. Waiting for opponent...';
             // The lobby proxy uses this first post-upgrade frame to know that
             // the gateway has completed its WebSocket tunnel handoff.
             ws.send(JSON.stringify({ type: 'proxy-ready' }));
         };
 
-        ws.onmessage = function (e) {
-            const msg = JSON.parse(e.data);
-
-            if (msg.type === 'joined') {
-                player = msg.player;
-                document.getElementById('status').textContent =
-                    'You are Player ' + player + '. ' +
-                    (player === 1 ? 'Use W/S to move.' : 'Use ↑/↓ to move.');
-                if (player === 1) {
-                    document.getElementById('status').textContent += ' Waiting for opponent...';
-                }
+        ws.onmessage = function (event) {
+            let message;
+            try {
+                message = JSON.parse(event.data);
+            } catch {
+                statusElement.textContent = 'Received invalid game data.';
+                return;
             }
 
-            if (msg.type === 'state') {
-                gameState = msg.state;
+            if (message.type === 'joined') {
+                player = message.player;
+                setControlHint();
+                statusElement.textContent =
+                    'You are Player ' + player + '. ' +
+                    (player === 1 ? 'Use W/S or touch buttons.' : 'Use ↑/↓ or touch buttons.') +
+                    (player === 1 ? ' Waiting for opponent...' : '');
+            }
+
+            if (message.type === 'state' && message.state && message.state.ball) {
+                const state = message.state;
                 const receivedAt = performance.now();
-                stateBuffer.push({ state: msg.state, receivedAt });
+                gameState = state;
+                stateBuffer.push({ state, receivedAt });
                 while (stateBuffer.length > 8 ||
-                    stateBuffer.length > 2 && receivedAt - stateBuffer[0].receivedAt > 250) {
+                    (stateBuffer.length > 2 && receivedAt - stateBuffer[0].receivedAt > 250)) {
                     stateBuffer.shift();
                 }
 
-                if (msg.state.status === 'playing') {
-                    document.getElementById('status').textContent = 'Playing!';
+                if (state.status === 'playing') {
+                    statusElement.textContent = 'Playing!';
                 }
-                if (msg.state.status === 'finished') {
-                    const winner = msg.state.winner;
-                    const text = winner === player ? '🎉 You Win!' : '💀 You Lose!';
-                    document.getElementById('winnerText').textContent = text;
-                    document.getElementById('winnerOverlay').classList.remove('hidden');
-                    document.getElementById('status').textContent = 'Game Over';
-                    if (ws) ws.close();
-                }
-
-                document.getElementById('score1').textContent = msg.state.score1;
-                document.getElementById('score2').textContent = msg.state.score2;
+                updateScore(state);
+                if (state.status === 'finished') showWinner(state.winner);
             }
 
-            if (msg.type === 'error') {
-                document.getElementById('status').textContent = 'Error: ' + msg.message;
+            if (message.type === 'error') {
+                statusElement.textContent = 'Error: ' + (message.message || 'game unavailable');
             }
         };
 
         ws.onclose = function () {
-            document.getElementById('status').textContent = 'Disconnected.';
+            if (!gameOverShown) statusElement.textContent = 'Disconnected.';
         };
 
         ws.onerror = function () {
-            document.getElementById('status').textContent = 'Connection error. Retrying...';
+            if (!gameOverShown) statusElement.textContent = 'Connection error. Retrying...';
         };
     }
 
-    // Keyboard input
-    const keys = {};
-    document.addEventListener('keydown', function (e) {
-        keys[e.key] = true;
-        e.preventDefault();
-    });
-    document.addEventListener('keyup', function (e) {
-        keys[e.key] = false;
-        e.preventDefault();
-    });
+    // Send input to the authoritative server at approximately 60Hz.
+    setInterval(() => {
+        if (isAI || !ws || ws.readyState !== WebSocket.OPEN || !player) return;
+        const input = readLocalInput();
+        ws.send(JSON.stringify({ player, up: input.up, down: input.down }));
+    }, TICK_MS);
 
-    // Send input to server at ~60Hz
-    setInterval(function () {
-        if (!ws || ws.readyState !== WebSocket.OPEN || !player) return;
+    function clampPaddle(value) {
+        const halfHeight = PADDLE_HEIGHT / 2;
+        return Math.max(halfHeight, Math.min(1 - halfHeight, value));
+    }
 
-        let up = false, down = false;
-        if (player === 1) {
-            up = keys['w'] || keys['W'];
-            down = keys['s'] || keys['S'];
-        } else {
-            up = keys['ArrowUp'];
-            down = keys['ArrowDown'];
+    function movePaddle(paddle, input, speed) {
+        if (input.up) paddle.y -= speed;
+        if (input.down) paddle.y += speed;
+        paddle.y = clampPaddle(paddle.y);
+    }
+
+    function reflectedY(value) {
+        const wrapped = ((value % 2) + 2) % 2;
+        return wrapped <= 1 ? wrapped : 2 - wrapped;
+    }
+
+    function resetBall(state, direction) {
+        const variation = ((state.score1 + state.score2) % 5 - 2) * 0.004;
+        const angle = variation;
+        state.ball = {
+            x: 0.5,
+            y: 0.5,
+            dx: direction * BASE_BALL_SPEED * Math.cos(angle),
+            dy: BASE_BALL_SPEED * Math.sin(angle),
+        };
+    }
+
+    function clampBallSpeed(state) {
+        const speed = Math.hypot(state.ball.dx, state.ball.dy);
+        if (speed === 0) {
+            state.ball.dx = BASE_BALL_SPEED;
+            return;
+        }
+        if (speed > MAX_BALL_SPEED) {
+            const scale = MAX_BALL_SPEED / speed;
+            state.ball.dx *= scale;
+            state.ball.dy *= scale;
+        } else if (speed < BASE_BALL_SPEED) {
+            const scale = BASE_BALL_SPEED / speed;
+            state.ball.dx *= scale;
+            state.ball.dy *= scale;
+        }
+    }
+
+    // A deliberately small, deterministic opponent. It predicts the ball's
+    // next intersection with the right paddle, updates its target roughly six
+    // times per second, and moves slightly slower than a human paddle. No LLM,
+    // network request, model, or external service is involved.
+    let aiTarget = 0.5;
+    let aiTick = 0;
+
+    function predictAIY(state) {
+        if (state.ball.dx <= 0) return 0.5;
+        const targetX = 1 - PADDLE_WIDTH - BALL_SIZE / 2;
+        const ticksUntilPaddle = Math.max(0, (targetX - state.ball.x) / state.ball.dx);
+        return reflectedY(state.ball.y + state.ball.dy * ticksUntilPaddle);
+    }
+
+    function createAIState() {
+        const state = {
+            ball: { x: 0.5, y: 0.5, dx: BASE_BALL_SPEED, dy: 0.004 },
+            p1: { y: 0.5 },
+            p2: { y: 0.5 },
+            score1: 0,
+            score2: 0,
+            status: 'playing',
+            winner: 0,
+            p1_ready: true,
+            p2_ready: true,
+        };
+        resetBall(state, 1);
+        return state;
+    }
+
+    function tickAI() {
+        const state = gameState;
+        if (!state || state.status !== 'playing') return;
+
+        movePaddle(state.p1, readLocalInput(), PADDLE_SPEED);
+
+        aiTick += 1;
+        if (aiTick % 6 === 0) aiTarget = predictAIY(state);
+        const aiDifference = aiTarget - state.p2.y;
+        if (Math.abs(aiDifference) > 0.006) {
+            const aiSpeed = 0.019;
+            state.p2.y = clampPaddle(state.p2.y + Math.sign(aiDifference) * Math.min(aiSpeed, Math.abs(aiDifference)));
         }
 
-        ws.send(JSON.stringify({
-            player: player,
-            up: up,
-            down: down,
-        }));
-    }, 16);
+        const ball = state.ball;
+        ball.x += ball.dx;
+        ball.y += ball.dy;
 
-    // Render the game state on canvas
+        if (ball.y - BALL_SIZE / 2 <= 0) {
+            ball.y = BALL_SIZE / 2;
+            ball.dy = Math.abs(ball.dy);
+        }
+        if (ball.y + BALL_SIZE / 2 >= 1) {
+            ball.y = 1 - BALL_SIZE / 2;
+            ball.dy = -Math.abs(ball.dy);
+        }
+
+        if (ball.x - BALL_SIZE / 2 <= PADDLE_WIDTH && ball.dx < 0) {
+            const offset = (ball.y - state.p1.y) / (PADDLE_HEIGHT / 2);
+            if (Math.abs(offset) <= 1) {
+                ball.x = PADDLE_WIDTH + BALL_SIZE / 2;
+                ball.dx = Math.abs(ball.dx);
+                ball.dy += offset * 0.005;
+                clampBallSpeed(state);
+            }
+        }
+
+        if (ball.x + BALL_SIZE / 2 >= 1 - PADDLE_WIDTH && ball.dx > 0) {
+            const offset = (ball.y - state.p2.y) / (PADDLE_HEIGHT / 2);
+            if (Math.abs(offset) <= 1) {
+                ball.x = 1 - PADDLE_WIDTH - BALL_SIZE / 2;
+                ball.dx = -Math.abs(ball.dx);
+                ball.dy += offset * 0.005;
+                clampBallSpeed(state);
+            }
+        }
+
+        if (ball.x < 0) {
+            state.score2 += 1;
+            if (state.score2 >= WIN_SCORE) {
+                state.status = 'finished';
+                state.winner = 2;
+            } else {
+                resetBall(state, 1);
+            }
+        } else if (ball.x > 1) {
+            state.score1 += 1;
+            if (state.score1 >= WIN_SCORE) {
+                state.status = 'finished';
+                state.winner = 1;
+            } else {
+                resetBall(state, -1);
+            }
+        }
+
+        updateScore(state);
+        if (state.status === 'finished') showWinner(state.winner);
+    }
+
+    function startAI() {
+        setControlHint();
+        gameState = createAIState();
+        statusElement.textContent = 'Playing vs Computer — use W/S or touch buttons.';
+    }
+
     function render(state) {
+        canvas.dataset.playerPaddleY = state.p1 ? String(state.p1.y) : '';
         ctx.clearRect(0, 0, W, H);
 
-        // Center line
         ctx.strokeStyle = '#333';
         ctx.lineWidth = 2;
         ctx.setLineDash([8, 8]);
@@ -146,36 +373,27 @@
         ctx.stroke();
         ctx.setLineDash([]);
 
-        // Paddles
-        const pw = state.ball ? 0.02 : 0.02;
-        const ph = 0.15;
+        const paddleHeight = PADDLE_HEIGHT;
         ctx.fillStyle = '#6366f1';
-        // Player 1 (left)
-        const p1X = 0;
         const p1Y = (state.p1 ? state.p1.y : 0.5) * H;
-        ctx.fillRect(p1X * W, p1Y - (ph * H) / 2, pw * W, ph * H);
-        // Player 2 (right)
-        const p2X = 1 - pw;
         const p2Y = (state.p2 ? state.p2.y : 0.5) * H;
-        ctx.fillRect(p2X * W, p2Y - (ph * H) / 2, pw * W, ph * H);
+        ctx.fillRect(0, p1Y - (paddleHeight * H) / 2, PADDLE_WIDTH * W, paddleHeight * H);
+        ctx.fillRect((1 - PADDLE_WIDTH) * W, p2Y - (paddleHeight * H) / 2, PADDLE_WIDTH * W, paddleHeight * H);
 
-        // Ball
         if (state.ball) {
-            const ballSize = 0.025 * W;
+            const ballSize = BALL_SIZE * W;
             ctx.fillStyle = '#fff';
             ctx.beginPath();
             ctx.arc(state.ball.x * W, state.ball.y * H, ballSize / 2, 0, Math.PI * 2);
             ctx.fill();
         }
 
-        // Player labels
         ctx.fillStyle = '#555';
         ctx.font = '12px monospace';
         ctx.textAlign = 'center';
-        ctx.fillText('P1 (W/S)', 50, H - 10);
-        ctx.fillText('P2 (↑/↓)', W - 50, H - 10);
+        ctx.fillText(isAI ? 'YOU (W/S)' : 'P1 (W/S)', 58, H - 10);
+        ctx.fillText(isAI ? 'PC' : 'P2 (↑/↓)', W - 52, H - 10);
 
-        // Ready status
         if (state.status === 'waiting') {
             ctx.fillStyle = 'rgba(255,255,255,0.7)';
             ctx.font = '18px sans-serif';
@@ -183,19 +401,16 @@
         }
     }
 
-    // Render continuously. Interpolating a short time behind the newest
-    // authoritative state absorbs network jitter without changing gameplay
-    // decisions, which remain entirely server-side.
     function interpolatedState(now) {
         if (stateBuffer.length === 0) return lastRenderedState;
 
         const target = now - interpolationDelay;
         let older = stateBuffer[0];
         let newer = stateBuffer[stateBuffer.length - 1];
-        for (let i = 1; i < stateBuffer.length; i++) {
-            if (stateBuffer[i].receivedAt >= target) {
-                newer = stateBuffer[i];
-                older = stateBuffer[i - 1];
+        for (let index = 1; index < stateBuffer.length; index += 1) {
+            if (stateBuffer[index].receivedAt >= target) {
+                newer = stateBuffer[index];
+                older = stateBuffer[index - 1];
                 break;
             }
         }
@@ -207,23 +422,35 @@
         const lerp = (a, b) => a + (b - a) * amount;
         const a = older.state;
         const b = newer.state;
-        const result = {
+        lastRenderedState = {
             ...b,
-            ball: {
-                ...b.ball,
-                x: lerp(a.ball.x, b.ball.x),
-                y: lerp(a.ball.y, b.ball.y),
-            },
+            ball: { ...b.ball, x: lerp(a.ball.x, b.ball.x), y: lerp(a.ball.y, b.ball.y) },
             p1: { y: lerp(a.p1.y, b.p1.y) },
             p2: { y: lerp(a.p2.y, b.p2.y) },
         };
-        lastRenderedState = result;
-        return result;
+        return lastRenderedState;
     }
 
+    let previousFrame = performance.now();
+    let aiAccumulator = 0;
+
     function renderLoop(now) {
-        const state = interpolatedState(now);
-        if (state) render(state);
+        const elapsed = Math.min(100, Math.max(0, now - previousFrame));
+        previousFrame = now;
+
+        if (isAI && gameState && gameState.status === 'playing') {
+            aiAccumulator += elapsed;
+            while (aiAccumulator >= TICK_MS) {
+                tickAI();
+                aiAccumulator -= TICK_MS;
+            }
+        }
+
+        const state = isAI ? gameState : interpolatedState(now);
+        if (state) {
+            render(state);
+            updateScore(state);
+        }
         window.requestAnimationFrame(renderLoop);
     }
 
@@ -231,11 +458,16 @@
         ball: { x: 0.5, y: 0.5 },
         p1: { y: 0.5 },
         p2: { y: 0.5 },
-        score1: 0, score2: 0,
-        status: 'waiting', winner: 0,
-        p1_ready: false, p2_ready: false,
+        score1: 0,
+        score2: 0,
+        status: 'waiting',
+        winner: 0,
+        p1_ready: false,
+        p2_ready: false,
     };
-    render(lastRenderedState);
+
+    setControlHint();
+    if (isAI) startAI();
+    else connect();
     window.requestAnimationFrame(renderLoop);
-    connect();
 })();

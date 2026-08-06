@@ -11,11 +11,46 @@
             flex-direction: column;
             align-items: center;
             gap: 16px;
+            width: 100%;
         }
         #pongCanvas {
+            display: block;
+            width: min(100%, 800px);
+            height: auto;
+            aspect-ratio: 8 / 5;
             background: #1a1a2e;
             border-radius: 8px;
             box-shadow: 0 0 24px rgba(100, 100, 255, 0.2);
+            touch-action: none;
+        }
+        .touch-controls {
+            display: flex;
+            justify-content: center;
+            gap: 12px;
+            width: min(100%, 420px);
+        }
+        .touch-control {
+            min-width: 110px;
+            min-height: 52px;
+            display: inline-flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 2px;
+            font-size: 1.25rem;
+            line-height: 1;
+            touch-action: none;
+            user-select: none;
+            -webkit-user-select: none;
+        }
+        .touch-control span {
+            font-size: 0.7rem;
+            font-weight: 500;
+        }
+        .control-hint {
+            color: #888;
+            font-size: 0.85rem;
+            text-align: center;
         }
         .scoreboard {
             display: flex;
@@ -58,6 +93,7 @@
     </style>
 </head>
 <body>
+    <a class="build-version" data-build-version href="https://github.com/macel94/cloudnativepong/commits/main" target="_blank" rel="noopener noreferrer">build unknown</a>
     <div class="container">
         <header>
             <h1>🏓 PONG</h1>
@@ -65,13 +101,18 @@
         </header>
 
         <div class="game-wrapper">
-            <div class="scoreboard">
+            <div class="scoreboard" aria-label="Scoreboard">
                 <span id="score1" class="score">0</span>
                 <span class="vs">vs</span>
                 <span id="score2" class="score">0</span>
             </div>
-            <canvas id="pongCanvas" width="800" height="500"></canvas>
-            <p id="status" class="status-bar">Waiting for opponent...</p>
+            <canvas id="pongCanvas" width="800" height="500" role="img" aria-label="Pong game board"></canvas>
+            <div class="touch-controls" aria-label="Touch paddle controls">
+                <button id="moveUp" class="touch-control btn secondary" type="button" aria-label="Move paddle up" aria-pressed="false">▲<span>Up</span></button>
+                <button id="moveDown" class="touch-control btn secondary" type="button" aria-label="Move paddle down" aria-pressed="false">▼<span>Down</span></button>
+            </div>
+            <p id="controlHint" class="control-hint">Controls: W/S or touch buttons</p>
+            <p id="status" class="status-bar" aria-live="polite">Waiting for opponent...</p>
         </div>
 
         <div id="winnerOverlay" class="winner-overlay hidden">
@@ -80,6 +121,7 @@
         </div>
     </div>
 
+    <script src="/build-info.js"></script>
     <script src="/game.js"></script>
 </body>
 </html>

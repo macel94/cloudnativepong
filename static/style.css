@@ -11,7 +11,31 @@ body {
     min-height: 100vh;
     display: flex;
     justify-content: center;
-    padding-top: 40px;
+    padding: 40px 0 max(24px, env(safe-area-inset-bottom));
+}
+
+.build-version {
+    position: fixed;
+    top: max(10px, env(safe-area-inset-top));
+    right: max(12px, env(safe-area-inset-right));
+    z-index: 20;
+    color: #8f92c8;
+    font: 0.72rem/1.2 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    text-decoration: none;
+    opacity: 0.9;
+}
+
+.build-version:hover,
+.build-version:focus-visible {
+    color: #fff;
+    text-decoration: underline;
+}
+
+.btn:focus-visible,
+.player-setup input:focus-visible,
+.build-version:focus-visible {
+    outline: 3px solid #a5b4fc;
+    outline-offset: 3px;
 }
 
 .container {
@@ -58,6 +82,10 @@ h1 {
 
 /* Buttons */
 .actions {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 12px;
     text-align: center;
     margin-bottom: 28px;
 }
@@ -155,6 +183,16 @@ h1 {
 
 /* Responsive */
 @media (max-width: 600px) {
+    body { padding-top: 44px; }
     h1 { font-size: 1.5rem; }
+    .container { padding-left: 14px; padding-right: 14px; }
     .room-card { flex-direction: column; gap: 8px; }
+    .actions .btn { flex: 1 1 100%; max-width: 320px; }
+    .player-setup input { width: min(100%, 320px); min-height: 48px; }
+}
+
+@media (max-width: 380px) {
+    .build-version { font-size: 0.65rem; }
+    .scoreboard { gap: 12px !important; font-size: 1.5rem !important; }
+    .score { min-width: 48px !important; padding: 8px 12px !important; }
 }
