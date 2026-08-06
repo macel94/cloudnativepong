@@ -34,9 +34,10 @@ export default defineConfig({
       use: { ...devices['iPhone 13'] },
     },
   ],
-  // K8s tests use the already-running gateway; only local tests start a binary.
+  // K8s tests use the already-running gateway. Local tests run the current
+  // source through `go run` so an ignored stale binary cannot mask changes.
   webServer: isK8s ? undefined : {
-    command: './cloudnativepong --mode=local',
+    command: 'go run . --mode=local',
     port: 8080,
     reuseExistingServer: !isCI,
   },

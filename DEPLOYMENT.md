@@ -225,7 +225,7 @@ one immutable image with:
 ```
 
 The helper runs `gh attestation verify` with the expected repository,
-publish workflow, OIDC issuer, registry bundle, and SLSA provenance predicate.
+publish workflow, OIDC issuer, GitHub attestation record, and SLSA provenance predicate.
 This is the native GitHub path; no separate signing executable, key, or manual
 signing workflow is required.
 

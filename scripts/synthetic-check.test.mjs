@@ -197,6 +197,7 @@ test('dry-run remains useful without a target, but execution does not', async ()
 test('the shell wrapper fails closed when no target is configured', () => {
   const result = spawnSync('bash', ['scripts/synthetic-check.sh'], {
     cwd: new URL('.', PROJECT_ROOT),
+    env: { ...process.env, SYNTHETIC_BASE_URL: '' },
     encoding: 'utf8',
   });
   assert.equal(result.status, 2);

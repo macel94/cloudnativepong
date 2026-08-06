@@ -20,9 +20,18 @@ test.describe('Lobby', () => {
     await page.goto(LOBBY_URL);
     const build = page.locator('[data-build-version]');
     await expect(build).toBeVisible();
-    await expect(build).toHaveText('sha-dev');
-    await expect(build).toHaveAttribute('href', /github\.com\/macel94\/cloudnativepong\/commits\/main/);
-    await expect(build).toHaveAttribute('data-build-sha', 'dev');
+    if (process.env.TEST_MODE === 'k8s') {
+      const expectedSHA = process.env.GITHUB_SHA;
+      await expect(build).toHaveText(/^sha-[0-9a-f]{7}$/);
+      await expect(build).toHaveAttribute('data-build-sha', expectedSHA || /^[0-9a-f]{40}$/);
+      if (expectedSHA) {
+        await expect(build).toHaveAttribute('href', `https://github.com/macel94/cloudnativepong/commit/${expectedSHA}`);
+      }
+    } else {
+      await expect(build).toHaveText('sha-dev');
+      await expect(build).toHaveAttribute('href', /github\.com\/macel94\/cloudnativepong\/commits\/main/);
+      await expect(build).toHaveAttribute('data-build-sha', 'dev');
+    }
   });
 
   test('loads the lobby page', async ({ page }) => {
@@ -80,7 +89,12 @@ test.describe('Room workflow', () => {
   test('creates a room and navigates to game page', async ({ page }) => {
     await page.goto(LOBBY_URL);
     await page.locator('#playerName').fill(PLAYER_NAME);
+    const roomCreated = page.waitForResponse((response) =>
+      response.url().endsWith('/api/rooms/create') && response.request().method() === 'POST'
+    );
     await page.locator('#btnNewRoom').click();
+    const createResponse = await roomCreated;
+    expect(createResponse.ok()).toBeTruthy();
 
     // Should navigate to game page
     await page.waitForURL(/game\.html\?room=/);
@@ -88,24 +102,18 @@ test.describe('Room workflow', () => {
     await expect(page.locator('#status')).toContainText('Player');
   });
 
-  test('lists created rooms on lobby page', async ({ page }) => {
+  test('lists created rooms on lobby page', async ({ page, request }) => {
+    // Create through the API and leave the waiting reservation alive while the
+    // lobby is loaded. Navigating away from a game page would close its socket
+    // and correctly trigger local room cleanup before the list can render.
+    const create = await request.post('/api/rooms/create', {
+      data: { name: 'List Test Room' },
+    });
+    expect(create.ok()).toBeTruthy();
+
     await page.goto(LOBBY_URL);
     await page.locator('#playerName').fill(PLAYER_NAME);
-
-    // Create a room
-    await page.locator('#btnNewRoom').click();
-    await page.waitForURL(/game\.html\?room=/);
-
-    // Go back to lobby
-    await page.goto(LOBBY_URL);
-    await page.locator('#playerName').fill(PLAYER_NAME);
-
-    // Wait for room list to refresh
-    await page.waitForTimeout(1000);
-
-    // Should see the room in the list
-    const rooms = page.locator('.room-card');
-    await expect(rooms.first()).toBeVisible();
+    await expect(page.locator('.room-card').first()).toBeVisible();
   });
 });
 
@@ -220,9 +228,8 @@ test.describe('API endpoints', () => {
     const res = await request.post('/api/rooms/join', {
       data: { room_id: 'nonexistent' },
     });
-    expect(res.ok()).toBeTruthy();
-    const data = await res.json();
-    expect(data.error).toBeTruthy();
+    expect(res.status()).toBe(400);
+    expect(await res.text()).toContain('invalid room ID');
   });
 
   test('static files are served', async ({ request }) => {

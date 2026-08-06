@@ -221,6 +221,8 @@ spec:
                   fieldPath: status.podIP
             - name: ROOM_POD_TEMPLATE
               value: /etc/room-template/template.json
+            - name: PONG_ALLOWED_ORIGINS
+              value: http://localhost:8080
           volumeMounts:
             - name: data
               mountPath: /data

@@ -280,8 +280,7 @@ Pong ingress.
 
 ## 🔐 Supply-chain, synthetic checks, and recovery
 
-The repository provides reusable helpers under `scripts/` and opt-in GitHub
-workflows:
+The repository provides reusable helpers under `scripts/` and GitHub workflows:
 
 - `.github/workflows/supply-chain.yml` builds each image locally, uploads a
   CycloneDX SBOM, and uploads a Trivy JSON report for HIGH/CRITICAL findings.
