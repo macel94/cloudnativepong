@@ -39,6 +39,12 @@ data:
               "--room-id=${ROOM_ID}",
               "--lobby-addr=${LOBBY_ADDR}"
             ],
+            "env": [
+              {
+                "name": "PONG_ALLOWED_ORIGINS",
+                "value": "https://pong.belacca.com"
+              }
+            ],
             "ports": [
               { "containerPort": 8080 }
             ],

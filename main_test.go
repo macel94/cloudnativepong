@@ -226,6 +226,9 @@ func TestRoomTemplateHasSecurityBoundary(t *testing.T) {
 	if len(manifest.Spec.Containers) != 1 || manifest.Spec.Containers[0].SecurityContext.AllowPrivilegeEscalation || !manifest.Spec.Containers[0].SecurityContext.ReadOnlyRootFilesystem || !manifest.Spec.Containers[0].SecurityContext.RunAsNonRoot {
 		t.Fatalf("container security context is incomplete: %+v", manifest.Spec.Containers)
 	}
+	if !strings.Contains(jsonText, `"name": "PONG_ALLOWED_ORIGINS"`) || !strings.Contains(jsonText, `"value": "https://pong.belacca.com"`) {
+		t.Fatal("room Pod template does not propagate the production PONG_ALLOWED_ORIGINS policy")
+	}
 }
 
 func TestReadWebSocketFrame(t *testing.T) {

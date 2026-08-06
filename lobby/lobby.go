@@ -745,6 +745,9 @@ func (s *Server) createK8sPod(roomID string) (string, error) {
 					"image":           image,
 					"imagePullPolicy": "IfNotPresent",
 					"args":            []string{"--mode=room", "--room-id=" + roomID, "--lobby-addr=" + s.lobbyAddr()},
+					"env": []map[string]interface{}{
+						{"name": "PONG_ALLOWED_ORIGINS", "value": s.allowedOrigins()},
+					},
 					"ports": []map[string]interface{}{
 						{"containerPort": 8080},
 					},
@@ -901,6 +904,19 @@ func (s *Server) createK8sService(roomID, apiHost, apiPort, ns string, token []b
 		return fmt.Errorf("kubernetes service create returned HTTP %d", resp.StatusCode)
 	}
 	return nil
+}
+
+// allowedOrigins returns the exact origin policy that room Pods must use for
+// their browser-facing WebSocket handler. Keeping this on the generated Pod
+// avoids a lobby/room policy split in local and Kubernetes test environments.
+func (s *Server) allowedOrigins() string {
+	if configured := strings.TrimSpace(os.Getenv("PONG_ALLOWED_ORIGINS")); configured != "" {
+		return configured
+	}
+	if s.mode == "local" {
+		return "http://localhost:8080,http://127.0.0.1:8080,http://[::1]:8080"
+	}
+	return "https://pong.belacca.com"
 }
 
 // lobbyAddr returns the lobby's address for room pods to report back to.

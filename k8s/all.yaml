@@ -373,6 +373,12 @@ data:
               "--room-id=${ROOM_ID}",
               "--lobby-addr=${LOBBY_ADDR}"
             ],
+            "env": [
+              {
+                "name": "PONG_ALLOWED_ORIGINS",
+                "value": "http://localhost:8080"
+              }
+            ],
             "ports": [
               { "containerPort": 8080 }
             ],
