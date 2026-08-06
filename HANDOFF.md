@@ -4,8 +4,11 @@
 > setup. The current multi-project hosting plan moves cluster ownership to
 > [`macel94/belacca-gitops`](https://github.com/macel94/belacca-gitops), keeps Pong
 > at [`pong.belacca.com`](https://pong.belacca.com), and hosts the personal site
-> at [`francesco.belacca.com`](https://francesco.belacca.com). Use
-> `belacca-gitops/MIGRATION.md` for the staged cutover procedure.
+> at [`francesco.belacca.com`](https://francesco.belacca.com). The aliases
+> `belacca.com`, `www.belacca.com`, and `www.francesco.belacca.com` redirect to
+> the canonical personal site. See the canonical
+> [platform site inventory](https://github.com/macel94/belacca-gitops/blob/main/docs/SITES.md)
+> and use `belacca-gitops/MIGRATION.md` for the staged cutover procedure.
 
 **Checkpoint date:** 2026-07-31
 **Branch:** `feat/gitops-server-deployment`

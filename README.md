@@ -111,17 +111,20 @@ Cloud Native Pong is hosted at:
 
 - **[https://pong.belacca.com/](https://pong.belacca.com/)**
 
-The apex names `belacca.com` and `www.belacca.com` redirect to the personal
-site at `https://francesco.belacca.com/`. Open the Pong subdomain, enter a
-display name, and create or join a room. Browser WebSocket connections are
-served over TLS. Let's Encrypt certificates are issued and renewed
-automatically by Traefik, with certificate state stored in the
-`kube-system/traefik-acme` PVC.
+The portfolio aliases `belacca.com`, `www.belacca.com`, and
+`www.francesco.belacca.com` redirect to the canonical personal site at
+`https://francesco.belacca.com/`. The complete platform site inventory is in
+[`macel94/belacca-gitops/docs/SITES.md`](https://github.com/macel94/belacca-gitops/blob/main/docs/SITES.md).
+Open the Pong subdomain, enter a display name, and create or join a room.
+Browser WebSocket connections are served over TLS. Let's Encrypt certificates
+are issued and renewed automatically by Traefik, with certificate state stored
+in the `kube-system/traefik-acme` PVC.
 
 Host-based routing is owned by the public
 [`macel94/belacca-gitops`](https://github.com/macel94/belacca-gitops) repository;
-this repository owns Pong workloads and immutable images. DNS must contain A
-records for `pong.belacca.com` and `francesco.belacca.com` pointing to
+this repository owns Pong workloads and immutable images. DNS must contain A records for `pong.belacca.com`,
+`francesco.belacca.com`, and the three portfolio aliases
+(`belacca.com`, `www.belacca.com`, and `www.francesco.belacca.com`) pointing to
 `169.58.97.73` for normal traffic. ACME uses the platform's Cloudflare DNS-01
 configuration and its out-of-band `kube-system/traefik-cloudflare` Secret; no
 DNS/API value is stored here.

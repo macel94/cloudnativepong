@@ -69,17 +69,15 @@ that path publicly. Callback requests carry only the opaque correlation headers;
 callback retries are bounded, and a failed start callback closes the room path
 so reconciliation can clean it rather than leaving a half-started game.
 
-The public endpoints are:
+The canonical platform site inventory is maintained in
+[`macel94/belacca-gitops/docs/SITES.md`](https://github.com/macel94/belacca-gitops/blob/main/docs/SITES.md).
+The Pong application is served at `https://pong.belacca.com/`; the canonical
+personal site is `https://francesco.belacca.com/`; and
+`belacca.com`, `www.belacca.com`, and `www.francesco.belacca.com` permanently
+redirect to that personal site.
 
-```text
-https://pong.belacca.com/       → Cloud Native Pong
-https://francesco.belacca.com/  → personal site
-https://belacca.com/            → redirect to the personal site
-https://www.belacca.com/        → redirect to the personal site
-```
-
-DNS A records for the two subdomains and both existing apex names point at
-`169.58.97.73`. Traefik exposes the `websecure` entrypoint on public port 443
+DNS A records for the supported application hosts and all three portfolio
+aliases point at `169.58.97.73`. Traefik exposes the `websecure` entrypoint on public port 443
 and obtains certificates from Let's Encrypt using the committed Cloudflare
 DNS-01 configuration. The out-of-band `kube-system/traefik-cloudflare` Secret
 must provide `CLOUDFLARE_DNS_API_TOKEN`; no value is stored in Git. The

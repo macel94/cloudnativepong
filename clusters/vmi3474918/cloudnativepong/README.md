@@ -10,5 +10,7 @@ image references in the production patches.
 The current k3d server exposes Traefik HTTP on host ports `80` and `18080`,
 and HTTPS on host port `443`. Host routing is owned by
 [`macel94/belacca-gitops`](https://github.com/macel94/belacca-gitops). The public
-application URL is `https://pong.belacca.com/`; the apex names redirect to the
-personal site at `https://francesco.belacca.com/`.
+application URL is `https://pong.belacca.com/`; the portfolio aliases
+`belacca.com`, `www.belacca.com`, and `www.francesco.belacca.com` redirect to the
+canonical personal site at `https://francesco.belacca.com/`. See the platform's
+[canonical site inventory](https://github.com/macel94/belacca-gitops/blob/main/docs/SITES.md).
