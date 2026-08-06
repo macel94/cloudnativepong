@@ -99,7 +99,9 @@ test.describe('Room workflow', () => {
     // Should navigate to game page
     await page.waitForURL(/game\.html\?room=/);
     await expect(page.locator('h1')).toHaveText('🏓 PONG');
-    await expect(page.locator('#status')).toContainText('Player');
+    await expect(page.locator('#status')).toContainText('Player', {
+      timeout: process.env.TEST_MODE === 'k8s' ? 20_000 : 5_000,
+    });
   });
 
   test('lists created rooms on lobby page', async ({ page, request }) => {
@@ -133,7 +135,9 @@ test.describe('Two-player game', () => {
     expect(roomId).toBeTruthy();
 
     // Player 1 should see their assignment
-    await expect(p1Page.locator('#status')).toContainText('Player 1');
+    await expect(p1Page.locator('#status')).toContainText('Player 1', {
+      timeout: process.env.TEST_MODE === 'k8s' ? 20_000 : 5_000,
+    });
 
     // Player 2: join the same room
     const p2Ctx = await browser.newContext();
