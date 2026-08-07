@@ -35,4 +35,25 @@ jobs:
           SYNTHETIC_BASE_URL: ''
         run: npm run test:synthetic
       - name: Check public Pong endpoint and two-player journey
-        run: ./scripts/synthetic-check.sh
+        shell: bash
+        run: |
+          set -euo pipefail
+          max_attempts=3
+
+          for ((attempt = 1; attempt <= max_attempts; attempt++)); do
+            echo "Synthetic check attempt ${attempt}/${max_attempts}"
+            if ./scripts/synthetic-check.sh; then
+              exit 0
+            else
+              status=$?
+            fi
+
+            if (( attempt == max_attempts )); then
+              echo "Synthetic check failed after ${max_attempts} attempts" >&2
+              exit "$status"
+            fi
+
+            delay=$((10 ** attempt))
+            echo "Synthetic check failed (exit ${status}); retrying in ${delay}s" >&2
+            sleep "$delay"
+          done
