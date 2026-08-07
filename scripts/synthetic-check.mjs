@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * Public Pong synthetic: verify the public page/API, create and join one room,
- * establish two WebSockets, observe the playing state, and verify cleanup.
+ * establish the WebSocket-compatible default sessions, observe the playing state, and verify cleanup.
  *
  * The target is deliberately supplied by the caller. The scheduled GitHub
  * workflow supplies the canonical production URL; local invocations must set
@@ -248,7 +248,7 @@ function waitForPlayer(socket, timeoutMs) {
     let joinedPlayer = null;
     let playing = false;
     let settled = false;
-    const timer = setTimeout(() => finishReject(new SyntheticError('WebSocket player journey timed out')), timeoutMs);
+    const timer = setTimeout(() => finishReject(new SyntheticError('WebSocket-compatible player journey timed out')), timeoutMs);
 
     function finishResolve(value) {
       if (settled) return;
@@ -267,7 +267,7 @@ function waitForPlayer(socket, timeoutMs) {
       socket.removeListener('message', onMessage);
       socket.removeListener('open', onOpen);
       socket.removeListener('close', onClose);
-      reject(error instanceof SyntheticError ? error : new SyntheticError('WebSocket player journey failed'));
+      reject(error instanceof SyntheticError ? error : new SyntheticError('WebSocket-compatible player journey failed'));
     }
 
     function onOpen() {
@@ -505,7 +505,7 @@ export async function runSynthetic({
 
   if (dryRun) {
     console.log(`synthetic dry-run: would check ${base.origin}${base.pathname}`);
-    console.log('synthetic dry-run: homepage, health, room list/create/join, two WebSockets, and cleanup');
+    console.log('synthetic dry-run: homepage, health, room list/create/join, two WebSocket-compatible sessions, and cleanup');
     return { dryRun: true, baseURL: `${base.origin}${base.pathname}` };
   }
 
@@ -551,7 +551,7 @@ export async function runSynthetic({
     const assignments = await Promise.all(sockets.map((player) => player.ready));
     const players = new Set(assignments.map(({ player }) => player));
     if (players.size !== 2 || !players.has(1) || !players.has(2)) {
-      throw new SyntheticError('WebSocket journey did not assign one Player 1 and one Player 2');
+      throw new SyntheticError('WebSocket-compatible journey did not assign one Player 1 and one Player 2');
     }
   } catch (error) {
     primaryError = safeError(error, 'synthetic journey failed');
@@ -576,7 +576,7 @@ export async function runSynthetic({
   if (cleanupError) throw cleanupError;
 
   const durationMs = Date.now() - startedAt;
-  console.log(`synthetic passed: homepage, health, room CRUD, two-player WebSocket state, and cleanup (${durationMs}ms)`);
+  console.log(`synthetic passed: homepage, health, room CRUD, two-player WebSocket-compatible state, and cleanup (${durationMs}ms)`);
   return { dryRun: false, durationMs };
 }
 

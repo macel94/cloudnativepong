@@ -1,5 +1,5 @@
 // Package db provides a lightweight SQLite-backed store for room state.
-// Uses modernc.org/sqlite — pure Go, no CGO, works on scratch containers.
+// Uses modernc.org/sqlite — pure Go, no CGO, works in distroless containers.
 package db
 
 import (

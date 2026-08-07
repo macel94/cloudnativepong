@@ -1,0 +1,39 @@
+# Cloud Native Pong static frontend.
+{
+    admin off
+    auto_https off
+}
+
+:8080 {
+    root * /srv
+    encode gzip
+
+    header {
+        Access-Control-Allow-Origin "*"
+        Access-Control-Allow-Methods "GET, POST, OPTIONS"
+        Access-Control-Allow-Headers "Origin, X-Requested-With, Content-Type, Accept, Authorization"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        X-XSS-Protection "1; mode=block"
+        X-WebTransport-Version "draft-ietf-webtrans-http3"
+    }
+
+    @build path /build-info.js
+    header @build Cache-Control "no-store, max-age=0"
+
+    @health path /health
+    @api path /api/*
+
+    route {
+        handle @health {
+            header Content-Type "text/plain; charset=utf-8"
+            header Cache-Control "no-store"
+            respond "ok" 200
+        }
+        handle @api {
+            respond 204
+        }
+        try_files {path} {path}/ /index.html
+        file_server
+    }
+}

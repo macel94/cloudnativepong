@@ -19,7 +19,8 @@ the backup/object-storage contract is in the [GitOps backup contract](https://gi
   ClusterIP Service. Room Pods have resource limits and a two-hour deadline.
 - Creating a room reserves the creator's slot; joining reserves the second slot.
   The lobby marks a room `playing` only after the room Pod confirms both actual
-  WebSocket connections through its internal callback.
+  room-side WebSocket connections through its internal callback. Public
+  WebTransport, when enabled, is bridged to this same room-side contract.
 - Completed, failed, orphaned, and abandoned waiting-room resources are cleaned
   by the lobby. Waiting rooms expire after 10 minutes, with reconciliation
   running every 1 minute.
@@ -54,8 +55,11 @@ changed only through the documented Flux upgrade/bootstrap process.
 Traefik is the existing k3s ingress controller in `kube-system`. The
 cluster-level platform repository owns the host-based Pong Ingress for
 `pong.belacca.com`, using class `traefik` and the `web,websecure` entrypoints.
-It forwards all paths to `pong-gateway`; NGINX in that gateway handles static
-files, API calls, and WebSocket upgrades. The k3d load balancer maps:
+It forwards all paths to `pong-gateway`; Caddy in that gateway handles static
+routing, API calls, and WebSocket upgrades. Native WebTransport is implemented
+in the Go API but is opt-in and terminates on a separate UDP listener because
+the current Traefik HTTP ingress does not expose UDP or proxy WebTransport
+sessions. The k3d load balancer maps:
 
 - Host `80` and `18080` → Traefik HTTP port 80
 - Host `443` → Traefik HTTPS port 443
@@ -82,7 +86,10 @@ and obtains certificates from Let's Encrypt using the committed Cloudflare
 DNS-01 configuration. The out-of-band `kube-system/traefik-cloudflare` Secret
 must provide `CLOUDFLARE_DNS_API_TOKEN`; no value is stored in Git. The
 certificate store is persisted in `kube-system/traefik-acme`, so certificates
-renew across Traefik restarts. WebSockets use the same HTTPS ingress.
+renew across Traefik restarts. WebSockets use the same HTTPS ingress. Native
+WebTransport requires a separate UDP-capable public service, matching TLS
+certificate, and `PONG_WEBTRANSPORT_PUBLIC_URL`; it is disabled in the default
+manifests until those platform prerequisites are reviewed.
 
 ## Project clusters on this server
 
@@ -136,7 +143,7 @@ public `k3d-pong` cluster as a repeated experiment sandbox.
    and patch only that environment. Never patch the public `k3d-pong` cluster
    for routine experiments. Wait for the affected rollout, run the focused
    Kubernetes Playwright test, and capture logs, events, resource usage,
-   WebSocket cadence, and room cleanup.
+   real-time frame cadence, and room cleanup.
 5. **Commit and push the branch.** GitHub Actions builds immutable
    `sha-<commit>` images and commits the generated overlay tag update back to
    the same feature branch. Fetch the branch before any follow-up commit because
@@ -153,16 +160,16 @@ public `k3d-pong` cluster as a repeated experiment sandbox.
    ```
 7. **Verify production after reconciliation.** Confirm Flux `Ready=True`, all
    pods Ready, the expected immutable image tags, ingress/API HTTP 200, a
-   two-player WebSocket game, and no unexpected room Pods or Services remain.
+   two-player WebSocket-compatible game, and no unexpected room Pods or Services remain.
 
-This workflow keeps rapid debugging local, tests the actual Kubernetes/WebSocket
+This workflow keeps rapid debugging local, tests the actual Kubernetes real-time
 path before merge, and ensures production changes arrive through Git history
 rather than drift from manual `kubectl apply` operations.
 
-## Latency investigation: WebSocket frame delivery
+## Latency investigation: real-time frame delivery
 
 The observed lag was caused by bursty delivery of small authoritative state
-frames through the multi-hop WebSocket path, not by node saturation: node CPU
+frames through the multi-hop real-time path, not by node saturation: node CPU
 remained below 20% and application pods used little CPU. The browser rendered
 only when a network frame arrived, making packet bursts visible as paddle/ball
 stutter. The fix enables TCP_NODELAY on Go WebSocket connections and adds a

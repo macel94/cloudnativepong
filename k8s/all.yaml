@@ -43,6 +43,13 @@ spec:
         app: cloudnativepong
         component: gateway
     spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: gateway
           image: cloudnativepong-gateway:latest
@@ -69,6 +76,22 @@ spec:
               port: 8080
             initialDelaySeconds: 2
             periodSeconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+          volumeMounts:
+            - name: caddy-data
+              mountPath: /data
+            - name: caddy-config
+              mountPath: /config
+      volumes:
+        - name: caddy-data
+          emptyDir: {}
+        - name: caddy-config
+          emptyDir: {}
 ---
 apiVersion: v1
 kind: Service
@@ -114,6 +137,13 @@ spec:
         app: cloudnativepong
         component: static
     spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: static
           image: cloudnativepong-static:latest
@@ -140,6 +170,22 @@ spec:
               port: 8080
             initialDelaySeconds: 2
             periodSeconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+          volumeMounts:
+            - name: caddy-data
+              mountPath: /data
+            - name: caddy-config
+              mountPath: /config
+      volumes:
+        - name: caddy-data
+          emptyDir: {}
+        - name: caddy-config
+          emptyDir: {}
 ---
 apiVersion: v1
 kind: Service
@@ -218,9 +264,18 @@ spec:
             - "--namespace=pong"
             - "--room-image=cloudnativepong-room:latest"
             - "--db-path=/data/pong.db"
+            # To enable native WebTransport, add:
+            # - "--webtransport-addr=:8443"
+            # - "--webtransport-public-url=https://pong.belacca.com/rooms/{room}/wt"
+            # and mount certificate/key files from an approved Secret.
           ports:
             - containerPort: 8080
               name: http
+            # Native WebTransport is opt-in; the listener is disabled unless
+            # PONG_WEBTRANSPORT_ADDR and TLS paths are configured.
+            - containerPort: 8443
+              name: webtransport
+              protocol: UDP
           env:
             - name: LOBBY_HOST
               valueFrom:
@@ -284,6 +339,29 @@ spec:
     - port: 8080
       targetPort: 8080
       name: http
+  type: ClusterIP
+---
+# Optional native WebTransport transport. This ClusterIP is intentionally not
+# public by itself; expose it through an approved UDP-capable load balancer or
+# NodePort only after configuring TLS and the platform NetworkPolicy.
+apiVersion: v1
+kind: Service
+metadata:
+  name: pong-api-webtransport
+  namespace: pong
+  labels:
+    app: cloudnativepong
+    component: api
+    transport: webtransport
+spec:
+  selector:
+    app: cloudnativepong
+    component: api
+  ports:
+    - port: 8443
+      targetPort: 8443
+      name: webtransport
+      protocol: UDP
   type: ClusterIP
 
 # ──────────────────────────────────────────────

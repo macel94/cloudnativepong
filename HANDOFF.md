@@ -22,11 +22,12 @@ This document is retained for lifecycle investigation history only. Do not use i
 
 ## What is verified
 
-The current uncommitted follow-up adds bounded aggregate application metrics,
-opaque request/correlation IDs, cluster-free orchestration failure injection,
-and the dependency-light `scripts/load-smoke.sh` harness. It does not edit
-`plan.md` or undo the origin, admission, Pod security, or SQLite single-writer
-changes.
+This historical checkpoint predates the current `main` rollout. The former
+follow-up added bounded aggregate application metrics, opaque request/correlation
+IDs, cluster-free orchestration failure injection, and the dependency-light
+`scripts/load-smoke.sh` harness. The current main branch has since migrated the
+HTTP/static edge to Caddy, moved Go runtimes to pinned Distroless images, and
+added an opt-in native WebTransport path with a WebSocket-compatible default.
 
 - `main` remains known-good at commit `2c5399c`.
 - Feature branch: `feat/gitops-server-deployment`.
@@ -102,9 +103,11 @@ Observed leaked resources after the last test run:
 
 This is a real lifecycle bug, not a Flux or ingress failure.
 
-## Current uncommitted implementation state
+## Historical implementation state (superseded)
 
-The working tree contains experimental application, test, and documentation changes in `db/db.go`, `lobby/lobby.go`, `main.go`, and related files.
+The former feature-branch working tree contained experimental application, test,
+and documentation changes in `db/db.go`, `lobby/lobby.go`, `main.go`, and related
+files. Those changes are now part of the published mainline history.
 
 The application-side implementation is locally verified with the full Go test
 suite, race detector, vet, Node syntax/dry-run checks, and the bounded local
@@ -117,7 +120,7 @@ reconciled by Flux.
 
 ### `lobby/lobby.go`
 
-The current uncommitted changes:
+The historical changes at this checkpoint included:
 
 - add a default 10-minute idle timeout and `NewServerWithIdleTimeout` constructor;
 - scan persisted rooms during reconciliation and attempt cleanup for old `waiting` rooms;
@@ -198,8 +201,10 @@ TEST_MODE=k8s BASE_URL=http://169.58.97.73:18080 npx playwright test --reporter=
 
 ## Current checkpoint conclusion
 
-**Working:** GitOps/Flux reconciliation, immutable images, Traefik HTTP ingress, public HTTP reachability, stateless scaling, single-replica persistent SQLite API, dynamic room Pod creation, atomic capacity reservation, actual-connection start notification, bounded waiting-room cleanup, aggregate no-label application metrics, opaque request/correlation IDs, cluster-free failure-injection tests, bounded load/smoke tooling, and the local two-player WebSocket path.
-
-**Not yet deployed/proven live:** the final lifecycle image has not been published or reconciled by Flux; the fresh Kubernetes abandoned-room and post-disconnect tests still need to run against that image. The previous leaked rooms were manually removed through the internal callback, and the API PVC was verified `Bound`.
-
-**Working tree note:** this handoff commit documents the current uncommitted lifecycle implementation. Do not stage or commit automatically; review the diff, then commit/push the application fix through the ordered deployment steps below.
+This file remains a historical lifecycle handoff and is not the current deployment
+source of truth. The published main branch now includes Caddy gateway/static
+images, pinned Distroless API/room runtimes, native WebTransport support behind an
+explicit UDP/TLS configuration, and a WebSocket-compatible default path. The
+current deployment and operational documentation live in `README.md` and
+`DEPLOYMENT.md`; production promotion still occurs through the application
+publish workflow and the parent GitOps repository.

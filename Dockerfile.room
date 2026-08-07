@@ -1,5 +1,5 @@
 # ── Cloud Native Pong — Room Server ────────────────────────────────
-# Multi-stage build: Go binary from golang:1.26-alpine → scratch.
+# Multi-stage build: Go binary from golang:1.26-alpine → distroless.
 # Runs in --mode=room for dedicated game room pods.
 # Room ID and lobby address are injected at runtime via --room-id and --lobby-addr.
 #
@@ -34,7 +34,7 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
     go build -ldflags="-s -w" -o /pong .
 
 # ── Final Stage ────────────────────────────────────────────────────
-FROM scratch
+FROM gcr.io/distroless/static-debian13:nonroot@sha256:23795be0fe67b7d47d1ee62b19c7db750152db627d5bbfa31307e892a7575bec
 
 # Metadata labels
 LABEL org.opencontainers.image.title="Cloud Native Pong — Room Server" \
@@ -47,13 +47,10 @@ LABEL org.opencontainers.image.title="Cloud Native Pong — Room Server" \
       org.opencontainers.image.licenses="MIT" \
       org.opencontainers.image.ref.name="latest"
 
-# Timezone data for proper log timestamps
+# Keep the small distroless runtime, and copy the exact CA/timezone data used
+# by the builder so callbacks and log timestamps are stable.
 COPY --from=builder /usr/share/zoneinfo /usr/share/zoneinfo
-
-# CA certs for K8s API calls (room pods generally don't need these,
-# but keeping them for consistency ensures the image is self-sufficient)
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
-
 # Binary
 COPY --from=builder /pong /pong
 

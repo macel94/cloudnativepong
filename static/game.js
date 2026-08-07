@@ -28,6 +28,7 @@
     roomLabel.textContent = isAI ? 'vs Computer · Local AI' : 'Room: ' + roomId;
 
     let ws = null;
+    let connection = null;
     let player = isAI ? 1 : 0;
     let gameState = null;
     let gameOverShown = false;
@@ -74,7 +75,7 @@
         winnerText.textContent = winner === player ? '🎉 You Win!' : '💀 You Lose!';
         winnerOverlay.classList.remove('hidden');
         statusElement.textContent = 'Game Over';
-        if (ws) ws.close();
+        if (connection) connection.close();
     }
 
     function bindTouchButton(id, direction) {
@@ -143,72 +144,157 @@
         };
     }
 
-    function connect() {
+    function handleMessage(message) {
+        if (message.type === 'joined') {
+            player = message.player;
+            setControlHint();
+            statusElement.textContent =
+                'You are Player ' + player + '. ' +
+                (player === 1 ? 'Use W/S or touch buttons.' : 'Use ↑/↓ or touch buttons.') +
+                (player === 1 ? ' Waiting for opponent...' : '');
+        }
+
+        if (message.type === 'state' && message.state && message.state.ball) {
+            const state = message.state;
+            const receivedAt = performance.now();
+            gameState = state;
+            stateBuffer.push({ state, receivedAt });
+            while (stateBuffer.length > 8 ||
+                (stateBuffer.length > 2 && receivedAt - stateBuffer[0].receivedAt > 250)) {
+                stateBuffer.shift();
+            }
+
+            if (state.status === 'playing') statusElement.textContent = 'Playing!';
+            updateScore(state);
+            if (state.status === 'finished') showWinner(state.winner);
+        }
+
+        if (message.type === 'error') {
+            statusElement.textContent = 'Error: ' + (message.message || 'game unavailable');
+        }
+    }
+
+    function markDisconnected(message) {
+        if (!gameOverShown) statusElement.textContent = message;
+        connection = null;
+    }
+
+    function connectWebSocket() {
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
         const wsURL = `${protocol}//${window.location.host}/rooms/${encodeURIComponent(roomId)}/ws`;
         ws = new WebSocket(wsURL);
+        connection = {
+            send: (value) => ws.send(JSON.stringify(value)),
+            close: () => ws.close(),
+            isOpen: () => ws.readyState === WebSocket.OPEN,
+        };
 
         ws.onopen = function () {
-            statusElement.textContent = 'Connected. Waiting for opponent...';
-            // The lobby proxy uses this first post-upgrade frame to know that
-            // the gateway has completed its WebSocket tunnel handoff.
+            statusElement.textContent = 'Connected via WebSocket. Waiting for opponent...';
             ws.send(JSON.stringify({ type: 'proxy-ready' }));
         };
-
         ws.onmessage = function (event) {
-            let message;
             try {
-                message = JSON.parse(event.data);
+                handleMessage(JSON.parse(event.data));
             } catch {
                 statusElement.textContent = 'Received invalid game data.';
-                return;
             }
+        };
+        ws.onclose = () => markDisconnected('Disconnected.');
+        ws.onerror = () => {
+            if (!gameOverShown) statusElement.textContent = 'Connection error.';
+        };
+    }
 
-            if (message.type === 'joined') {
-                player = message.player;
-                setControlHint();
-                statusElement.textContent =
-                    'You are Player ' + player + '. ' +
-                    (player === 1 ? 'Use W/S or touch buttons.' : 'Use ↑/↓ or touch buttons.') +
-                    (player === 1 ? ' Waiting for opponent...' : '');
-            }
+    function frameWebTransportMessage(value) {
+        const payload = new TextEncoder().encode(JSON.stringify(value));
+        const frame = new Uint8Array(4 + payload.length);
+        new DataView(frame.buffer).setUint32(0, payload.length);
+        frame.set(payload, 4);
+        return frame;
+    }
 
-            if (message.type === 'state' && message.state && message.state.ball) {
-                const state = message.state;
-                const receivedAt = performance.now();
-                gameState = state;
-                stateBuffer.push({ state, receivedAt });
-                while (stateBuffer.length > 8 ||
-                    (stateBuffer.length > 2 && receivedAt - stateBuffer[0].receivedAt > 250)) {
-                    stateBuffer.shift();
+    async function connectWebTransport(url) {
+        const transport = new WebTransport(url);
+        await transport.ready;
+        const stream = await transport.createBidirectionalStream();
+        const writer = stream.writable.getWriter();
+        const reader = stream.readable.getReader();
+        const decoder = new TextDecoder();
+        let writeChain = Promise.resolve();
+        let buffered = new Uint8Array(0);
+        let open = true;
+
+        const connectionForTransport = {
+            send(value) {
+                writeChain = writeChain.then(() => writer.write(frameWebTransportMessage(value)));
+                writeChain.catch(() => markDisconnected('WebTransport write failed.'));
+            },
+            close() {
+                open = false;
+                transport.close();
+                writer.releaseLock();
+                reader.releaseLock();
+            },
+            isOpen: () => open,
+        };
+        connection = connectionForTransport;
+        statusElement.textContent = 'Connected via WebTransport. Waiting for opponent...';
+        connection.send({ type: 'proxy-ready' });
+
+        (async () => {
+            try {
+                while (open) {
+                    const result = await reader.read();
+                    if (result.done) break;
+                    const next = new Uint8Array(buffered.length + result.value.length);
+                    next.set(buffered);
+                    next.set(result.value, buffered.length);
+                    buffered = next;
+                    while (buffered.length >= 4) {
+                        const length = new DataView(buffered.buffer, buffered.byteOffset).getUint32(0);
+                        if (length > 1 << 20) throw new Error('message too large');
+                        if (buffered.length < 4 + length) break;
+                        const payload = buffered.slice(4, 4 + length);
+                        buffered = buffered.slice(4 + length);
+                        handleMessage(JSON.parse(decoder.decode(payload)));
+                    }
                 }
-
-                if (state.status === 'playing') {
-                    statusElement.textContent = 'Playing!';
+            } catch {
+                if (open) markDisconnected('WebTransport connection error.');
+            } finally {
+                open = false;
+                if (!gameOverShown) {
+                    transport.closed.catch(() => undefined);
+                    markDisconnected('Disconnected.');
                 }
-                updateScore(state);
-                if (state.status === 'finished') showWinner(state.winner);
             }
+        })();
+    }
 
-            if (message.type === 'error') {
-                statusElement.textContent = 'Error: ' + (message.message || 'game unavailable');
+    async function connect() {
+        if (window.WebTransport) {
+            try {
+                const response = await fetch('/api/capabilities', { headers: { accept: 'application/json' } });
+                const capabilities = await response.json();
+                if (capabilities.webtransport && capabilities.webtransport_url) {
+                    const url = capabilities.webtransport_url.replace('{room}', encodeURIComponent(roomId));
+                    await connectWebTransport(url);
+                    return;
+                }
+            } catch {
+                // Capability discovery or QUIC setup failed; use the tested
+                // WebSocket fallback without delaying the game unnecessarily.
             }
-        };
-
-        ws.onclose = function () {
-            if (!gameOverShown) statusElement.textContent = 'Disconnected.';
-        };
-
-        ws.onerror = function () {
-            if (!gameOverShown) statusElement.textContent = 'Connection error. Retrying...';
-        };
+        }
+        connectWebSocket();
     }
 
     // Send input to the authoritative server at approximately 60Hz.
     setInterval(() => {
-        if (isAI || !ws || ws.readyState !== WebSocket.OPEN || !player) return;
+        if (isAI || !connection || !connection.isOpen() || !player) return;
         const input = readLocalInput();
-        ws.send(JSON.stringify({ player, up: input.up, down: input.down }));
+        connection.send({ player, up: input.up, down: input.down });
     }, TICK_MS);
 
     function clampPaddle(value) {

@@ -8,7 +8,8 @@ on:
     paths:
       - 'Dockerfile.*'
       - '.dockerignore'
-      - 'nginx-main.conf'
+      - 'gateway/Caddyfile'
+      - 'static/Caddyfile'
       - 'go.mod'
       - 'go.sum'
       - '**.go'

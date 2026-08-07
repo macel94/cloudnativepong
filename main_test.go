@@ -75,6 +75,38 @@ func TestRequestMetricsCountsFailureWithoutRequestData(t *testing.T) {
 	}
 }
 
+func TestCapabilitiesAdvertiseConfiguredWebTransport(t *testing.T) {
+	oldEnabled, oldURL := webTransportEnabled, webTransportURL
+	webTransportEnabled = true
+	webTransportURL = "https://pong.example/rooms/{room}/wt"
+	defer func() {
+		webTransportEnabled, webTransportURL = oldEnabled, oldURL
+	}()
+
+	store, err := db.New(":memory:")
+	if err != nil {
+		t.Fatalf("db.New() error = %v", err)
+	}
+	defer store.Close()
+	mux := http.NewServeMux()
+	setupLocalRoutes(mux, lobby.NewServer(store, "local", "", ""), store)
+	recorder := httptest.NewRecorder()
+	mux.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/capabilities", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("capabilities status = %d, want 200", recorder.Code)
+	}
+	var got struct {
+		WebTransport    bool   `json:"webtransport"`
+		WebTransportURL string `json:"webtransport_url"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode capabilities: %v", err)
+	}
+	if !got.WebTransport || got.WebTransportURL != webTransportURL {
+		t.Fatalf("capabilities = %+v, want enabled URL %q", got, webTransportURL)
+	}
+}
+
 func TestOriginAllowlistIsExactAndNormalized(t *testing.T) {
 	allowlist := loadOriginAllowlist("lobby", "https://PONG.BELACCA.COM/")
 	if !allowlist.allowed("https://pong.belacca.com") {
@@ -229,6 +261,41 @@ func TestRoomTemplateHasSecurityBoundary(t *testing.T) {
 	if !strings.Contains(jsonText, `"name": "PONG_ALLOWED_ORIGINS"`) || !strings.Contains(jsonText, `"value": "https://pong.belacca.com"`) {
 		t.Fatal("room Pod template does not propagate the production PONG_ALLOWED_ORIGINS policy")
 	}
+}
+
+func TestWebTransportJSONRoundTrip(t *testing.T) {
+	var encoded bytes.Buffer
+	want := map[string]interface{}{"type": "input", "player": float64(2), "up": true}
+	if err := writeWebTransportJSON(&encoded, want); err != nil {
+		t.Fatalf("writeWebTransportJSON() error = %v", err)
+	}
+	var got map[string]interface{}
+	if err := readWebTransportJSON(&encoded, &got); err != nil {
+		t.Fatalf("readWebTransportJSON() error = %v", err)
+	}
+	if !jsonEqual(got, want) {
+		t.Fatalf("round-trip value = %#v, want %#v", got, want)
+	}
+}
+
+func TestWebTransportJSONRejectsOversizedFrame(t *testing.T) {
+	var encoded bytes.Buffer
+	var length [4]byte
+	binary.BigEndian.PutUint32(length[:], maxWebTransportMessageSize+1)
+	encoded.Write(length[:])
+	var got map[string]interface{}
+	if err := readWebTransportJSON(&encoded, &got); err == nil {
+		t.Fatal("readWebTransportJSON() accepted an oversized frame")
+	}
+	if err := writeWebTransportJSON(&encoded, bytes.Repeat([]byte{'x'}, maxWebTransportMessageSize+1)); err == nil {
+		t.Fatal("writeWebTransportJSON() accepted an oversized value")
+	}
+}
+
+func jsonEqual(left, right interface{}) bool {
+	leftJSON, leftErr := json.Marshal(left)
+	rightJSON, rightErr := json.Marshal(right)
+	return leftErr == nil && rightErr == nil && bytes.Equal(leftJSON, rightJSON)
 }
 
 func TestReadWebSocketFrame(t *testing.T) {

@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha1"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -34,6 +35,9 @@ import (
 	"github.com/cloudnativepong/telemetry"
 
 	"github.com/gorilla/websocket"
+	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/http3"
+	"github.com/quic-go/webtransport-go"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 )
@@ -44,6 +48,9 @@ var websocketOrigins = defaultOriginAllowlist("local")
 var publicAdmission = admission.NewController(admission.DefaultConfig)
 var appMetrics = metrics.NewRegistry()
 var appTelemetry = &telemetry.Provider{}
+var webTransportServer *webtransport.Server
+var webTransportEnabled bool
+var webTransportURL string
 
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool { return websocketOrigins.allowed(r.Header.Get("Origin")) },
@@ -125,6 +132,72 @@ func runHealthcheck(port string) error {
 	return nil
 }
 
+func startWebTransportServer(addr, certFile, keyFile string, mux http.Handler) (*webtransport.Server, error) {
+	if strings.TrimSpace(certFile) == "" || strings.TrimSpace(keyFile) == "" {
+		return nil, errors.New("webtransport certificate and key files are required")
+	}
+	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		return nil, fmt.Errorf("load webtransport certificate: %w", err)
+	}
+	h3Server := &http3.Server{
+		Addr:      addr,
+		Handler:   mux,
+		TLSConfig: http3.ConfigureTLSConfig(&tls.Config{Certificates: []tls.Certificate{cert}}),
+		QUICConfig: &quic.Config{
+			EnableDatagrams:                  true,
+			EnableStreamResetPartialDelivery: true,
+		},
+	}
+	webtransport.ConfigureHTTP3Server(h3Server)
+	server := &webtransport.Server{
+		H3: h3Server,
+		CheckOrigin: func(r *http.Request) bool {
+			return websocketOrigins.allowed(r.Header.Get("Origin"))
+		},
+	}
+	go func() {
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Printf("webtransport server: %v", err)
+		}
+	}()
+	return server, nil
+}
+
+const maxWebTransportMessageSize = 1 << 20
+
+func readWebTransportJSON(stream io.Reader, value interface{}) error {
+	var lengthBytes [4]byte
+	if _, err := io.ReadFull(stream, lengthBytes[:]); err != nil {
+		return err
+	}
+	length := binary.BigEndian.Uint32(lengthBytes[:])
+	if length > maxWebTransportMessageSize {
+		return fmt.Errorf("webtransport message exceeds limit")
+	}
+	payload := make([]byte, int(length))
+	if _, err := io.ReadFull(stream, payload); err != nil {
+		return err
+	}
+	return json.Unmarshal(payload, value)
+}
+
+func writeWebTransportJSON(stream io.Writer, value interface{}) error {
+	payload, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	if len(payload) > maxWebTransportMessageSize {
+		return fmt.Errorf("webtransport message exceeds limit")
+	}
+	var lengthBytes [4]byte
+	binary.BigEndian.PutUint32(lengthBytes[:], uint32(len(payload)))
+	if err := writeAll(stream, lengthBytes[:]); err != nil {
+		return err
+	}
+	return writeAll(stream, payload)
+}
+
 func main() {
 	mode := flag.String("mode", "local", "Mode: local, lobby, room")
 	port := flag.String("port", "8080", "HTTP listen port")
@@ -134,6 +207,10 @@ func main() {
 	roomImage := flag.String("room-image", "cloudnativepong-room:latest", "Room container image")
 	dbPath := flag.String("db-path", ":memory:", "SQLite database path")
 	allowedOrigins := flag.String("allowed-origins", "", "Comma-separated exact browser origins (or PONG_ALLOWED_ORIGINS)")
+	webTransportAddr := flag.String("webtransport-addr", os.Getenv("PONG_WEBTRANSPORT_ADDR"), "UDP address for native WebTransport (empty disables it)")
+	webTransportCert := flag.String("webtransport-cert-file", os.Getenv("PONG_WEBTRANSPORT_CERT_FILE"), "PEM certificate for native WebTransport")
+	webTransportKey := flag.String("webtransport-key-file", os.Getenv("PONG_WEBTRANSPORT_KEY_FILE"), "PEM private key for native WebTransport")
+	webTransportPublicURL := flag.String("webtransport-public-url", os.Getenv("PONG_WEBTRANSPORT_PUBLIC_URL"), "Public WebTransport URL template, including {room}")
 	healthcheck := flag.Bool("healthcheck", false, "Check the local health endpoint and exit")
 	flag.Parse()
 
@@ -169,17 +246,19 @@ func main() {
 	lobbySrv := lobby.NewServerWithMetrics(store, *mode, *k8sNS, *roomImage, appMetrics)
 
 	mux := http.NewServeMux()
+	webTransportMux := http.NewServeMux()
 
 	switch *mode {
 	case "local":
 		// In local mode, lobby and rooms share one process.
 		// Rooms are spawned as goroutines and addressed via path /room/{id}/ws
 		setupLocalRoutes(mux, lobbySrv, store)
+		setupLocalWebTransportRoutes(webTransportMux, lobbySrv, store)
 		go reconcileLobbyRooms(lobbySrv)
 
 	case "lobby":
 		// Lobby-only mode: serves API, delegates rooms to K8s pods.
-		// Static files are served by nginx.
+		// Static files are served by the Caddy gateway.
 		apiHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			switch {
 			case r.URL.Path == "/api/rooms":
@@ -191,6 +270,8 @@ func main() {
 					return
 				}
 				lobbySrv.HandleCreateRoom(w, r)
+			case r.URL.Path == "/api/capabilities":
+				writeJSON(w, map[string]interface{}{"webtransport": webTransportEnabled, "webtransport_url": webTransportURL})
 			case r.URL.Path == "/api/rooms/join":
 				if !publicAdmission.AllowJoin(clientKey(r)) {
 					appMetrics.Inc("pong_admission_join_rejected")
@@ -221,10 +302,13 @@ func main() {
 			}
 		})
 		go reconcileLobbyRooms(lobbySrv)
-		// WebSocket proxy: /rooms/{id}/ws -> room pod
+		// WebSocket proxy: /rooms/{id}/ws -> room pod. WebTransport uses a
+		// native UDP listener because HTTP reverse proxies do not yet proxy
+		// WebTransport sessions safely.
 		mux.HandleFunc("/rooms/", func(w http.ResponseWriter, r *http.Request) {
 			proxyRoomWS(w, r, lobbySrv, store)
 		})
+		setupLobbyWebTransportRoutes(webTransportMux, lobbySrv, store)
 
 	case "room":
 		// Room-only mode: runs a single game room.
@@ -232,6 +316,7 @@ func main() {
 			log.Fatal("--room-id is required in room mode")
 		}
 		setupRoomRoutes(mux, *roomID, *lobbyAddr)
+		setupRoomWebTransportRoutes(webTransportMux, *roomID, *lobbyAddr)
 
 	default:
 		log.Fatalf("unknown mode: %s", *mode)
@@ -255,6 +340,18 @@ func main() {
 		}
 	}()
 
+	var wtServer *webtransport.Server
+	if strings.TrimSpace(*webTransportAddr) != "" {
+		var err error
+		wtServer, err = startWebTransportServer(*webTransportAddr, *webTransportCert, *webTransportKey, webTransportMux)
+		if err != nil {
+			log.Fatalf("webtransport setup: %v", err)
+		}
+		webTransportServer = wtServer
+		webTransportURL = strings.TrimSpace(*webTransportPublicURL)
+		webTransportEnabled = webTransportURL != ""
+	}
+
 	// Graceful shutdown with timeout. A room container exits after its game
 	// finishes so the lobby can remove the completed room resources.
 	quit := make(chan os.Signal, 1)
@@ -274,6 +371,9 @@ func main() {
 	log.Println("Shutting down...")
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	if wtServer != nil {
+		_ = wtServer.Close()
+	}
 	srv.Shutdown(ctx)
 }
 
@@ -281,7 +381,7 @@ func main() {
 
 type localRoom struct {
 	engine      *game.Engine
-	players     [2]*websocket.Conn
+	players     [2]gameConnection
 	mu          sync.Mutex
 	loopOnce    sync.Once
 	done        chan struct{}
@@ -299,6 +399,9 @@ func setupLocalRoutes(mux *http.ServeMux, lobbySrv *lobby.Server, store *db.Stor
 
 	// API routes use the same admission and CORS contract as lobby mode.
 	mux.Handle("/api/rooms", publicAPIHandler(corsMiddleware(http.HandlerFunc(lobbySrv.HandleListRooms))))
+	mux.Handle("/api/capabilities", publicAPIHandler(corsMiddleware(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, map[string]interface{}{"webtransport": webTransportEnabled, "webtransport_url": webTransportURL})
+	}))))
 	mux.Handle("/api/rooms/create", publicAPIHandler(corsMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !publicAdmission.AllowCreate(clientKey(r)) {
 			appMetrics.Inc("pong_admission_create_rejected")
@@ -409,7 +512,7 @@ func setupLocalRoutes(mux *http.ServeMux, lobbySrv *lobby.Server, store *db.Stor
 		handleRoomWS(w, r, parts[1], "")
 	})
 
-	// Static files (local mode only — served by nginx in K8s)
+	// Static files (local mode only — served by Caddy in K8s)
 	mux.Handle("/", http.FileServer(http.Dir("./static")))
 }
 
@@ -419,6 +522,71 @@ func setupRoomRoutes(mux *http.ServeMux, roomID, lobbyAddr string) {
 	})
 	mux.HandleFunc("/health", healthHandler)
 	mux.Handle("/metrics", appMetrics.Handler())
+}
+
+type gameConnection interface {
+	ReadJSON(value interface{}) error
+	WriteJSON(value interface{}) error
+	Close() error
+}
+
+type webSocketGameConnection struct{ conn *websocket.Conn }
+
+func (c webSocketGameConnection) ReadJSON(value interface{}) error  { return c.conn.ReadJSON(value) }
+func (c webSocketGameConnection) WriteJSON(value interface{}) error { return c.conn.WriteJSON(value) }
+func (c webSocketGameConnection) Close() error                      { return c.conn.Close() }
+
+func setupLocalWebTransportRoutes(mux *http.ServeMux, _ *lobby.Server, _ *db.Store) {
+	mux.HandleFunc("/rooms/", func(w http.ResponseWriter, r *http.Request) {
+		parts := splitPath(r.URL.Path)
+		if len(parts) != 3 || parts[2] != "wt" {
+			http.NotFound(w, r)
+			return
+		}
+		session, err := webTransportServer.Upgrade(w, r)
+		if err != nil {
+			appMetrics.Inc("pong_webtransport_upgrade_failure")
+			http.Error(w, "webtransport unavailable", http.StatusBadRequest)
+			return
+		}
+		appMetrics.Inc("pong_webtransport_upgrade_success")
+		go handleRoomWebTransport(session, r, parts[1], "")
+	})
+}
+
+func setupLobbyWebTransportRoutes(mux *http.ServeMux, lobbySrv *lobby.Server, store *db.Store) {
+	mux.HandleFunc("/rooms/", func(w http.ResponseWriter, r *http.Request) {
+		parts := splitPath(r.URL.Path)
+		if len(parts) != 3 || parts[2] != "wt" {
+			http.NotFound(w, r)
+			return
+		}
+		session, err := webTransportServer.Upgrade(w, r)
+		if err != nil {
+			appMetrics.Inc("pong_webtransport_upgrade_failure")
+			http.Error(w, "webtransport unavailable", http.StatusBadRequest)
+			return
+		}
+		appMetrics.Inc("pong_webtransport_upgrade_success")
+		go proxyRoomWebTransport(session, r, parts[1], lobbySrv, store)
+	})
+}
+
+func setupRoomWebTransportRoutes(mux *http.ServeMux, roomID, lobbyAddr string) {
+	mux.HandleFunc("/rooms/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/rooms/"+roomID+"/wt" {
+			http.NotFound(w, r)
+			return
+		}
+		session, err := webTransportServer.Upgrade(w, r)
+		if err != nil {
+			appMetrics.Inc("pong_webtransport_upgrade_failure")
+			http.Error(w, "webtransport unavailable", http.StatusBadRequest)
+			return
+		}
+		appMetrics.Inc("pong_webtransport_upgrade_success")
+		go handleRoomWebTransport(session, r, roomID, lobbyAddr)
+	})
 }
 
 func handleRoomWS(w http.ResponseWriter, r *http.Request, roomID, lobbyAddr string) {
@@ -440,16 +608,54 @@ func handleRoomWS(w http.ResponseWriter, r *http.Request, roomID, lobbyAddr stri
 		return
 	}
 	appMetrics.Inc("pong_websocket_upgrade_success")
-	appMetrics.Inc("pong_websocket_accepted")
-	appMetrics.AddGauge("pong_websockets_active", 1)
-	defer appMetrics.AddGauge("pong_websockets_active", -1)
-	defer conn.Close()
 	enableTCPNoDelay(conn.UnderlyingConn())
+	handleGameConnection(webSocketGameConnection{conn: conn}, r, roomID, lobbyAddr, "websocket")
+}
 
-	// Get or create the local room
+type webTransportGameConnection struct {
+	stream  *webtransport.Stream
+	writeMu sync.Mutex
+}
+
+func (c *webTransportGameConnection) ReadJSON(value interface{}) error {
+	return readWebTransportJSON(c.stream, value)
+}
+
+func (c *webTransportGameConnection) WriteJSON(value interface{}) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	return writeWebTransportJSON(c.stream, value)
+}
+
+func (c *webTransportGameConnection) Close() error { return c.stream.Close() }
+
+func handleRoomWebTransport(session *webtransport.Session, r *http.Request, roomID, lobbyAddr string) {
+	defer session.CloseWithError(0, "")
+	if !lobby.ValidRoomID(roomID) || !websocketOrigins.allowed(r.Header.Get("Origin")) {
+		_ = session.CloseWithError(0, "origin or room not allowed")
+		return
+	}
+	release, ok := publicAdmission.AcquireWebSocket(clientKey(r))
+	if !ok {
+		_ = session.CloseWithError(0, "too many sessions")
+		return
+	}
+	defer release()
+	stream, err := session.AcceptStream(session.Context())
+	if err != nil {
+		_ = session.CloseWithError(0, "stream unavailable")
+		return
+	}
+	handleGameConnection(&webTransportGameConnection{stream: stream}, r, roomID, lobbyAddr, "webtransport")
+}
+
+func handleGameConnection(conn gameConnection, r *http.Request, roomID, lobbyAddr, transport string) {
+	appMetrics.Inc("pong_" + transport + "_accepted")
+	appMetrics.AddGauge("pong_"+transport+"s_active", 1)
+	defer appMetrics.AddGauge("pong_"+transport+"s_active", -1)
+	defer conn.Close()
+
 	room := getOrCreateLocalRoom(roomID)
-
-	// Assign player slot
 	room.mu.Lock()
 	var player int
 	if room.players[0] == nil {
@@ -460,26 +666,19 @@ func handleRoomWS(w http.ResponseWriter, r *http.Request, roomID, lobbyAddr stri
 		room.players[1] = conn
 	} else {
 		room.mu.Unlock()
-		appMetrics.Inc("pong_websocket_room_full")
+		appMetrics.Inc("pong_" + transport + "_room_full")
 		_ = conn.WriteJSON(map[string]string{"type": "error", "message": "room full"})
 		return
 	}
 	room.mu.Unlock()
-	appMetrics.Inc("pong_websocket_player_assigned")
+	appMetrics.Inc("pong_" + transport + "_player_assigned")
 
-	// Notify player of their assignment.
-	if err := conn.WriteJSON(map[string]interface{}{
-		"type":   "joined",
-		"player": player,
-	}); err != nil {
-		appMetrics.Inc("pong_websocket_joined_write_failure")
+	if err := conn.WriteJSON(map[string]interface{}{"type": "joined", "player": player}); err != nil {
+		appMetrics.Inc("pong_" + transport + "_joined_write_failure")
 		room.signalFinished()
 		return
 	}
-	appMetrics.Inc("pong_websocket_joined_write_success")
-
-	// Mark ready. The lobby's playing transition is deliberately based on
-	// actual WebSocket connections, not only on API reservations.
+	appMetrics.Inc("pong_" + transport + "_joined_write_success")
 	room.engine.PlayerReady(player)
 	if player == 2 {
 		room.mu.Lock()
@@ -494,30 +693,25 @@ func handleRoomWS(w http.ResponseWriter, r *http.Request, roomID, lobbyAddr stri
 			startErr = notifyRoomStartedContext(r.Context(), roomID, lobbyAddr, requestID(r))
 		}
 		if startErr != nil {
-			// Do not leave a live game in waiting state: reconciliation would
-			// eventually expire it as an abandoned room.
 			room.signalFinished()
 			return
 		}
 	}
 
-	// Read loop: handle input from this player
 	go func() {
 		for {
 			var input game.Input
-			err := conn.ReadJSON(&input)
-			if err != nil {
-				appMetrics.Inc("pong_websocket_disconnect")
+			if err := conn.ReadJSON(&input); err != nil {
+				appMetrics.Inc("pong_" + transport + "_disconnect")
 				room.engine.PlayerLeft(player)
 				room.signalFinished()
-				// Close the other player's connection
 				room.mu.Lock()
 				other := 0
 				if player == 1 {
 					other = 1
 				}
 				if room.players[other] != nil {
-					room.players[other].Close()
+					_ = room.players[other].Close()
 				}
 				room.mu.Unlock()
 				return
@@ -527,31 +721,18 @@ func handleRoomWS(w http.ResponseWriter, r *http.Request, roomID, lobbyAddr stri
 		}
 	}()
 
-	// Start the loop once for every room so a single-player disconnect can
-	// also terminate an abandoned room. PlayerReady above starts the engine
-	// when the second actual WebSocket has connected.
 	room.loopOnce.Do(func() { go runGameLoop(room) })
-
-	// Keep connection alive (read loop above will exit on disconnect)
-	// This goroutine writes game state to the client
 	ticker := time.NewTicker(game.TickDuration)
 	defer ticker.Stop()
-
 	for range ticker.C {
 		state := room.engine.State()
-		err := conn.WriteJSON(map[string]interface{}{
-			"type":  "state",
-			"state": state,
-		})
-		if err != nil {
-			appMetrics.Inc("pong_websocket_state_write_failure")
+		if err := conn.WriteJSON(map[string]interface{}{"type": "state", "state": state}); err != nil {
+			appMetrics.Inc("pong_" + transport + "_state_write_failure")
 			room.signalFinished()
 			return
 		}
-		appMetrics.Inc("pong_websocket_state_write_success")
+		appMetrics.Inc("pong_" + transport + "_state_write_success")
 		if state.Status == game.StatusFinished {
-			// Send final state and close. The room-mode process also watches the
-			// room completion signal and reports it to the lobby.
 			appMetrics.Inc("pong_room_finished")
 			room.signalFinished()
 			time.Sleep(3 * time.Second)
@@ -741,7 +922,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func clientKey(r *http.Request) string {
-	// NGINX overwrites X-Real-IP with the peer address. Do not trust the first
+	// Caddy overwrites X-Real-IP with the peer address. Do not trust the first
 	// X-Forwarded-For value: a public caller can supply that header themselves.
 	// Never log or export this key; it exists only in ephemeral limiter state.
 	if realIP := strings.TrimSpace(r.Header.Get("X-Real-IP")); realIP != "" {
@@ -952,18 +1133,124 @@ func requestMetrics(next http.Handler) http.Handler {
 	})
 }
 
+func proxyRoomWebTransport(session *webtransport.Session, r *http.Request, roomID string, lobbySrv *lobby.Server, _ *db.Store) {
+	defer session.CloseWithError(0, "")
+	if !lobby.ValidRoomID(roomID) || !websocketOrigins.allowed(r.Header.Get("Origin")) {
+		_ = session.CloseWithError(0, "origin or room not allowed")
+		return
+	}
+	release, ok := publicAdmission.AcquireWebSocket(clientKey(r))
+	if !ok {
+		_ = session.CloseWithError(0, "too many sessions")
+		return
+	}
+	defer release()
+	appMetrics.Inc("pong_webtransport_proxy_accepted")
+	appMetrics.AddGauge("pong_webtransports_active", 1)
+	defer appMetrics.AddGauge("pong_webtransports_active", -1)
+
+	addr, err := lobbySrv.GetRoomAddr(roomID)
+	if err != nil {
+		appMetrics.Inc("pong_webtransport_proxy_room_not_found")
+		_ = session.CloseWithError(0, "room not found")
+		return
+	}
+
+	dialer := websocket.Dialer{
+		HandshakeTimeout: 2 * time.Second,
+		NetDialContext:   (&net.Dialer{Timeout: 2 * time.Second}).DialContext,
+	}
+	targetHeader := http.Header{}
+	if origin := websocketOrigins.first(); origin != "" {
+		targetHeader.Set("Origin", origin)
+	}
+	targetHeader.Set(requestIDHeader, requestID(r))
+	targetHeader.Set(correlationIDHeader, requestID(r))
+	telemetry.Inject(r.Context(), targetHeader)
+	var target *websocket.Conn
+	for i := 0; i < 10; i++ {
+		target, _, err = dialer.Dial("ws://"+addr+"/ws", targetHeader)
+		if err == nil {
+			break
+		}
+		appMetrics.Inc("pong_webtransport_proxy_dial_retry")
+		time.Sleep(500 * time.Millisecond)
+	}
+	if err != nil {
+		appMetrics.Inc("pong_webtransport_proxy_dial_failure")
+		_ = session.CloseWithError(0, "room unavailable")
+		return
+	}
+	defer target.Close()
+	target.SetReadLimit(maxProxyMessageSize)
+	appMetrics.Inc("pong_webtransport_proxy_dial_success")
+
+	stream, err := session.AcceptStream(session.Context())
+	if err != nil {
+		_ = session.CloseWithError(0, "stream unavailable")
+		return
+	}
+	var writeMu sync.Mutex
+	writeBrowser := func(value interface{}) error {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		return writeWebTransportJSON(stream, value)
+	}
+
+	errCh := make(chan error, 2)
+	go func() {
+		for {
+			var value json.RawMessage
+			if err := readWebTransportJSON(stream, &value); err != nil {
+				errCh <- err
+				return
+			}
+			if bytes.Equal(value, []byte(proxyReadyMessage)) {
+				continue
+			}
+			var input interface{}
+			if err := json.Unmarshal(value, &input); err != nil {
+				errCh <- err
+				return
+			}
+			if err := target.WriteJSON(input); err != nil {
+				errCh <- err
+				return
+			}
+		}
+	}()
+	go func() {
+		for {
+			messageType, payload, err := target.ReadMessage()
+			if err != nil {
+				errCh <- err
+				return
+			}
+			if messageType != websocket.TextMessage && messageType != websocket.BinaryMessage {
+				continue
+			}
+			if err := writeBrowser(json.RawMessage(payload)); err != nil {
+				errCh <- err
+				return
+			}
+		}
+	}()
+	<-errCh
+	appMetrics.Inc("pong_webtransport_proxy_closed")
+}
+
 // ---- WebSocket Proxy (lobby mode) ----
 
-// proxyRoomWS relays WebSocket traffic between the client (via NGINX) and a
+// proxyRoomWS relays WebSocket traffic between the client (via Caddy) and a
 // dynamically created room pod.
 //
 // Architecture:
 //
-//	Browser --WS--> NGINX --HTTP+Upgrade--> Lobby (hijack) --WS--> Room Pod
+//	Browser --WS--> Caddy --HTTP+Upgrade--> Lobby (hijack) --WS--> Room Pod
 //
-// NGINX forwards the WebSocket upgrade request to the lobby. The lobby
+// Caddy forwards the WebSocket upgrade request to the lobby. The lobby
 // hijacks the raw client connection, sends back the 101 Switching Protocols
-// response so NGINX enters tunnel mode, then opens a proper WebSocket
+// response so Caddy enters tunnel mode, then opens a proper WebSocket
 // connection to the room pod and relays validated frames between the two.
 func proxyRoomWS(w http.ResponseWriter, r *http.Request, lobbySrv *lobby.Server, store *db.Store) {
 	parts := splitPath(r.URL.Path)
@@ -1006,7 +1293,7 @@ func proxyRoomWS(w http.ResponseWriter, r *http.Request, lobbySrv *lobby.Server,
 		return
 	}
 
-	// ── Step 1: hijack the client connection (from NGINX) ──────────
+	// ── Step 1: hijack the client connection (from Caddy) ──────────
 	hj, ok := w.(http.Hijacker)
 	if !ok {
 		appMetrics.Inc("pong_websocket_proxy_hijack_failure")
@@ -1069,7 +1356,7 @@ func proxyRoomWS(w http.ResponseWriter, r *http.Request, lobbySrv *lobby.Server,
 		return
 	}
 
-	// NGINX starts its tunnel copier after it receives the flushed 101. The
+	// Caddy starts its tunnel copier after it receives the flushed 101. The
 	// browser sends proxyReadyMessage from WebSocket.onopen; hold all target
 	// frames until that post-upgrade client frame arrives. A timeout keeps raw
 	// WebSocket clients that do not send an application frame working.

@@ -1,0 +1,39 @@
+# Cloud Native Pong gateway.
+# Caddy owns HTTP routing and WebSocket upgrades. Native WebTransport is
+# terminated by the Go lobby because Caddy's standard reverse_proxy does not
+# proxy WebTransport sessions/QUIC streams.
+{
+    admin off
+    auto_https off
+}
+
+:8080 {
+    log {
+        output stdout
+        format json
+    }
+
+    @health path /health
+    handle @health {
+        respond "ok" 200
+    }
+
+    # The API handles REST, WebSocket upgrade requests, and the optional
+    # WebTransport capability endpoint. Caddy forwards Upgrade/Connection
+    # automatically for WebSocket requests.
+    handle /api/* {
+        reverse_proxy pong-api.pong.svc.cluster.local:8080
+    }
+    handle /rooms/* {
+        reverse_proxy pong-api.pong.svc.cluster.local:8080 {
+            flush_interval -1
+            stream_timeout 1h
+            stream_close_delay 5s
+        }
+    }
+
+    # Static frontend assets.
+    handle {
+        reverse_proxy pong-static.pong.svc.cluster.local:80
+    }
+}

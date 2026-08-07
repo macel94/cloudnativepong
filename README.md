@@ -6,7 +6,7 @@ A minimalist, horizontally-scalable PONG game running on Kubernetes. Each game r
 
 - **Zero-auth** — Just pick a name and play. No accounts, no passwords.
 - **1 room = 1 pod** — Every game room runs in its own isolated pod. Scale infinitely.
-- **Blazing fast** — Go binary (~6 MB), `scratch` container image, sub-millisecond WebSocket messages.
+- **Blazing fast** — Go binary (~6 MB), distroless runtime image, and low-latency WebTransport with a WebSocket fallback.
 - **Embedded SQLite** — Pure Go, CGO-free, no external database needed.
 - **Self-cleaning** — Rooms auto-terminate when the game ends. No orphaned pods.
 - **Multi-service** — Gateway, static, API, room: each scales independently.
@@ -17,14 +17,14 @@ A minimalist, horizontally-scalable PONG game running on Kubernetes. Each game r
 
 ```
                      ┌──────────────┐
-                     │   Gateway    │  (NGINX, 1 replica, NodePort)
+                     │   Gateway    │  (Caddy, 1 replica, NodePort)
                      │   :80        │
                      └──────┬───────┘
         ┌───────────────────┼───────────────────┐
         ▼                   ▼                   ▼
  ┌──────────┐     ┌──────────────┐     ┌──────────────┐
  │  Static   │     │   API/Lobby  │     │  Room Pods   │
- │ (nginx)  │     │  (Go, 1 rep) │     │ (Go, dynamic)│
+ │ (Caddy)  │     │  (Go, 1 rep) │     │ (Go, dynamic)│
  │  /        │     │  /api/*      │     │  /rooms/*    │
  └──────────┘     └──────┬───────┘     └──────────────┘
                          │ SQLite (PVC)
@@ -35,9 +35,9 @@ A minimalist, horizontally-scalable PONG game running on Kubernetes. Each game r
 
 | Component | Image | Replicas | Purpose |
 |-----------|-------|----------|---------|
-| **Gateway** | `cloudnativepong-gateway` | 2 production / 1 local | NGINX entry point, routes by path |
-| **Static** | `cloudnativepong-static` | 2 production / 1 local | Serves HTML, CSS, JS via nginx |
-| **API** | `cloudnativepong-api` | 1 | Room CRUD, K8s pod orchestration, WebSocket proxy |
+| **Gateway** | `cloudnativepong-gateway` | 2 production / 1 local | Caddy HTTP entry point, routes by path |
+| **Static** | `cloudnativepong-static` | 2 production / 1 local | Serves HTML, CSS, JS via Caddy |
+| **API** | `cloudnativepong-api` | 1 | Room CRUD, K8s pod orchestration, WebSocket-compatible proxy, optional WebTransport endpoint |
 | **Room** | `cloudnativepong-room` | N (dynamic) | One pod per game, runs PONG engine |
 
 ### Routing
@@ -45,7 +45,8 @@ A minimalist, horizontally-scalable PONG game running on Kubernetes. Each game r
 ```
 /              → Static (index.html)
 /api/*         → API (room management)
-/rooms/{id}/ws → API (proxies to room pod WebSocket)
+/rooms/{id}/ws → API (WebSocket-compatible fallback, proxies to room pod WebSocket)
+/rooms/{id}/wt → API (optional native WebTransport, bridges to room pod WebSocket)
 ```
 
 ## 🚀 Quick Start
@@ -116,7 +117,9 @@ The portfolio aliases `belacca.com`, `www.belacca.com`, and
 `https://francesco.belacca.com/`. The complete platform site inventory is in
 [`macel94/belacca-gitops/docs/SITES.md`](https://github.com/macel94/belacca-gitops/blob/main/docs/SITES.md).
 Open the Pong subdomain, enter a display name, and create or join a room.
-Browser WebSocket connections are served over TLS. Let's Encrypt certificates
+Browser WebSocket-compatible connections are served over TLS. The browser checks
+`/api/capabilities` and only uses native WebTransport when a reviewed UDP
+listener is advertised; otherwise WebSockets remain the default. Let's Encrypt certificates
 are issued and renewed automatically by Traefik, with certificate state stored
 in the `kube-system/traefik-acme` PVC.
 
@@ -144,7 +147,7 @@ flowchart TB
     publicLB["k3d load balancer\n80/18080 → Traefik HTTP\n443 → Traefik HTTPS\n18083 → NodePort :30080\n45371 → Kubernetes API"]
     publicCluster["Persistent k3d cluster: pong\nContext: k3d-pong\n1 server + 2 agents"]
     traefik["Traefik Ingress\nweb entrypoint"]
-    gateway["pong-gateway\nNGINX"]
+    gateway["pong-gateway\nCaddy"]
     app["pong namespace\nstatic + api + dynamic room Pods"]
     flux["flux-system\nFlux v2 GitOps"]
     git[("GitHub main\nsource of truth")]
@@ -374,7 +377,7 @@ up only its exact `pong-restore-*` cluster unless `--keep-cluster` is used.
 The source file is never modified. The script uses SQLite's online backup API
 when given a readable database and runs `PRAGMA integrity_check` on source,
 backup, and restored databases. Because
-the scratch API image contains no SQLite CLI, obtaining a copy from the live
+the distroless API image contains no SQLite CLI, obtaining a copy from the live
 PVC requires an operator-controlled maintenance window (see `DEPLOYMENT.md`).
 Do not delete/recreate the cluster or PVC, and do not run restore against
 `/data/pong.db` in place. A stronger rehearsal uses a separate disposable k3d
@@ -413,17 +416,17 @@ badge links to the full GitHub commit, and `/build-info.js` is served with
 `Cache-Control: no-store` so a rollout cannot leave the visible release marker
 stale in the browser.
 
-## 🔌 WebSocket Proxy Design
+## 🔌 Real-time transport design
 
-Kubernetes traffic enters through the NGINX gateway. It routes REST requests to the Go lobby, static assets to the static service, and `/rooms/{id}/ws` to the lobby's room proxy. The lobby then opens a second WebSocket connection to the dynamically created room pod.
+Kubernetes HTTP traffic enters through the Caddy gateway. It routes REST requests to the Go lobby, static assets to the static service, and `/rooms/{id}/ws` to the lobby's compatibility WebSocket proxy. When the optional native UDP listener is enabled, the browser instead uses `/rooms/{id}/wt` over WebTransport and the Go lobby bridges that session to the dynamically created room pod.
 
 The lobby keeps the browser-facing HTTP connection hijacked because the gateway must receive the lobby's `101 Switching Protocols` response before it can enter WebSocket tunnel mode. The room-side connection uses `gorilla/websocket`, rather than copying the underlying TCP socket, so bytes buffered during the room handshake and WebSocket control frames are preserved.
 
-Room capacity reservations and actual connections are separate lifecycle events: creating a room reserves the creator's slot, `/api/rooms/join` reserves the opponent's slot, and the room Pod calls the internal `started` callback only after both WebSockets are accepted. A disconnect or game completion calls the `finished` callback, while a waiting room that never starts expires after 10 minutes. The lobby reconciles these waiting rooms every minute. The internal callbacks are reachable through the API ClusterIP only, not through the public gateway.
+Room capacity reservations and actual connections are separate lifecycle events: creating a room reserves the creator's slot, `/api/rooms/join` reserves the opponent's slot, and the room Pod calls the internal `started` callback only after both room-side WebSocket connections are accepted. A public WebTransport session is bridged to that same room-side contract. A disconnect or game completion calls the `finished` callback, while a waiting room that never starts expires after 10 minutes. The lobby reconciles these waiting rooms every minute. The internal callbacks are reachable through the API ClusterIP only, not through the public gateway.
 
 The browser sends a small `{"type":"proxy-ready"}` message immediately after `WebSocket.onopen`. The lobby consumes that marker, releases the first room-to-browser frames only after the outer gateway handoff, and forwards all subsequent application messages. The browser-to-room relay validates masked client frames, reassembles fragmented messages, handles control frames, and enforces a 16 MiB message limit. The marker is harmless in local mode, where the browser connects directly to the in-process room handler.
 
-NGINX's `/rooms/` location explicitly enables HTTP/1.1 upgrade headers, disables request/response buffering, and uses one-hour WebSocket timeouts. See `gateway/nginx.conf` and `main.go` for the two sides of the handoff.
+Caddy's `/rooms/` reverse proxy streams WebSocket upgrades with a one-hour timeout. The browser first checks `/api/capabilities`; if a public WebTransport URL is advertised and the browser supports `WebTransport`, it opens a reliable bidirectional stream with length-prefixed JSON messages. Otherwise it uses the existing WebSocket route. WebTransport is opt-in through `PONG_WEBTRANSPORT_ADDR`, certificate/key paths, and `PONG_WEBTRANSPORT_PUBLIC_URL`; the current Traefik HTTP Ingress does not expose UDP, so the default deployment remains WebSocket-compatible.
 
 ## 📈 Application observability and reliability contract
 
@@ -475,7 +478,7 @@ checks remain in `scripts/synthetic-check.sh`.
 - The local Chromium suite passes 14/14, including build metadata, computer play, and online two-player play.
 - Dedicated Pixel 7 and iPhone 13/WebKit touch emulation cover responsive layout, touch controls, and actual paddle movement.
 - The production-style static image build was verified with a full source SHA, full commit URL, and `Cache-Control: no-store` metadata response.
-- Isolated Chromium checks through the NGINX k3d gateway pass, including two-player joining.
+- Isolated Chromium checks through the Caddy k3d gateway pass, including two-player joining.
 - The full k3d suite passes 12/12 when host traffic is mapped to the gateway NodePort with `8080:30080@agent:0`. The earlier intermittent 11/12 result came from using the cluster's port-80 ingress path or an unstable `kubectl port-forward`, not from a reproducible room/proxy failure.
 
 ## 📁 Project Structure
@@ -489,16 +492,16 @@ checks remain in `scripts/synthetic-check.sh`.
 ├── db/                  # SQLite database layer
 ├── static/              # Frontend (HTML, CSS, vanilla JS)
 │   ├── build-info.js     # Compile-time source SHA marker
-│   └── nginx.conf        # nginx config for static pod
+│   └── Caddyfile         # Caddy config for static pod
 ├── gateway/             # Gateway config
-│   └── nginx.conf       # NGINX routing and WebSocket upgrade rules
+│   └── Caddyfile         # Caddy routing and WebSocket upgrade rules
 ├── k8s/                 # Kubernetes manifests
 │   └── all.yaml         # All resources: gateway, static, api, RBAC, ConfigMap
 ├── tests/               # Playwright E2E tests
-├── Dockerfile.api       # Go binary → scratch (lobby mode)
-├── Dockerfile.room      # Go binary → scratch (room mode)
-├── Dockerfile.static    # nginx:alpine + static files
-├── Dockerfile.gateway   # nginx:alpine + gateway/nginx.conf
+├── Dockerfile.api       # Go binary → distroless (lobby mode)
+├── Dockerfile.room      # Go binary → distroless (room mode)
+├── Dockerfile.static    # Caddy + static files
+├── Dockerfile.gateway   # Caddy HTTP gateway
 ├── HANDOFF.md           # Current implementation state and next steps
 └── README.md
 ```
@@ -509,10 +512,11 @@ checks remain in `scripts/synthetic-check.sh`.
 | -------------- | ----------------------------- | ---------------------------------------- |
 | Language       | Go 1.25+                      | Single binary, no runtime, tiny images   |
 | Database       | SQLite (modernc.org/sqlite)   | Pure Go, embedded, zero ops              |
-| WebSocket      | gorilla/websocket             | Battle-tested, minimal API               |
-| Gateway        | NGINX                         | Kubernetes-friendly HTTP/WebSocket proxy |
-| Static Server  | nginx:alpine                  | Battle-tested, tiny footprint            |
-| Container      | `scratch` (Go), `alpine` (others) | Smallest possible images              |
+| WebSocket fallback | gorilla/websocket          | Compatibility path for browsers/ingresses without WebTransport |
+| WebTransport   | quic-go/webtransport-go       | Native HTTP/3 reliable streams and datagrams |
+| Gateway        | Caddy 2.10                    | HTTP routing and WebSocket proxy          |
+| Static Server  | Caddy 2.10                    | Small static image with gzip              |
+| Container      | distroless (Go), Caddy alpine | Minimal runtime attack surface            |
 | Frontend       | Vanilla JS + Canvas           | No framework, instant load               |
 | E2E Testing    | Playwright + TypeScript       | Reliable, cross-browser                  |
 | Local K8s      | k3d                           | Lightweight, fast startup (~10s)         |

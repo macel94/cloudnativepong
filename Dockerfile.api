@@ -1,5 +1,5 @@
 # ── Cloud Native Pong — API / Lobby Server ─────────────────────────
-# Multi-stage build: Go binary from golang:1.26-alpine → scratch.
+# Multi-stage build: Go binary from golang:1.26-alpine → distroless.
 # Runs in --mode=lobby to serve the API and WebSocket endpoints.
 #
 # Build:
@@ -31,11 +31,11 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
     go build -ldflags="-s -w" -o /pong .
 
 # ── Final Stage ────────────────────────────────────────────────────
-FROM scratch
+FROM gcr.io/distroless/static-debian13:nonroot@sha256:23795be0fe67b7d47d1ee62b19c7db750152db627d5bbfa31307e892a7575bec
 
 # Metadata labels
 LABEL org.opencontainers.image.title="Cloud Native Pong — API / Lobby" \
-      org.opencontainers.image.description="Pong lobby API server: room management, K8s pod orchestration, WebSocket routing" \
+      org.opencontainers.image.description="Pong lobby API server: room management, K8s pod orchestration, WebSocket compatibility and WebTransport routing" \
       org.opencontainers.image.version="1.0.0" \
       org.opencontainers.image.created="2025-07-30T00:00:00Z" \
       org.opencontainers.image.source="https://github.com/cloudnativepong/cloudnativepong" \
@@ -44,13 +44,11 @@ LABEL org.opencontainers.image.title="Cloud Native Pong — API / Lobby" \
       org.opencontainers.image.licenses="MIT" \
       org.opencontainers.image.ref.name="latest"
 
-# Timezone data for proper log timestamps
+# Keep the small distroless runtime, and copy the exact CA/timezone data used
+# by the builder so Kubernetes API/TLS calls and log timestamps are stable.
 COPY --from=builder /usr/share/zoneinfo /usr/share/zoneinfo
-
-# CA certs for K8s API calls
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
-
-# Static files (served by nginx in production, but included for standalone use)
+# Static files (served by Caddy in production, but included for standalone use)
 COPY static/ /static/
 
 # Binary
