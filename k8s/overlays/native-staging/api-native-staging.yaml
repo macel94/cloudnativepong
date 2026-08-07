@@ -1,0 +1,22 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pong-api
+  namespace: pong
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  template:
+    spec:
+      containers:
+        - name: api
+          imagePullPolicy: Always
+          args:
+            - --mode=lobby
+            - --namespace=pong
+            - --room-image=ghcr.io/macel94/cloudnativepong-room:sha-32b6f6af7a00a72950b182439b99847d721bb871
+            - --db-path=/data/pong.db
+          env:
+            - name: PONG_ALLOWED_ORIGINS
+              value: http://localhost:8080

@@ -1,18 +1,34 @@
 # Cloud Native Pong server deployment
 
-This repository contains both the application and its GitOps deployment for the
-experimental server named `vmi3474918`. The static frontend image injects the
-full source commit SHA at build time; the lobby and game pages display a
-clickable `sha-<short-sha>` badge linking to that exact GitHub commit. The
-metadata asset is served with `Cache-Control: no-store` so the visible marker
-tracks the deployed static image rather than a stale browser cache. Platform-level failure drills and rollback commands are
+This repository contains the Pong application. Its production workloads are
+an independently reconciled child source of the platform
+`macel94/belacca-gitops` repository, which owns the old-production Flux root.
+The current operational state is deliberately split:
+
+- **Public production:** the old `k3d-pong` cluster on `vmi3474918` / public
+  `169.58.97.73` remains the only player-facing environment. It uses the old
+  Traefik ACME setup and the k3s `local-path` storage provisioner.
+- **Native staging:** `belacca-production` is staging only. Native Traefik is
+  staged on `.41` and `.42`, but there is no Pong workload, public Pong route,
+  or Pong database/PVC data there yet.
+- **CI and restore:** GitHub Actions and the guarded restore rehearsal use
+  disposable k3d clusters only; neither is a production or staging target.
+
+The static frontend image injects the full source commit SHA at build time; the
+lobby and game pages display a clickable `sha-<short-sha>` badge linking to that
+exact GitHub commit. The metadata asset is served with `Cache-Control: no-store`
+so the visible marker tracks the deployed static image rather than a stale
+browser cache. Platform-level failure drills and rollback commands are
 maintained in the [GitOps game-day runbook](https://github.com/macel94/belacca-gitops/blob/main/docs/GAME-DAY-DRILLS.md);
 the backup/object-storage contract is in the [GitOps backup contract](https://github.com/macel94/belacca-gitops/blob/main/docs/BACKUP-CONTRACT.md).
 
 ## Runtime model
 
-- `pong-api` runs as one replica because it owns the SQLite database.
-- The database is persisted at `/data/pong.db` on the `pong-api-data` PVC.
+- `pong-api` runs as one replica because it owns the SQLite database and is the
+  single writer.
+- The database is persisted at `/data/pong.db` on the `pong-api-data` PVC. In
+  current public production that claim is backed by `local-path`; native
+  staging must use a reviewed Longhorn-backed claim before it can hold data.
 - `pong-gateway` and `pong-static` start with two replicas and can scale to four
   using the Kubernetes metrics-server.
 - Every room is a separate Pod named `pong-room-<room-id>` and a matching
@@ -48,30 +64,37 @@ repository as an independent child source:
 - Application reconciliation interval: 10 minutes (force it for immediate validation with `flux reconcile kustomization pong -n flux-system --with-source`)
 
 The Flux controllers are `source-controller`, `kustomize-controller`,
-`helm-controller`, and `notification-controller`. The generated Flux
-bootstrap manifests live under `clusters/vmi3474918/flux-system` and should be
-changed only through the documented Flux upgrade/bootstrap process.
+`helm-controller`, and `notification-controller`. The platform repository owns
+the generated Flux bootstrap manifests and old-production root; change them
+only through the documented Flux upgrade/bootstrap process.
 
-Traefik is the existing k3s ingress controller in `kube-system`. The
+Traefik in the legacy `k3d-pong` cluster is the current public ingress. The
 cluster-level platform repository owns the host-based Pong Ingress for
 `pong.belacca.com`, using class `traefik` and the `web,websecure` entrypoints.
 It forwards all paths to `pong-gateway`; Caddy in that gateway handles static
 routing, API calls, and WebSocket upgrades. Native WebTransport is implemented
 in the Go API but is opt-in and terminates on a separate UDP listener because
 the current Traefik HTTP ingress does not expose UDP or proxy WebTransport
-sessions. The k3d load balancer maps:
+sessions. The legacy k3d load balancer maps:
 
-- Host `80` and `18080` → Traefik HTTP port 80
-- Host `443` → Traefik HTTPS port 443
-- Host `18083` → the legacy Pong NodePort 30080
+- Host `80` and `18080` → legacy Traefik HTTP port 80
+- Host `443` → legacy Traefik HTTPS port 443
+- Host `18083` → legacy Pong NodePort 30080
 - Host `45371` → the Kubernetes API
 
-The GitOps ingress is the intended application path. The room Pod callbacks at
-`/internal/rooms/<id>/started` and `/internal/rooms/<id>/finished` are only
-reachable through the `pong-api` ClusterIP Service; the gateway does not route
-that path publicly. Callback requests carry only the opaque correlation headers;
-callback retries are bounded, and a failed start callback closes the room path
-so reconciliation can clean it rather than leaving a half-started game.
+The GitOps ingress is the current public application path. The room Pod
+callbacks at `/internal/rooms/<id>/started` and `/internal/rooms/<id>/finished`
+are only reachable through the `pong-api` ClusterIP Service; the gateway does
+not route that path publicly. Callback requests carry only the opaque
+correlation headers; callback retries are bounded, and a failed start callback
+closes the room path so reconciliation can clean it rather than leaving a
+half-started game.
+
+Native Traefik is staged only on `.41` and `.42`. It is not the public ingress,
+and no native Pong Ingress, service route, workload, or database exists yet.
+Before cutover, the platform repository must define and validate the native
+`pong.belacca.com` route, TLS entrypoints, health checks, and rollback route.
+Do not move DNS or public traffic merely because native Traefik is installed.
 
 The canonical platform site inventory is maintained in
 [`macel94/belacca-gitops/docs/SITES.md`](https://github.com/macel94/belacca-gitops/blob/main/docs/SITES.md).
@@ -80,33 +103,55 @@ personal site is `https://francesco.belacca.com/`; and
 `belacca.com`, `www.belacca.com`, and `www.francesco.belacca.com` permanently
 redirect to that personal site.
 
-DNS A records for the supported application hosts and all three portfolio
-aliases point at `169.58.97.73`. Traefik exposes the `websecure` entrypoint on public port 443
-and obtains certificates from Let's Encrypt using the committed Cloudflare
-DNS-01 configuration. The out-of-band `kube-system/traefik-cloudflare` Secret
-must provide `CLOUDFLARE_DNS_API_TOKEN`; no value is stored in Git. The
-certificate store is persisted in `kube-system/traefik-acme`, so certificates
-renew across Traefik restarts. WebSockets use the same HTTPS ingress. Native
+The public DNS records currently point supported application hosts and the
+portfolio aliases at `169.58.97.73`. The legacy Traefik setup obtains Let's
+Encrypt certificates with its existing ACME configuration and persists the
+store in the `kube-system/traefik-acme` PVC. That PVC is RWO and uses the
+legacy cluster's `local-path` provisioner. The out-of-band
+`kube-system/traefik-cloudflare` Secret and any platform-managed challenge
+configuration must remain owned by the legacy path until a native ACME plan is
+reviewed; no certificate state or secret may be copied implicitly. Native
 WebTransport requires a separate UDP-capable public service, matching TLS
-certificate, and `PONG_WEBTRANSPORT_PUBLIC_URL`; it is disabled in the default
-manifests until those platform prerequisites are reviewed.
+certificate, and `PONG_WEBTRANSPORT_PUBLIC_URL`; it remains disabled until
+those platform prerequisites are reviewed.
 
-## Project clusters on this server
+## Project clusters and operational state
 
-At the time of the latency investigation, this server has **one Kubernetes
-cluster for this project**:
+| Context | Cluster/target | Topology or access | Purpose | Status |
+|---|---|---|---|---|
+| `k3d-pong` | k3d `pong` on `169.58.97.73` | 1 server, 2 agents, 1 load balancer | Public production and legacy Flux target | Running; serves players |
+| `belacca-production` | Native cluster | Traefik staged on `.41` and `.42` | Staging target for future migration | No Pong workload, route, or data |
+| generated CI context | disposable k3d | Job-local gateway | Kubernetes integration tests | Created and deleted per workflow run |
+| generated restore context | `pong-restore-*` k3d | Explicit isolated context | Restore rehearsal only | Opt-in and disposable |
 
-| Context | k3d cluster | Topology | Purpose |
-|---|---|---|---|
-| `k3d-pong` | `pong` | 1 server, 2 agents, 1 load balancer | Local production-like cluster and Flux target |
+The public `k3d-pong` cluster owns the `pong` application namespace and
+`flux-system` GitOps controllers. The platform repository's old-production root
+Kustomization reconciles this repository's shared application overlay at
+`./k8s/overlays/server`. That overlay is the application source of truth for
+the legacy deployment and is not evidence that native `belacca-production` has
+been populated. Do not create or delete clusters during routine debugging, and
+do not delete/recreate the public cluster or its SQLite PVC.
 
-The persistent project target is `k3d-pong`; the `pong` namespace contains the
-application and `flux-system` contains GitOps. CI may create a disposable k3d
-cluster for integration tests. The opt-in restore rehearsal may create only a
-new `pong-restore-*` cluster and uses an explicit generated context; it never
-attaches to or deletes `k3d-pong`. Do not create or delete clusters during
-routine debugging, and do not delete/recreate this cluster: the API uses a
-persistent SQLite PVC.
+### Native storage and single-writer migration gate
+
+Before native staging can receive Pong resources or data, the following must
+be complete and documented:
+
+1. Install Longhorn on the native cluster and verify healthy replicas,
+   StorageClasses, backups/snapshots, node scheduling, and restore behavior.
+2. Create and test a native Longhorn-backed claim with the same single-writer
+   expectation as `pong-api-data`. The API must remain one replica; never mount
+   the live SQLite database read/write from both clusters.
+3. Take and verify an offline/online SQLite backup from the legacy PVC during a
+   maintenance window. Stop the legacy API before any file-level copy so the
+   `local-path` RWO claim has one writer and no concurrent mount.
+4. Restore the verified copy into native staging, run integrity and application
+   checks there, and rehearse rollback. The native cluster must be proven
+   isolated before it is allowed to write data.
+5. Only after the data and workload rehearsal passes may the platform GitOps
+   repository review the route/DNS and ACME cutover. Keep `.73` available as the
+   rollback target until the native route, certificates, WebSocket path, and
+   database checks are accepted.
 
 ## Fastest safe debug, local test, and GitOps workflow
 

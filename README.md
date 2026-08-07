@@ -99,7 +99,7 @@ k3d image import cloudnativepong-api:latest cloudnativepong-room:latest \
   cloudnativepong-static:latest cloudnativepong-gateway:latest -c pong
 
 # Deploy
-kubectl apply -f k8s/all.yaml
+kubectl apply -k k8s/overlays/test
 
 # Open http://localhost:8080
 ```
@@ -119,70 +119,77 @@ The portfolio aliases `belacca.com`, `www.belacca.com`, and
 Open the Pong subdomain, enter a display name, and create or join a room.
 Browser WebSocket-compatible connections are served over TLS. The browser checks
 `/api/capabilities` and only uses native WebTransport when a reviewed UDP
-listener is advertised; otherwise WebSockets remain the default. Let's Encrypt certificates
-are issued and renewed automatically by Traefik, with certificate state stored
-in the `kube-system/traefik-acme` PVC.
+listener is advertised; otherwise WebSockets remain the default.
+
+The public URL is still served by the **legacy production path**: the `k3d-pong`
+cluster on `vmi3474918` at `169.58.97.73`. Its existing Traefik ingress uses the
+old ACME setup, with certificate state in the `kube-system/traefik-acme` PVC and
+storage supplied by the cluster's `local-path` provisioner. Do not interpret the
+native staging cluster below as a second public endpoint or as having taken over
+ACME, routing, or application data.
 
 Host-based routing is owned by the public
 [`macel94/belacca-gitops`](https://github.com/macel94/belacca-gitops) repository;
-this repository owns Pong workloads and immutable images. DNS must contain A records for `pong.belacca.com`,
-`francesco.belacca.com`, and the three portfolio aliases
-(`belacca.com`, `www.belacca.com`, and `www.francesco.belacca.com`) pointing to
-`169.58.97.73` for normal traffic. ACME uses the platform's Cloudflare DNS-01
-configuration and its out-of-band `kube-system/traefik-cloudflare` Secret; no
-DNS/API value is stored here.
+this repository owns Pong workloads and immutable images. The public DNS and
+route currently target `169.58.97.73`. The native `belacca-production` cluster
+is staging only: it has no Pong workload, public Pong route, or Pong database/PVC
+data yet. Native Traefik is staged only on the `.41`/`.42` nodes and is not the
+public ingress. A reviewed route, certificate/ACME plan, Longhorn storage, and
+single-writer data migration are required before any cutover; see
+[`DEPLOYMENT.md`](DEPLOYMENT.md).
 
 ### Cluster layout
 
-There are **not currently two persistent Kubernetes clusters** for this project.
-The current machine hosts the public/production-like k3d cluster. Development
-and Kubernetes integration tests use a separate **ephemeral** k3d cluster that
-is created and destroyed by the GitHub Actions workflow; it is not a second
-always-on public environment.
+This project has two operational states, but only one currently serves players:
+legacy k3d production on `.73` and native Kubernetes staging on
+`belacca-production`. GitHub Actions also creates a third, disposable k3d test
+cluster; that CI cluster is never a production or staging target.
 
 ```mermaid
 flowchart TB
     internet((Players / Internet))
-    machine["Current machine: vmi3474918\nPublic IP: 169.58.97.73"]
-    publicLB["k3d load balancer\n80/18080 → Traefik HTTP\n443 → Traefik HTTPS\n18083 → NodePort :30080\n45371 → Kubernetes API"]
-    publicCluster["Persistent k3d cluster: pong\nContext: k3d-pong\n1 server + 2 agents"]
-    traefik["Traefik Ingress\nweb entrypoint"]
+    machine["Legacy host: vmi3474918\nPublic IP: 169.58.97.73"]
+    publicLB["Legacy k3d load balancer\n80/18080 → Traefik HTTP\n443 → Traefik HTTPS\n18083 → NodePort :30080\n45371 → Kubernetes API"]
+    publicCluster["Public production: k3d-pong\nCluster: pong\n1 server + 2 agents"]
+    traefik["Legacy Traefik\nold ACME + local-path"]
     gateway["pong-gateway\nCaddy"]
     app["pong namespace\nstatic + api + dynamic room Pods"]
     flux["flux-system\nFlux v2 GitOps"]
     git[("GitHub main\nsource of truth")]
+    native["Native belacca-production\nSTAGING ONLY\nno Pong workload/route/data"]
+    nativeTraefik["Traefik staged only\non .41/.42"]
     actions["GitHub Actions\nTest & Build workflow"]
-    ciCluster["Ephemeral dev/test k3d cluster\nCreated per CI run\nDestroyed after E2E"]
+    ciCluster["Ephemeral CI k3d cluster\nCreated per run\nDestroyed after E2E"]
     ciApp["Kubernetes E2E\nthrough gateway"]
 
     internet -->|"Play here: https://pong.belacca.com/"| machine
     machine --> publicLB --> publicCluster
     publicCluster --> traefik --> gateway --> app
     git -->|"Flux watches main"| flux
-    flux -->|"reconciles ./clusters/vmi3474918"| publicCluster
+    flux -->|"legacy app reconciliation"| publicCluster
+    native --> nativeTraefik
     git --> actions -->|"k3d + kubectl apply"| ciCluster --> ciApp
     actions -->|"build/publish immutable GHCR images"| git
-    dashboard["Headlamp operations dashboard\nprivate port-forward only"]
+    dashboard["Headlamp operations dashboard\nprotected old-production route"]
     publicCluster --> dashboard
 ```
 
-The diagram's two Kubernetes boxes represent two different roles: the
-persistent public target on the current machine, and the disposable CI test
-cluster. Only `pong` is currently running on the machine and exposed publicly.
+| Role | kubeconfig context | Target | Access | Status |
+|------|--------------------|--------|--------|--------|
+| Public production | `k3d-pong` | k3d cluster `pong` on `169.58.97.73` | Public Pong URL and legacy NodePort diagnostics | Running; public traffic remains here |
+| Native staging | `belacca-production` | Native cluster; Traefik staged on `.41` and `.42` | No public Pong route | No Pong workload, route, or data yet |
+| CI integration test | generated/ephemeral | Disposable k3d cluster | Job-local gateway on `localhost:8080` | Created, tested, and deleted by CI |
 
+The legacy `pong` namespace contains the game and `flux-system` contains the
+GitOps controllers. The Flux root is maintained by the platform
+`macel94/belacca-gitops` repository; its old-production Kustomization
+reconciles this repository's shared [`k8s/overlays/server/`](k8s/overlays/server/)
+application overlay. That path describes the legacy application deployment; it
+does not mean native `belacca-production` has been populated. Host routing is
+declared in `macel94/belacca-gitops`, and the native staging route has not been
+created.
 
-| Role | kubeconfig context | Cluster | Access | Status |
-|------|--------------------|---------|--------|--------|
-| Development and public deployment target | `k3d-pong` | `pong` | Local k3d API; public app through the URL above | Running; 3 Ready nodes and all Pong deployments available |
-
-The cluster has one server, two agents, and a load balancer. The `pong`
-namespace contains the game, while `flux-system` contains the GitOps
-controllers. The Pong route is Traefik → `pong-gateway` → the static/API
-services. Host-based routing is declared in
-`macel94/belacca-gitops`; this repository does not expose a wildcard or apex
-Ingress. The NodePort remains available for local diagnostics at port `30080`.
-
-To inspect the cluster when the k3d host is available:
+To inspect the public production cluster when the legacy k3d host is available:
 
 ```bash
 kubectl config use-context k3d-pong
@@ -191,9 +198,37 @@ kubectl -n pong get deploy,pods,svc,ingress,hpa,pvc
 kubectl -n flux-system get pods
 ```
 
-If a separate dev cluster or separately managed public cluster is added later,
-it should have its own kubeconfig context and a separate directory under
-`clusters/`; it should not be inferred from the current `k3d-pong` context.
+Do not use the public cluster as an experiment sandbox. Native staging and the
+CI/restore clusters must have their own context and must not share the
+production PVC or public route. Longhorn must be healthy and a single-writer
+migration rehearsed before native staging can become a data-bearing target.
+
+### Native staging and eventual cutover prerequisites
+
+`belacca-production` is an infrastructure staging target, not an application
+environment yet. Before it can receive Pong, all of the following must be
+reviewed and proven in staging:
+
+- **Native Traefik and route:** Traefik is only staged on `.41` and `.42`. The
+  platform repository must create and validate the intended `pong.belacca.com`
+  route and TLS entrypoints before DNS or traffic changes. Until then, the
+  legacy `.73` route is authoritative.
+- **ACME ownership:** the legacy `k3d-pong` path uses its existing ACME/local-
+  path arrangement. Native Traefik needs an explicit certificate store,
+  challenge method, secret ownership, and renewal test; do not reuse or move
+  `traefik-acme` implicitly.
+- **Longhorn storage:** install and validate Longhorn on the native nodes,
+  including healthy replicas, the intended StorageClass, backups/snapshots,
+  and recovery behavior. No native Pong PVC or database exists yet.
+- **SQLite single writer:** Pong's API owns `/data/pong.db` on one
+  ReadWriteOnce-style claim and must remain at one API writer. Take a verified
+  backup, stop the legacy writer, copy/verify the database into a native
+  Longhorn-backed claim, and rehearse rollback before enabling native writes.
+  Never mount the live database read/write from both clusters.
+- **Cutover and rollback:** prove the native workload, ingress, WebSocket path,
+  room cleanup, and restored data in isolation. Keep `.73` serving until the
+  native route and data checks pass; make DNS/route changes only through the
+  reviewed platform GitOps process, with a documented way back to `.73`.
 
 ### GitOps workflow
 
@@ -211,9 +246,10 @@ repository is one independently reconciled application source.
    `sha-<commit>` images to GHCR for `api`, `room`, `static`, and `gateway`.
 4. The workflow updates `k8s/overlays/server/` with those image tags and commits
    the generated deployment update.
-5. Flux watches `main` at one-minute source intervals and reconciles
-   `./clusters/vmi3474918` (which deploys `./k8s/overlays/server`) every ten
-   minutes. Force an immediate sync when needed:
+5. Flux watches `main` at one-minute source intervals. The platform
+   repository's old-production root reconciles this repository's
+   `./k8s/overlays/server` application source every ten minutes. Force an
+   immediate sync when needed:
 
    ```bash
    flux reconcile source git flux-system -n flux-system
@@ -223,9 +259,9 @@ repository is one independently reconciled application source.
    ```
 
 The Flux source and kustomization should both report `Ready=True` after a
-successful deployment. The generated Flux bootstrap manifests are under
-`clusters/vmi3474918/flux-system`; application manifests and environment
-patches are under `k8s/overlays/server/`.
+successful deployment. The platform repository owns the generated Flux
+bootstrap manifests and old-production root; application manifests and
+environment patches for Pong are under `k8s/overlays/server/`.
 
 ### Kubernetes dashboards and administrative access
 
@@ -234,18 +270,25 @@ patches are under `k8s/overlays/server/`.
 [Headlamp](https://headlamp.dev/) is installed by Flux from the pinned official
 Headlamp Helm chart (`0.44.0`). Its Service is `ClusterIP` only, there is no
 Ingress or NodePort, and it is not connected to the public Pong route. The
-installation is declared under `clusters/vmi3474918/headlamp/`; do not install
-or upgrade it manually with `kubectl` or Helm.
+old-production installation is declared in the `macel94/belacca-gitops` platform
+repository; do not install or upgrade it manually with
+`kubectl` or Helm. Its protected public route is
+`https://dashboard.belacca.com/`, backed by Dex/Google OIDC and OAuth2 Proxy.
+Native staging has encrypted Secret interfaces only and does not yet deploy
+Headlamp, Dex, or the dashboard route.
 
-The dashboard's pod uses a dedicated ServiceAccount bound to the
-`headlamp-read-only` ClusterRole. That role permits `get`, `list`, and `watch`
-for cluster observability, including Flux resources, but no create/update/delete
-operations. It does not grant access to Secret values. Headlamp's own
-`unsafeUseServiceAccountToken` and Helm-operation features are disabled.
+The dashboard's pod uses the fixed `headlamp` ServiceAccount. Its mounted token
+is the shared backend identity, and the platform repository binds that
+ServiceAccount to the built-in `cluster-admin` ClusterRole through the
+`headlamp-authenticated-admin` binding. Authenticated old-production Headlamp
+is therefore shared-admin, not read-only; the Dex/OAuth2 Proxy allowlist is the
+front-door authentication gate, not per-user Kubernetes RBAC or impersonation.
+Headlamp's `unsafeUseServiceAccountToken` is enabled for this backend identity,
+while Helm-operation features remain disabled.
 
-To access it securely from this machine, use the existing kubeconfig context
-and a localhost-only port-forward. Keep this command running while using the
-browser:
+For a private old-production fallback, use the existing kubeconfig context and
+a localhost-only port-forward only when the protected public identity route is
+unavailable. Keep this command running while using the browser:
 
 ```bash
 kubectl config use-context k3d-pong
@@ -253,16 +296,17 @@ kubectl -n headlamp port-forward --address 127.0.0.1 service/headlamp 8080:80
 ```
 
 Then open **[http://127.0.0.1:8080/](http://127.0.0.1:8080/)** on the machine. Headlamp
-will ask for a Kubernetes bearer token. Generate a short-lived token locally
-and paste it directly into the browser; do not print, log, commit, or send the
-token anywhere:
+will ask for a Kubernetes bearer token. This is a short-lived token for the
+fixed shared-admin ServiceAccount, not a per-user credential. Generate it
+locally and paste it directly into the browser; do not print, log, commit, or
+send the token anywhere:
 
 ```bash
 kubectl -n headlamp create token headlamp --duration=1h
 ```
 
-The port-forward binds to localhost by default. Do not expose it with a public
-Ingress, NodePort, or load balancer. If remote access is ever required, use an
+The port-forward binds to localhost by default. Do not expose a new public
+Ingress, NodePort, or load balancer from this application repository. If remote access is ever required, use an
 authenticated private tunnel or identity-aware proxy with HTTPS and audited
 RBAC instead. The public game URL remains intentionally separate and provides
 no cluster-administration access. The persistent project target is administered
@@ -279,10 +323,9 @@ flux get kustomizations -A
 ```
 
 The public game URL is intentionally not a Kubernetes dashboard and does not
-provide cluster-administration access. If a dashboard is installed in the
-future, expose it through an authenticated, private access path (for example,
-port-forwarding or an identity-aware proxy) rather than adding it to the public
-Pong ingress.
+provide cluster-administration access. Keep Headlamp on its authenticated
+old-production route or use a private port-forward/identity-aware proxy rather
+than adding it to the public Pong ingress.
 
 ## 🔐 Supply-chain, synthetic checks, and recovery
 
@@ -496,13 +539,13 @@ checks remain in `scripts/synthetic-check.sh`.
 ├── gateway/             # Gateway config
 │   └── Caddyfile         # Caddy routing and WebSocket upgrade rules
 ├── k8s/                 # Kubernetes manifests
-│   └── all.yaml         # All resources: gateway, static, api, RBAC, ConfigMap
+│   ├── base/             # Shared resources and protected PVC contract
+│   └── overlays/         # Server production and disposable test overlays
 ├── tests/               # Playwright E2E tests
 ├── Dockerfile.api       # Go binary → distroless (lobby mode)
 ├── Dockerfile.room      # Go binary → distroless (room mode)
 ├── Dockerfile.static    # Caddy + static files
 ├── Dockerfile.gateway   # Caddy HTTP gateway
-├── HANDOFF.md           # Current implementation state and next steps
 └── README.md
 ```
 

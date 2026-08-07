@@ -70,7 +70,8 @@ self_test() {
   is_forbidden_cluster k3d-pong || { echo 'production cluster predicate is not refusing k3d-pong' >&2; status=1; }
   is_forbidden_cluster pong || { echo 'production cluster predicate is not refusing pong' >&2; status=1; }
   is_forbidden_cluster pong-restore-self-test && { echo 'restore cluster predicate rejects its own dedicated prefix' >&2; status=1; }
-  grep -q -- 'pong-api-data' "$REPO_ROOT/k8s/all.yaml" || { echo 'application manifest no longer names the expected PVC' >&2; status=1; }
+  grep -q -- '../../base' "$REPO_ROOT/k8s/overlays/test/kustomization.yaml" || { echo 'test overlay no longer references the application base' >&2; status=1; }
+  grep -q -- 'pong-api-data' "$REPO_ROOT/k8s/base/all.yaml" || { echo 'application base no longer names the expected PVC' >&2; status=1; }
   if grep -nE 'k3d cluster delete (pong|k3d-pong)|kubectl .*delete (pvc|namespace)' "$0"; then
     echo 'destructive production/PVC command found in rehearsal script' >&2
     status=1
@@ -192,7 +193,7 @@ if (( dry_run )); then
   log 'dry-run: no k3d, kubectl, filesystem, or backup operations will run'
   quote_cmd "$BACKUP_HELPER" verify "$backup_file"
   quote_cmd k3d cluster create "$cluster_name" --agents 1 --wait --port "127.0.0.1:${host_port}:30080@agent:0"
-  quote_cmd kubectl --context "k3d-${cluster_name}" apply -f "$REPO_ROOT/k8s/all.yaml"
+  quote_cmd kubectl --context "k3d-${cluster_name}" apply -k "$REPO_ROOT/k8s/overlays/test"
   quote_cmd kubectl --context "k3d-${cluster_name}" -n "$namespace" scale deployment/pong-api --replicas=0
   quote_cmd kubectl --context "k3d-${cluster_name}" -n "$namespace" cp "$backup_file" pong-restore-seed:/data/pong.db
   quote_cmd kubectl --context "k3d-${cluster_name}" -n "$namespace" scale deployment/pong-api --replicas=1
@@ -247,7 +248,7 @@ docker images --format '{{.Repository}}:{{.Tag}}' | grep -E '^cloudnativepong-(a
 k3d image import cloudnativepong-api:latest cloudnativepong-room:latest cloudnativepong-static:latest cloudnativepong-gateway:latest --cluster "$cluster_name"
 
 log 'applying the checked-in application manifest only to the isolated context'
-kubectl --context "$context" apply -f "$REPO_ROOT/k8s/all.yaml"
+kubectl --context "$context" apply -k "$REPO_ROOT/k8s/overlays/test"
 kubectl --context "$context" -n "$namespace" wait --for=condition=available deployment/pong-api --timeout=180s
 kubectl --context "$context" -n "$namespace" scale deployment/pong-api --replicas=0
 kubectl --context "$context" -n "$namespace" wait --for=delete pod -l 'app=cloudnativepong,component=api' --timeout=120s

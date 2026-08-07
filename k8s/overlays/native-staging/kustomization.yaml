@@ -1,0 +1,52 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: pong
+
+resources:
+  - ../../base
+
+images:
+  - name: cloudnativepong-api
+    newName: ghcr.io/macel94/cloudnativepong-api
+    newTag: sha-32b6f6af7a00a72950b182439b99847d721bb871
+  - name: cloudnativepong-room
+    newName: ghcr.io/macel94/cloudnativepong-room
+    newTag: sha-32b6f6af7a00a72950b182439b99847d721bb871
+  - name: cloudnativepong-static
+    newName: ghcr.io/macel94/cloudnativepong-static
+    newTag: sha-32b6f6af7a00a72950b182439b99847d721bb871
+  - name: cloudnativepong-gateway
+    newName: ghcr.io/macel94/cloudnativepong-gateway
+    newTag: sha-32b6f6af7a00a72950b182439b99847d721bb871
+
+patches:
+  - path: api-native-staging.yaml
+    target:
+      group: apps
+      version: v1
+      kind: Deployment
+      name: pong-api
+      namespace: pong
+  - path: deployment-pull-policy.yaml
+  - path: gateway-private.yaml
+    target:
+      version: v1
+      kind: Service
+      name: pong-gateway
+      namespace: pong
+  - path: pvc-longhorn.yaml
+    target:
+      version: v1
+      kind: PersistentVolumeClaim
+      name: pong-api-data
+      namespace: pong
+  - path: remove-webtransport-port.yaml
+    target:
+      group: apps
+      version: v1
+      kind: Deployment
+      name: pong-api
+      namespace: pong
+  - path: remove-webtransport-service.yaml
+  - path: room-template.yaml

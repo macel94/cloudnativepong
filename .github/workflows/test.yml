@@ -109,8 +109,8 @@ jobs:
           docker build -t cloudnativepong-gateway:latest -f Dockerfile.gateway .
           k3d image import cloudnativepong-api:latest cloudnativepong-room:latest cloudnativepong-static:latest cloudnativepong-gateway:latest -c pong
 
-      - name: Deploy to k3d
-        run: kubectl apply -f k8s/all.yaml
+      - name: Deploy disposable test overlay to k3d
+        run: kubectl apply -k k8s/overlays/test
 
       - name: Wait for pods
         run: |

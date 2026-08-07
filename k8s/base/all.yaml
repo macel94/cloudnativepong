@@ -1,7 +1,7 @@
 # Kubernetes manifests for Cloud Native Pong.
 #
-# Quick deploy:
-#   kubectl apply -f k8s/all.yaml
+# Quick deploy (use the disposable local test overlay):
+#   kubectl apply -k k8s/overlays/test
 #
 # What this creates:
 #   - namespace: pong
