@@ -2,18 +2,18 @@
 
 This repository contains the Pong application. Its production workloads are
 an independently reconciled child source of the platform
-`macel94/belacca-gitops` repository, which owns the old-production Flux root.
-The current operational state is deliberately split:
+`macel94/belacca-gitops` repository, which owns the native-production Flux
+root. The current operational state is:
 
-- **Public production:** the old `k3d-pong` cluster on `vmi3474918` / public
-  `169.58.97.73` remains the only player-facing environment. It uses the old
-  Traefik ACME setup and the k3s `local-path` storage provisioner.
-- **Native staging:** `belacca-production` is staging only. Its isolated Pong
-  workload is used for readiness and migration rehearsal; native Traefik is
-  staged on `.41` and `.42`, but there is no public Pong route or migrated
-  production database/data there. It must not receive production traffic.
+- **Native production:** `belacca-production` serves players through native
+  Traefik on `.41` and `.42`, with Flux-managed Pong and a Longhorn-backed
+  single-writer SQLite PVC. Cloudflare DNS is direct round-robin, not
+  health-aware failover.
+- **Retired old production:** the former `k3d-pong` runtime on `.73` was
+  stopped and removed after Pong, GoatCounter, and Dex state handoff. Its
+  manifests remain historical reference only.
 - **CI and restore:** GitHub Actions and the guarded restore rehearsal use
-  disposable k3d clusters only; neither is a production or staging target.
+  disposable k3d clusters only; neither is a production target.
 
 The static frontend image injects the full source commit SHA at build time; the
 lobby and game pages display a clickable `sha-<short-sha>` badge linking to that
@@ -27,9 +27,8 @@ the backup/object-storage contract is in the [GitOps backup contract](https://gi
 
 - `pong-api` runs as one replica because it owns the SQLite database and is the
   single writer.
-- The database is persisted at `/data/pong.db` on the `pong-api-data` PVC. In
-  current public production that claim is backed by `local-path`; native
-  staging must use a reviewed Longhorn-backed claim before it can hold data.
+- The database is persisted at `/data/pong.db` on the `pong-api-data` PVC.
+  Current native production uses a Longhorn-backed RWO claim and one API writer.
 - `pong-gateway` and `pong-static` start with two replicas and can scale to four
   using the Kubernetes metrics-server.
 - Every room is a separate Pod named `pong-room-<room-id>` and a matching
@@ -69,19 +68,13 @@ The Flux controllers are `source-controller`, `kustomize-controller`,
 the generated Flux bootstrap manifests and old-production root; change them
 only through the documented Flux upgrade/bootstrap process.
 
-Traefik in the legacy `k3d-pong` cluster is the current public ingress. The
+Native Traefik is the current public ingress on `.41` and `.42`. The
 cluster-level platform repository owns the host-based Pong Ingress for
 `pong.belacca.com`, using class `traefik` and the `web,websecure` entrypoints.
 It forwards all paths to `pong-gateway`; Caddy in that gateway handles static
 routing, API calls, and WebSocket upgrades. Native WebTransport is implemented
-in the Go API but is opt-in and terminates on a separate UDP listener because
-the current Traefik HTTP ingress does not expose UDP or proxy WebTransport
-sessions. The legacy k3d load balancer maps:
-
-- Host `80` and `18080` → legacy Traefik HTTP port 80
-- Host `443` → legacy Traefik HTTPS port 443
-- Host `18083` → legacy Pong NodePort 30080
-- Host `45371` → the Kubernetes API
+in the Go API but remains opt-in because the current HTTP ingress does not
+expose UDP.
 
 The GitOps ingress is the current public application path. The room Pod
 callbacks at `/internal/rooms/<id>/started` and `/internal/rooms/<id>/finished`
@@ -91,11 +84,10 @@ correlation headers; callback retries are bounded, and a failed start callback
 closes the room path so reconciliation can clean it rather than leaving a
 half-started game.
 
-Native Traefik is staged only on `.41` and `.42`. It is not the public ingress,
-and no native Pong Ingress, service route, workload, or database exists yet.
-Before cutover, the platform repository must define and validate the native
-`pong.belacca.com` route, TLS entrypoints, health checks, and rollback route.
-Do not move DNS or public traffic merely because native Traefik is installed.
+Native Traefik on `.41` and `.42` is the public ingress. Native TLS uses
+cert-manager DNS-01 and namespace-local Secrets. Monitor both direct-DNS edges
+and remove an unhealthy address manually until a health-aware load balancer is
+available.
 
 The canonical platform site inventory is maintained in
 [`macel94/belacca-gitops/docs/SITES.md`](https://github.com/macel94/belacca-gitops/blob/main/docs/SITES.md).
@@ -104,14 +96,11 @@ personal site is `https://francesco.belacca.com/`; and
 `belacca.com`, `www.belacca.com`, and `www.francesco.belacca.com` permanently
 redirect to that personal site.
 
-The public DNS records currently point supported application hosts and the
-portfolio aliases at `169.58.97.73`. The legacy Traefik setup obtains Let's
-Encrypt certificates with its existing ACME configuration and persists the
-store in the `kube-system/traefik-acme` PVC. That PVC is RWO and uses the
-legacy cluster's `local-path` provisioner. The out-of-band
-`kube-system/traefik-cloudflare` Secret and any platform-managed challenge
-configuration must remain owned by the legacy path until a native ACME plan is
-reviewed; no certificate state or secret may be copied implicitly. Native
+Cloudflare DNS-only records for supported application hosts and
+`k3s-api.belacca.com` contain `.41` and `.42`. Native cert-manager uses the
+out-of-band Cloudflare credential for DNS-01 and stores issued certificates in
+namespace-local Kubernetes Secrets. The retired old ACME PVC was not copied or
+mounted into native Traefik. Native
 WebTransport requires a separate UDP-capable public service, matching TLS
 certificate, and `PONG_WEBTRANSPORT_PUBLIC_URL`; it remains disabled until
 those platform prerequisites are reviewed.
@@ -120,8 +109,8 @@ those platform prerequisites are reviewed.
 
 | Context | Cluster/target | Topology or access | Purpose | Status |
 |---|---|---|---|---|
-| `k3d-pong` | k3d `pong` on `169.58.97.73` | 1 server, 2 agents, 1 load balancer | Public production and legacy Flux target | Running; serves players |
-| `belacca-production` | Native cluster | Traefik staged on `.41` and `.42` | Isolated Pong readiness/migration rehearsal | No public route or migrated production data |
+| `belacca-production` | Native k3s cluster | Traefik on `.41` and `.42` | Public production and Flux target | Running; serves players |
+| retired `k3d-pong` | historical k3d `pong` on `.73` | Removed containers | Audit/reference only | Retired after state handoff |
 | generated CI context | disposable k3d | Job-local gateway | Kubernetes integration tests | Created and deleted per workflow run |
 | generated restore context | `pong-restore-*` k3d | Explicit isolated context | Restore rehearsal only | Opt-in and disposable |
 
@@ -133,11 +122,10 @@ the legacy deployment and is not evidence that native `belacca-production` has
 been populated. Do not create or delete clusters during routine debugging, and
 do not delete/recreate the public cluster or its SQLite PVC.
 
-### Native storage and single-writer migration gate
+### Native storage and single-writer operations
 
-The isolated native workload may be used for manifest, image, and readiness
-rehearsal. Before native staging can receive production data or public traffic,
-the following must be complete and documented:
+Native production uses a Longhorn-backed RWO claim and one API writer. The
+following controls are required for state operations:
 
 1. Install Longhorn on the native cluster and verify healthy replicas,
    StorageClasses, backups/snapshots, node scheduling, and restore behavior.
@@ -147,13 +135,11 @@ the following must be complete and documented:
 3. Take and verify an offline/online SQLite backup from the legacy PVC during a
    maintenance window. Stop the legacy API before any file-level copy so the
    `local-path` RWO claim has one writer and no concurrent mount.
-4. Restore the verified copy into native staging, run integrity and application
-   checks there, and rehearse rollback. The native cluster must be proven
-   isolated before it is allowed to write data.
-5. Only after the data and workload rehearsal passes may the platform GitOps
-   repository review the route/DNS and ACME cutover. Keep `.73` available as the
-   rollback target until the native route, certificates, WebSocket path, and
-   database checks are accepted.
+4. Restore the verified copy into an isolated target or approved native
+   maintenance window, run integrity and application checks, and preserve the
+   single-writer contract.
+5. Keep Cloudflare records limited to healthy `.41` and `.42` edges until a
+   health-aware load balancer exists; remove an unhealthy address manually.
 
 ## Fastest safe debug, local test, and GitOps workflow
 

@@ -8,7 +8,7 @@ spec:
     spec:
       containers:
         - name: static
-          # Caddy's native staging container exceeded the base 16Mi limit and
+          # Caddy's native production container exceeded the base 16Mi limit and
           # was OOMKilled before it could remain ready.
           resources:
             requests:
