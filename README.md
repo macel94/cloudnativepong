@@ -132,8 +132,9 @@ Host-based routing is owned by the public
 [`macel94/belacca-gitops`](https://github.com/macel94/belacca-gitops) repository;
 this repository owns Pong workloads and immutable images. The public DNS and
 route currently target `169.58.97.73`. The native `belacca-production` cluster
-is staging only: it has no Pong workload, public Pong route, or Pong database/PVC
-data yet. Native Traefik is staged only on the `.41`/`.42` nodes and is not the
+is staging only: it has an isolated Pong workload for readiness and migration
+rehearsal, but no public Pong route or migrated production database/data. Native
+Traefik is staged only on the `.41`/`.42` nodes and is not the
 public ingress. A reviewed route, certificate/ACME plan, Longhorn storage, and
 single-writer data migration are required before any cutover; see
 [`DEPLOYMENT.md`](DEPLOYMENT.md).
@@ -156,7 +157,7 @@ flowchart TB
     app["pong namespace\nstatic + api + dynamic room Pods"]
     flux["flux-system\nFlux v2 GitOps"]
     git[("GitHub main\nsource of truth")]
-    native["Native belacca-production\nSTAGING ONLY\nno Pong workload/route/data"]
+    native["Native belacca-production\nSTAGING ONLY\nisolated workload\nno public route/production data"]
     nativeTraefik["Traefik staged only\non .41/.42"]
     actions["GitHub Actions\nTest & Build workflow"]
     ciCluster["Ephemeral CI k3d cluster\nCreated per run\nDestroyed after E2E"]
@@ -177,7 +178,7 @@ flowchart TB
 | Role | kubeconfig context | Target | Access | Status |
 |------|--------------------|--------|--------|--------|
 | Public production | `k3d-pong` | k3d cluster `pong` on `169.58.97.73` | Public Pong URL and legacy NodePort diagnostics | Running; public traffic remains here |
-| Native staging | `belacca-production` | Native cluster; Traefik staged on `.41` and `.42` | No public Pong route | No Pong workload, route, or data yet |
+| Native staging | `belacca-production` | Native cluster; Traefik staged on `.41` and `.42` | Isolated readiness/migration rehearsal; no public route | No public route or migrated production data |
 | CI integration test | generated/ephemeral | Disposable k3d cluster | Job-local gateway on `localhost:8080` | Created, tested, and deleted by CI |
 
 The legacy `pong` namespace contains the game and `flux-system` contains the

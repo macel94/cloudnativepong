@@ -8,9 +8,10 @@ The current operational state is deliberately split:
 - **Public production:** the old `k3d-pong` cluster on `vmi3474918` / public
   `169.58.97.73` remains the only player-facing environment. It uses the old
   Traefik ACME setup and the k3s `local-path` storage provisioner.
-- **Native staging:** `belacca-production` is staging only. Native Traefik is
-  staged on `.41` and `.42`, but there is no Pong workload, public Pong route,
-  or Pong database/PVC data there yet.
+- **Native staging:** `belacca-production` is staging only. Its isolated Pong
+  workload is used for readiness and migration rehearsal; native Traefik is
+  staged on `.41` and `.42`, but there is no public Pong route or migrated
+  production database/data there. It must not receive production traffic.
 - **CI and restore:** GitHub Actions and the guarded restore rehearsal use
   disposable k3d clusters only; neither is a production or staging target.
 
@@ -120,7 +121,7 @@ those platform prerequisites are reviewed.
 | Context | Cluster/target | Topology or access | Purpose | Status |
 |---|---|---|---|---|
 | `k3d-pong` | k3d `pong` on `169.58.97.73` | 1 server, 2 agents, 1 load balancer | Public production and legacy Flux target | Running; serves players |
-| `belacca-production` | Native cluster | Traefik staged on `.41` and `.42` | Staging target for future migration | No Pong workload, route, or data |
+| `belacca-production` | Native cluster | Traefik staged on `.41` and `.42` | Isolated Pong readiness/migration rehearsal | No public route or migrated production data |
 | generated CI context | disposable k3d | Job-local gateway | Kubernetes integration tests | Created and deleted per workflow run |
 | generated restore context | `pong-restore-*` k3d | Explicit isolated context | Restore rehearsal only | Opt-in and disposable |
 
@@ -134,8 +135,9 @@ do not delete/recreate the public cluster or its SQLite PVC.
 
 ### Native storage and single-writer migration gate
 
-Before native staging can receive Pong resources or data, the following must
-be complete and documented:
+The isolated native workload may be used for manifest, image, and readiness
+rehearsal. Before native staging can receive production data or public traffic,
+the following must be complete and documented:
 
 1. Install Longhorn on the native cluster and verify healthy replicas,
    StorageClasses, backups/snapshots, node scheduling, and restore behavior.

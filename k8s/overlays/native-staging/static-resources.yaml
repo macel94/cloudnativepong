@@ -1,0 +1,17 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pong-static
+  namespace: pong
+spec:
+  template:
+    spec:
+      containers:
+        - name: static
+          # Caddy's native staging container exceeded the base 16Mi limit and
+          # was OOMKilled before it could remain ready.
+          resources:
+            requests:
+              memory: 16Mi
+            limits:
+              memory: 32Mi
