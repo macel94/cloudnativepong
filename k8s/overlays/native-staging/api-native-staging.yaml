@@ -19,4 +19,4 @@ spec:
             - --db-path=/data/pong.db
           env:
             - name: PONG_ALLOWED_ORIGINS
-              value: http://localhost:8080
+              value: https://pong.belacca.com
