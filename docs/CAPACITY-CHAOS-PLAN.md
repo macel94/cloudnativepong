@@ -80,8 +80,9 @@ Every manual run uploads a short-lived artifact containing:
 - load-smoke stderr and exit code;
 - the private aggregate Pong `/metrics` exposition, including admission and
   WebSocket failure counters without labels; and
-- bounded `kubectl get` pod/deployment/service output plus `kubectl top` pod
-  and node snapshots.
+- bounded, redacted `kubectl get` pod/deployment/service output plus
+  `kubectl top` pod and node snapshots. Disposable room names and IP-like
+  values are removed before upload; aggregate status/counts are retained.
 
 A missing metrics server may make a `kubectl top` snapshot unavailable; that
 condition is captured in the artifact rather than converted into an unbounded
