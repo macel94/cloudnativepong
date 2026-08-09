@@ -89,18 +89,31 @@ jobs:
             exit 1
           fi
 
-          HOST_PORT=$(python3 - <<'PY'
+          read -r HOST_PORT METRICS_PORT < <(python3 - <<'PY'
           import socket
-          with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-              sock.bind(('127.0.0.1', 0))
-              print(sock.getsockname()[1])
+          sockets = []
+          try:
+              for _ in range(2):
+                  sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                  sock.bind(('127.0.0.1', 0))
+                  sockets.append(sock)
+              print(sockets[0].getsockname()[1], sockets[1].getsockname()[1])
+          finally:
+              for sock in sockets:
+                  sock.close()
           PY
           )
-          if [[ ! "$HOST_PORT" =~ ^[0-9]+$ ]] || (( HOST_PORT < 1024 || HOST_PORT > 65535 )); then
-            echo 'failed to allocate a valid loopback port' >&2
+          for port in "$HOST_PORT" "$METRICS_PORT"; do
+            if [[ ! "$port" =~ ^[0-9]+$ ]] || (( port < 1024 || port > 65535 )); then
+              echo 'failed to allocate valid loopback ports' >&2
+              exit 1
+            fi
+          done
+          if [[ "$HOST_PORT" == "$METRICS_PORT" ]]; then
+            echo 'gateway and metrics ports must be distinct' >&2
             exit 1
           fi
-          printf 'HOST_PORT=%s\n' "$HOST_PORT" >> "$GITHUB_ENV"
+          printf 'HOST_PORT=%s\nMETRICS_PORT=%s\n' "$HOST_PORT" "$METRICS_PORT" >> "$GITHUB_ENV"
           printf 'ARTIFACT_DIR=capacity-artifacts\n' >> "$GITHUB_ENV"
           mkdir -p capacity-artifacts
 
@@ -202,8 +215,31 @@ jobs:
             top pods --containers
           snapshot kubectl-top-nodes.txt kubectl --context "$KUBE_CONTEXT" \
             top nodes
-          snapshot pong-metrics.txt curl --fail --silent --show-error --max-time 10 \
-            "http://127.0.0.1:${HOST_PORT}/metrics"
+
+          # /metrics is intentionally private and is not routed by the gateway.
+          # Port-forward only inside this disposable cluster to collect the
+          # aggregate admission/WebSocket evidence; never use a production context.
+          metrics_log="$ARTIFACT_DIR/metrics-port-forward.log"
+          kubectl --context "$KUBE_CONTEXT" -n pong port-forward \
+            --address 127.0.0.1 "${METRICS_PORT}:8080" service/pong-api >"$metrics_log" 2>&1 &
+          metrics_pid=$!
+          metrics_ready=0
+          for _ in $(seq 1 30); do
+            if curl --fail --silent --show-error --max-time 1 \
+              "http://127.0.0.1:${METRICS_PORT}/metrics" >"$ARTIFACT_DIR/pong-metrics.txt"; then
+              metrics_ready=1
+              break
+            fi
+            sleep 1
+          done
+          if (( metrics_ready == 0 )); then
+            echo 'metrics port-forward did not become ready' >&2
+          fi
+          kill "$metrics_pid" 2>/dev/null || true
+          wait "$metrics_pid" 2>/dev/null || true
+          if (( metrics_ready == 0 )); then
+            printf '%s\n' 'metrics-unavailable' >"$ARTIFACT_DIR/pong-metrics.txt"
+          fi
 
       - name: Upload capacity evidence
         if: always()
