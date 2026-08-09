@@ -221,7 +221,7 @@ jobs:
           # aggregate admission/WebSocket evidence; never use a production context.
           metrics_log="$ARTIFACT_DIR/metrics-port-forward.log"
           kubectl --context "$KUBE_CONTEXT" -n pong port-forward \
-            --address 127.0.0.1 "${METRICS_PORT}:8080" service/pong-api >"$metrics_log" 2>&1 &
+            --address 127.0.0.1 service/pong-api "${METRICS_PORT}:8080" >"$metrics_log" 2>&1 &
           metrics_pid=$!
           metrics_ready=0
           for _ in $(seq 1 30); do
