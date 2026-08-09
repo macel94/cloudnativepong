@@ -202,6 +202,8 @@ jobs:
             top pods --containers
           snapshot kubectl-top-nodes.txt kubectl --context "$KUBE_CONTEXT" \
             top nodes
+          snapshot pong-metrics.txt curl --fail --silent --show-error --max-time 10 \
+            "http://127.0.0.1:${HOST_PORT}/metrics"
 
       - name: Upload capacity evidence
         if: always()

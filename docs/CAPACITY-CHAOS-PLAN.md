@@ -77,7 +77,9 @@ public or unbounded browser load generator.
 Every manual run uploads a short-lived artifact containing:
 
 - the aggregate load-smoke JSON result;
-- load-smoke stderr and exit code; and
+- load-smoke stderr and exit code;
+- the private aggregate Pong `/metrics` exposition, including admission and
+  WebSocket failure counters without labels; and
 - bounded `kubectl get` pod/deployment/service output plus `kubectl top` pod
   and node snapshots.
 
@@ -86,7 +88,9 @@ condition is captured in the artifact rather than converted into an unbounded
 wait. Reviewers should correlate the aggregate operation results with pod
 readiness, resource requests/limits, and any snapshot errors. This evidence is
 for a disposable baseline and cannot establish the public 30-day availability
-objective or the drill recovery P95 by itself.
+objective or the drill recovery P95 by itself. If WebSocket failures occur
+while node CPU/memory remain low, inspect admission-rejection and WebSocket
+failure counters before calling the result resource saturation.
 
 ## Current non-goals
 

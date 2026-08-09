@@ -55,6 +55,7 @@ test('capacity workflow keeps its disposable cluster name within k3d limits', as
   assert.match(workflow, /CLUSTER_NAME: cnp-capacity-\$\{\{ github\.run_id \}\}/u);
   assert.match(workflow, /KUBE_CONTEXT: k3d-cnp-capacity-\$\{\{ github\.run_id \}\}/u);
   assert.doesNotMatch(workflow, /cloudnativepong-capacity-/u);
+  assert.match(workflow, /pong-metrics\.txt/u);
 });
 
 test('dry-run defaults to a local target and emits aggregate metadata only', () => {
