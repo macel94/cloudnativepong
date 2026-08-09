@@ -1,0 +1,236 @@
+name: Disposable capacity experiment
+
+on:
+  workflow_dispatch:
+    inputs:
+      iterations:
+        description: 'Journey iterations (1-50)'
+        required: true
+        default: 3
+        type: number
+      concurrency:
+        description: 'Concurrent journeys (1-8)'
+        required: true
+        default: 1
+        type: number
+      timeout_ms:
+        description: 'Per-operation timeout in milliseconds (500-30000)'
+        required: true
+        default: 10000
+        type: number
+      max_duration_ms:
+        description: 'Total experiment duration in milliseconds (1000-180000)'
+        required: true
+        default: 60000
+        type: number
+
+# Capacity experiments are deliberately serialized. A cancelled run must not
+# interrupt another run's disposable cluster or leave two load journeys active.
+concurrency:
+  group: capacity-experiment
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CLUSTER_NAME: cloudnativepong-capacity-${{ github.run_id }}
+  KUBE_CONTEXT: k3d-cloudnativepong-capacity-${{ github.run_id }}
+  ITERATIONS: '${{ inputs.iterations }}'
+  EXPERIMENT_CONCURRENCY: '${{ inputs.concurrency }}'
+  TIMEOUT_MS: '${{ inputs.timeout_ms }}'
+  MAX_DURATION_MS: '${{ inputs.max_duration_ms }}'
+
+jobs:
+  capacity:
+    name: Isolated disposable capacity baseline
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install existing load-smoke dependency
+        run: npm ci --ignore-scripts
+
+      - name: Validate numeric bounds and allocate loopback port
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          validate_integer() {
+            local name=$1 value=$2 minimum=$3 maximum=$4 normalized
+            if [[ ! "$value" =~ ^[0-9]+$ ]]; then
+              echo "$name must be a decimal integer" >&2
+              return 1
+            fi
+            # The regex above prevents arithmetic injection; base 10 also
+            # avoids bash interpreting a leading zero as octal.
+            normalized=$((10#$value))
+            if (( normalized < minimum || normalized > maximum )); then
+              echo "$name must be between $minimum and $maximum" >&2
+              return 1
+            fi
+            printf '%s=%s\n' "$name" "$normalized" >> "$GITHUB_ENV"
+          }
+
+          validate_integer ITERATIONS "$ITERATIONS" 1 50
+          validate_integer EXPERIMENT_CONCURRENCY "$EXPERIMENT_CONCURRENCY" 1 8
+          validate_integer TIMEOUT_MS "$TIMEOUT_MS" 500 30000
+          validate_integer MAX_DURATION_MS "$MAX_DURATION_MS" 1000 180000
+
+          if [[ ! "$GITHUB_RUN_ID" =~ ^[0-9]+$ ]]; then
+            echo 'GITHUB_RUN_ID must be numeric' >&2
+            exit 1
+          fi
+
+          HOST_PORT=$(python3 - <<'PY'
+          import socket
+          with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+              sock.bind(('127.0.0.1', 0))
+              print(sock.getsockname()[1])
+          PY
+          )
+          if [[ ! "$HOST_PORT" =~ ^[0-9]+$ ]] || (( HOST_PORT < 1024 || HOST_PORT > 65535 )); then
+            echo 'failed to allocate a valid loopback port' >&2
+            exit 1
+          fi
+          printf 'HOST_PORT=%s\n' "$HOST_PORT" >> "$GITHUB_ENV"
+          printf 'ARTIFACT_DIR=capacity-artifacts\n' >> "$GITHUB_ENV"
+          mkdir -p capacity-artifacts
+
+      - name: Install k3d
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
+          k3d version
+
+      - name: Create exact disposable k3d cluster
+        shell: bash
+        run: |
+          set -euo pipefail
+          if k3d cluster list --no-headers 2>/dev/null | awk '{print $1}' | grep -Fxq "$CLUSTER_NAME"; then
+            echo "refusing to attach to an existing cluster named $CLUSTER_NAME" >&2
+            exit 1
+          fi
+          # The host bind is explicit: no wildcard or public interface.
+          k3d cluster create "$CLUSTER_NAME" --agents 2 --wait \
+            --port "127.0.0.1:${HOST_PORT}:30080@agent:0"
+          # Claim ownership only after successful creation. Cleanup uses this
+          # marker so an interrupted create cannot delete an unrelated cluster.
+          : > "$ARTIFACT_DIR/cluster-created"
+          kubectl --context "$KUBE_CONTEXT" wait --for=condition=Ready node --all --timeout=120s
+
+      - name: Build four local images
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build -t cloudnativepong-api:latest -f Dockerfile.api .
+          docker build -t cloudnativepong-room:latest -f Dockerfile.room .
+          docker build --build-arg BUILD_SHA="$GITHUB_SHA" \
+            --build-arg BUILD_REPOSITORY="$GITHUB_REPOSITORY" \
+            -t cloudnativepong-static:latest -f Dockerfile.static .
+          docker build -t cloudnativepong-gateway:latest -f Dockerfile.gateway .
+          k3d image import \
+            cloudnativepong-api:latest \
+            cloudnativepong-room:latest \
+            cloudnativepong-static:latest \
+            cloudnativepong-gateway:latest \
+            --cluster "$CLUSTER_NAME"
+
+      - name: Deploy disposable test overlay and wait for readiness
+        shell: bash
+        run: |
+          set -euo pipefail
+          kubectl --context "$KUBE_CONTEXT" apply -k k8s/overlays/test
+          for deployment in pong-api pong-static pong-gateway; do
+            kubectl --context "$KUBE_CONTEXT" -n pong \
+              rollout status "deployment/$deployment" --timeout=180s
+          done
+          kubectl --context "$KUBE_CONTEXT" -n pong \
+            wait --for=condition=ready pod -l app=cloudnativepong --timeout=180s
+          kubectl --context "$KUBE_CONTEXT" -n pong get pods -o wide
+          curl --fail --silent --show-error --max-time 10 \
+            "http://127.0.0.1:${HOST_PORT}/health" >/dev/null
+
+      - name: Run guarded aggregate load-smoke on loopback
+        id: load_smoke
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -u
+          mkdir -p "$ARTIFACT_DIR"
+          # The target is loopback, so the existing guard does not require an
+          # approval marker. Explicitly remove any inherited marker regardless.
+          env -u LOAD_SMOKE_EXPERIMENT_APPROVED \
+            LOAD_SMOKE_BASE_URL="http://127.0.0.1:${HOST_PORT}" \
+            LOAD_SMOKE_ORIGIN="http://localhost:8080" \
+            ./scripts/load-smoke.sh \
+              --iterations="$ITERATIONS" \
+              --concurrency="$EXPERIMENT_CONCURRENCY" \
+              --timeout-ms="$TIMEOUT_MS" \
+              --max-duration-ms="$MAX_DURATION_MS" \
+              > "$ARTIFACT_DIR/load-smoke.json" \
+              2> "$ARTIFACT_DIR/load-smoke.stderr"
+          status=$?
+          printf '%s\n' "$status" > "$ARTIFACT_DIR/load-smoke.exit-code"
+          exit 0
+
+      - name: Collect bounded Kubernetes resource snapshots
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -u
+          mkdir -p "$ARTIFACT_DIR"
+          snapshot() {
+            local name=$1
+            shift
+            # A metrics server is optional; failed/bounded commands are still
+            # captured as evidence without hiding the load result.
+            timeout 30s "$@" > "$ARTIFACT_DIR/$name" 2>&1 || true
+          }
+          snapshot kubectl-get.txt kubectl --context "$KUBE_CONTEXT" -n pong \
+            get pods,deployments,services -o wide
+          snapshot kubectl-top-pods.txt kubectl --context "$KUBE_CONTEXT" -n pong \
+            top pods --containers
+          snapshot kubectl-top-nodes.txt kubectl --context "$KUBE_CONTEXT" \
+            top nodes
+
+      - name: Upload capacity evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: capacity-experiment-${{ github.run_id }}
+          path: capacity-artifacts/
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Preserve load-smoke result
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          status=$(cat "$ARTIFACT_DIR/load-smoke.exit-code" 2>/dev/null || printf '1')
+          if [[ "$status" != 0 ]]; then
+            echo "load-smoke failed with exit code $status; see uploaded aggregate evidence" >&2
+            exit 1
+          fi
+
+      - name: Delete only the exact disposable cluster
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -f "$ARTIFACT_DIR/cluster-created" ]]; then
+            k3d cluster delete "$CLUSTER_NAME"
+          else
+            echo "no owned cluster was created; nothing to delete"
+          fi

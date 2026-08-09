@@ -497,6 +497,17 @@ limiter. Loopback targets need no authorization; every non-local target requires
 hostname is never selected by default. The scheduled `synthetic-check` workflow
 is a separate low-rate availability check and does not run this load harness.
 
+### Manual disposable capacity baseline
+
+Repository maintainers can invoke **Actions → Disposable capacity experiment →
+Run workflow** with bounded numeric inputs. It builds the four local images,
+creates one run-ID-named k3d cluster, binds its gateway to `127.0.0.1`, runs the
+aggregate load-smoke journey, uploads bounded resource evidence, and deletes
+only that exact disposable cluster. It is serialized, manual-only, has no
+matrix or chaos injection, and never targets production or a public URL. See
+[`docs/CAPACITY-CHAOS-PLAN.md`](docs/CAPACITY-CHAOS-PLAN.md) for the safety
+contract and the separate availability/recovery objectives.
+
 ## 📊 Verification Status
 
 - Local Go tests, race tests, vet, and static builds pass.
