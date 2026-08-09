@@ -112,15 +112,16 @@ those platform prerequisites are reviewed.
 | `belacca-production` | Native k3s cluster | Traefik on `.41` and `.42` | Public production and Flux target | Running; serves players |
 | retired `k3d-pong` | historical k3d `pong` on `.73` | Removed containers | Audit/reference only | Retired after state handoff |
 | generated CI context | disposable k3d | Job-local gateway | Kubernetes integration tests | Created and deleted per workflow run |
+| capacity experiment context | `cnp-capacity-*` k3d | Loopback-only gateway | Bounded capacity baseline | Manual, serialized, redacted evidence, disposable |
 | generated restore context | `pong-restore-*` k3d | Explicit isolated context | Restore rehearsal only | Opt-in and disposable |
 
-The public `k3d-pong` cluster owns the `pong` application namespace and
-`flux-system` GitOps controllers. The platform repository's old-production root
-Kustomization reconciles this repository's shared application overlay at
-`./k8s/overlays/server`. That overlay is the application source of truth for
-the legacy deployment and is not evidence that native `belacca-production` has
-been populated. Do not create or delete clusters during routine debugging, and
-do not delete/recreate the public cluster or its SQLite PVC.
+The retired `k3d-pong` cluster no longer owns public traffic. Native
+`belacca-production` is the live Flux target; the platform repository consumes
+this repository through its native application Kustomization. The historical
+`./k8s/overlays/server` path remains retained for audit/compatibility, while
+`k8s/overlays/test` and the `cnp-capacity-*` workflow are disposable-only. Do
+not create or delete clusters during routine debugging, and do not
+delete/recreate native production or its SQLite PVC.
 
 ### Native storage and single-writer operations
 
@@ -332,7 +333,7 @@ cleans only the exact disposable cluster it created. The existing `k3d-pong`
 cluster, `pong-api-data` PVC, and production `/data/pong.db` must not be
 destroyed or overwritten for this rehearsal.
 
-## Observability, failure handling, and bounded smoke
+## Observability, failure handling, capacity, and bounded smoke
 
 ### Optional OpenTelemetry tracing
 
@@ -397,8 +398,11 @@ LOAD_SMOKE_BASE_URL=http://127.0.0.1:8080 \
 Use the scheduled synthetic script for the public workflow; it is a low-rate
 availability check, not a load generator. The availability objective is 99% per
 public service over 30 days; the controlled-drill recovery objective is P95 under
-six minutes and is separate from availability. For local or disposable load-smoke
-runs, set `LOAD_SMOKE_BASE_URL` explicitly. Loopback targets work without extra
+six minutes and is separate from availability. The manual `capacity-experiment`
+workflow is the supported CI capacity path: it is loopback-only, serialized,
+bounded, and redacts uploaded snapshots. Its first 8-concurrent baseline hit the
+configured WebSocket admission boundary before CPU/RAM saturation. For local or
+disposable load-smoke runs, set `LOAD_SMOKE_BASE_URL` explicitly. Loopback targets work without extra
 authorization; every non-local target requires the explicit operator marker
 `LOAD_SMOKE_EXPERIMENT_APPROVED=1` for an approved experiment. The marker is not
 configured by the workflow, and the canonical public Pong target is never a
