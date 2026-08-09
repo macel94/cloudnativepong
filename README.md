@@ -454,17 +454,26 @@ Caddy's `/rooms/` reverse proxy streams WebSocket upgrades with a one-hour timeo
 
 `/metrics` exposes dependency-free Prometheus text format. Optional OpenTelemetry OTLP/HTTP tracing is available through `OTEL_EXPORTER_OTLP_ENDPOINT` or `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`; without either variable, tracing is a no-op and no collector is contacted. HTTP spans and W3C propagation use bounded route/status metadata only and never include room IDs, names, IPs, tokens, URLs, or request bodies. See `DEPLOYMENT.md` for the private collector contract.
 
-`/metrics` exposes dependency-free Prometheus text format. Metrics are aggregate
-fixed-name counters and gauges only: there are no labels, room IDs, names, IPs,
-tokens, URLs, or request contents in telemetry. The registry also caps the
-number of distinct metric names. The main metric families cover:
+`/metrics` exposes dependency-free Prometheus text format. The machine-readable
+[`slo-contract.json`](slo-contract.json) defines the public 99%/30d SLI boundary:
+one hourly external observation is good only when the complete user journey
+passes. Internal metrics are diagnostics, not the public availability SLI, and
+there is no SLA. The separate controlled-drill recovery objective is P95 under
+six minutes and is excluded from availability arithmetic.
+
+Metrics are aggregate fixed-name counters, gauges, and bounded duration
+ distributions only: there are no labels, room IDs, names, IPs, tokens, URLs, or
+request contents in telemetry. The registry caps the number of distinct metric
+names. The main metric families cover:
 
 - HTTP request totals and 1xx/2xx/3xx/4xx/5xx outcomes;
 - room create, join, start, finish, active/waiting/playing, and cleanup;
 - Pod/Service create, list, delete, reconciliation, and failure outcomes;
 - SQLite open/migrate/read/write/delete operation outcomes;
 - admission rejection and WebSocket upgrade, active, assignment, disconnect,
-  relay, callback, and write outcomes.
+  relay, callback, and write outcomes;
+- fixed-name cumulative duration distributions for HTTP request and room
+  create/join/start/cleanup/reconciliation operations, with no labels.
 
 Every HTTP response receives `X-Request-ID` and `X-Correlation-ID`. IDs are
 server-generated 128-bit lowercase hexadecimal values; inbound values are used

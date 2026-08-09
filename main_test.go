@@ -54,6 +54,10 @@ func TestRequestIDIsOpaqueValidatedAndPropagated(t *testing.T) {
 	if counters["pong_http_requests_success"] != 1 || counters["pong_http_responses_2xx"] != 1 {
 		t.Fatalf("success metrics = %+v", counters)
 	}
+	body := registry.Render()
+	if !strings.Contains(body, "pong_http_request_duration_seconds_count 1") {
+		t.Fatalf("request duration metric missing: %q", body)
+	}
 }
 
 func TestRequestMetricsCountsFailureWithoutRequestData(t *testing.T) {

@@ -38,6 +38,10 @@ type Recorder interface {
 	SetGauge(string, int64)
 }
 
+type durationRecorder interface {
+	ObserveDuration(string, time.Duration)
+}
+
 // RoomResource is the privacy-safe subset of orchestration state needed for
 // reconciliation tests and production cleanup.
 type RoomResource struct {
@@ -146,6 +150,12 @@ func (s *Server) metricResult(operation string, err error) {
 	}
 }
 
+func (s *Server) observeDuration(name string, started time.Time) {
+	if recorder, ok := s.recorder.(durationRecorder); ok {
+		recorder.ObserveDuration(name, time.Since(started))
+	}
+}
+
 // shortID generates a 6-char hex room ID.
 func shortID() string {
 	b := make([]byte, 3)
@@ -155,7 +165,11 @@ func shortID() string {
 
 // CreateRoom creates a new room (locally or via K8s API).
 func (s *Server) CreateRoom(name string) (room *db.Room, err error) {
-	defer func() { s.metricResult("room_create", err) }()
+	started := time.Now()
+	defer func() {
+		s.metricResult("room_create", err)
+		s.observeDuration("pong_room_create_duration_seconds", started)
+	}()
 	id := shortID()
 	room, err = s.store.CreateRoom(id, name)
 	if err != nil {
@@ -234,7 +248,11 @@ func (s *Server) ListRooms() ([]db.Room, error) {
 // JoinRoom reserves one of the room's two player slots. The room remains in
 // waiting status until the room process confirms both WebSocket connections.
 func (s *Server) JoinRoom(id string) (err error) {
-	defer func() { s.metricResult("room_join", err) }()
+	started := time.Now()
+	defer func() {
+		s.metricResult("room_join", err)
+		s.observeDuration("pong_room_join_duration_seconds", started)
+	}()
 	if !ValidRoomID(id) {
 		return ErrInvalidRoomID
 	}
@@ -251,7 +269,11 @@ func (s *Server) JoinRoom(id string) (err error) {
 // MarkRoomStarted records that both players have connected to the room
 // WebSocket. Reservations made through JoinRoom alone never start a room.
 func (s *Server) MarkRoomStarted(id string) (err error) {
-	defer func() { s.metricResult("room_start", err) }()
+	started := time.Now()
+	defer func() {
+		s.metricResult("room_start", err)
+		s.observeDuration("pong_room_start_duration_seconds", started)
+	}()
 	return s.store.MarkRoomPlaying(id)
 }
 
@@ -284,7 +306,11 @@ func (s *Server) cleanupResources(roomID string) error {
 // is safe to call repeatedly; a resource deletion failure retains the row so
 // restart reconciliation can retry it.
 func (s *Server) CleanupRoom(roomID string) (err error) {
-	defer func() { s.metricResult("room_cleanup", err) }()
+	started := time.Now()
+	defer func() {
+		s.metricResult("room_cleanup", err)
+		s.observeDuration("pong_room_cleanup_duration_seconds", started)
+	}()
 	if err = s.cleanupResources(roomID); err != nil {
 		return err
 	}
@@ -319,7 +345,11 @@ func (s *Server) k8sConfig() (token []byte, apiHost, apiPort, ns string, err err
 // ReconcileRooms removes terminal or orphaned room resources after an API
 // restart. Active rooms remain untouched.
 func (s *Server) ReconcileRooms() (err error) {
-	defer func() { s.metricResult("reconcile", err) }()
+	started := time.Now()
+	defer func() {
+		s.metricResult("reconcile", err)
+		s.observeDuration("pong_room_reconcile_duration_seconds", started)
+	}()
 	rooms, err := s.store.ListRooms()
 	if err != nil {
 		return err

@@ -363,11 +363,15 @@ exporter documentation:
 - <https://opentelemetry.io/docs/languages/go/instrumentation/>
 - <https://pkg.go.dev/go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp>
 
-Scrape `/metrics` through the existing private/cluster monitoring path. Do not
-add labels or relabel rules containing room IDs, names, IPs, tokens, URLs, or
-request IDs. Alerting should use the aggregate success/failure counters and
-active/waiting/playing gauges; request IDs are for short-lived request
-correlation only and are not a metric dimension.
+Scrape `/metrics` through the existing private/cluster monitoring path. The
+machine-readable `slo-contract.json` defines the external 99%/30d journey SLI;
+internal metrics are diagnostics and do not establish public availability. Do
+not add labels or relabel rules containing room IDs, names, IPs, tokens, URLs,
+or request IDs. Alerting should use aggregate success/failure counters,
+bounded duration distributions, and active/waiting/playing gauges; request IDs
+are for short-lived request correlation only and are not a metric dimension.
+The separate controlled-drill recovery objective is P95 under six minutes and
+must not be derived from these availability signals.
 
 The orchestration contract is intentionally conservative:
 

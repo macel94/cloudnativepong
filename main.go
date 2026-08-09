@@ -1097,6 +1097,7 @@ func (w *responseRecorder) Unwrap() http.ResponseWriter { return w.ResponseWrite
 
 func requestMetrics(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		started := time.Now()
 		ctx := telemetry.Extract(r.Context(), r.Header)
 		ctx, span := appTelemetry.Start(ctx, "http.request", attribute.String("http.route", telemetry.HTTPRoute(r.URL.Path)), attribute.String("http.method", r.Method))
 		defer span.End()
@@ -1108,6 +1109,7 @@ func requestMetrics(next http.Handler) http.Handler {
 		recorder := &responseRecorder{ResponseWriter: w}
 		appMetrics.Inc("pong_http_requests")
 		next.ServeHTTP(recorder, r)
+		appMetrics.ObserveDuration("pong_http_request_duration_seconds", time.Since(started))
 		status := recorder.statusCode()
 		span.SetAttributes(attribute.Int("http.status_code", status))
 		if status >= 400 {

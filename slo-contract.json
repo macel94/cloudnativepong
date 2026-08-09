@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "schema_version": "belacca.pong-slo-contract.v1",
+  "service": "cloud-native-pong",
+  "availability": {
+    "target": 0.99,
+    "target_percent": "99%",
+    "window": "30d",
+    "sla": false,
+    "source": "external-durable-synthetic",
+    "measurement": "One hourly observation is good only when the public homepage, health, room create/join, two-player WebSocket-compatible playing state, and cleanup journey all pass."
+  },
+  "journey": {
+    "id": "pong-user-journey",
+    "good_conditions": [
+      "homepage marker is served",
+      "health endpoint returns ok",
+      "room creation returns a valid waiting room",
+      "room join returns the exact connection contract",
+      "two unique WebSocket players receive joined and playing state",
+      "room cleanup is observed after disconnect"
+    ],
+    "failure_stages": [
+      "homepage",
+      "health",
+      "room-create",
+      "room-join",
+      "websocket-assignment",
+      "playing-state",
+      "cleanup"
+    ],
+    "failure_output": "Aggregate stage identifier and bounded failure code only; no room IDs, player names, addresses, tokens, URLs, response bodies, or request IDs."
+  },
+  "diagnostics": {
+    "metric_names": [
+      "pong_http_request_duration_seconds",
+      "pong_room_create_duration_seconds",
+      "pong_room_join_duration_seconds",
+      "pong_room_start_duration_seconds",
+      "pong_room_cleanup_duration_seconds",
+      "pong_room_reconcile_duration_seconds"
+    ],
+    "labels": [],
+    "purpose": "Private native metrics diagnose latency, saturation, and lifecycle behavior; they do not calculate public availability or replace external SLO evidence."
+  },
+  "recovery": {
+    "target": "P95 under 6 minutes",
+    "scope": "Approved isolated controlled drills only",
+    "included_in_availability": false
+  }
+}
