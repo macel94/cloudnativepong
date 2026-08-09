@@ -490,9 +490,12 @@ LOAD_SMOKE_BASE_URL=http://localhost:8080 \
   ./scripts/load-smoke.sh --iterations=3 --concurrency=2
 ```
 
-The harness is intended for local smoke/load checks and external test targets,
-not as a replacement for a production rate limiter. Existing public synthetic
-checks remain in `scripts/synthetic-check.sh`.
+The harness is intended for local smoke/load checks and explicitly approved
+disposable experiment targets, not as a replacement for a production rate
+limiter. Loopback targets need no authorization; every non-local target requires
+`LOAD_SMOKE_EXPERIMENT_APPROVED=1`, and the canonical public Pong production
+hostname is never selected by default. The scheduled `synthetic-check` workflow
+is a separate low-rate availability check and does not run this load harness.
 
 ## 📊 Verification Status
 

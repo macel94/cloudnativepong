@@ -1,11 +1,13 @@
 #!/usr/bin/env node
 /**
- * Bounded local/public Pong journey smoke and load harness.
+ * Bounded local/disposable Pong journey smoke and load harness.
  *
- * It deliberately reports aggregate operation results only. Room IDs, names,
+ * Non-local targets require an explicit approved experiment marker. The
+ * harness deliberately reports aggregate operation results only. Room IDs, names,
  * URLs, client addresses, tokens, and response bodies never appear in output.
  */
 import process from 'node:process';
+import { isIP } from 'node:net';
 import WebSocket from 'ws';
 
 const MAX_ITERATIONS = 50;
@@ -16,6 +18,8 @@ const DEFAULT_ITERATIONS = 3;
 const DEFAULT_CONCURRENCY = 1;
 const DEFAULT_TIMEOUT_MS = 10_000;
 const DEFAULT_DURATION_MS = 60_000;
+const CANONICAL_PUBLIC_HOSTNAME = 'pong.belacca.com';
+const EXPERIMENT_APPROVAL_VALUE = '1';
 
 const flags = parseFlags(process.argv.slice(2));
 const dryRun = flags.has('dry-run');
@@ -29,6 +33,7 @@ const origin = process.env.LOAD_SMOKE_ORIGIN || inferOrigin(baseURL);
 
 if (flags.has('help')) {
   console.log('usage: LOAD_SMOKE_BASE_URL=http://localhost:8080 node scripts/load-smoke.mjs [--dry-run]');
+  console.log('non-local targets require LOAD_SMOKE_EXPERIMENT_APPROVED=1');
   process.exit(0);
 }
 
@@ -38,6 +43,14 @@ try {
   if (!['http:', 'https:'].includes(base.protocol)) throw new Error('unsupported protocol');
 } catch {
   console.error('load smoke configuration rejected: base URL must use http or https');
+  process.exit(2);
+}
+
+if (!isLocalTarget(base) && process.env.LOAD_SMOKE_EXPERIMENT_APPROVED !== EXPERIMENT_APPROVAL_VALUE) {
+  const targetDescription = normalizeHostname(base.hostname) === CANONICAL_PUBLIC_HOSTNAME
+    ? 'canonical public Pong production'
+    : 'a non-local target';
+  console.error(`load smoke configuration rejected: ${targetDescription} requires LOAD_SMOKE_EXPERIMENT_APPROVED=1`);
   process.exit(2);
 }
 
@@ -79,14 +92,19 @@ function fail(code) {
 }
 
 async function request(path, options = {}) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
   const started = Date.now();
+  const remainingUntilDeadline = deadline - started;
+  if (remainingUntilDeadline <= 0) return { response: null, body: '', started, failureCode: 'deadline' };
+  const remainingMs = Math.min(timeoutMs, remainingUntilDeadline);
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), remainingMs);
   try {
     const response = await fetch(endpoint(path), { ...options, signal: controller.signal });
-    return { response, started };
+    const body = await response.text();
+    return { response, body, started };
   } catch {
-    return { response: null, started };
+    return { response: null, body: '', started, failureCode: Date.now() >= deadline ? 'deadline' : 'transport' };
   } finally {
     clearTimeout(timer);
   }
@@ -95,12 +113,12 @@ async function request(path, options = {}) {
 async function jsonRequest(name, path, options = {}) {
   const result = await request(path, options);
   if (!result.response) {
-    record(name, result.started, false, `${name}_transport`);
+    record(name, result.started, false, `${name}_${result.failureCode || 'transport'}`);
     return null;
   }
   let body;
   try {
-    body = await result.response.json();
+    body = JSON.parse(result.body);
   } catch {
     record(name, result.started, false, `${name}_body`);
     return null;
@@ -121,12 +139,10 @@ async function runOne(sequence) {
 
   const healthResult = await request('/health');
   if (!healthResult.response || !healthResult.response.ok) {
-    record('health', healthResult.started, false, 'health_unavailable');
+    record('health', healthResult.started, false, `health_${healthResult.failureCode || 'unavailable'}`);
     return false;
   }
-  try {
-    await healthResult.response.text();
-  } catch {
+  if (!healthResult.body.trim()) {
     record('health', healthResult.started, false, 'health_body');
     return false;
   }
@@ -143,6 +159,7 @@ async function runOne(sequence) {
   }
 
   let sockets = [];
+  let connectionAttempted = false;
   let cleanupStarted = Date.now();
   try {
     const joined = await jsonRequest('join', '/api/rooms/join', {
@@ -150,8 +167,15 @@ async function runOne(sequence) {
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ room_id: room.id }),
     });
-    if (!joined) return false;
+    const validConnectionContract = joined && joined.room_id === room.id && (
+      joined.ws_path === `/rooms/${room.id}/ws` || joined.mode === 'local'
+    );
+    if (!validConnectionContract) {
+      fail('join_contract');
+      return false;
+    }
 
+    connectionAttempted = true;
     const wsStarted = Date.now();
     const results = await Promise.allSettled([
       openPlayer(room.id),
@@ -171,7 +195,7 @@ async function runOne(sequence) {
     }
     // If the journey failed before a socket was established, make one bounded
     // best-effort connection so the room lifecycle can still signal finished.
-    if (sockets.length === 0) {
+    if (connectionAttempted && sockets.length === 0) {
       try {
         const socket = await openPlayer(room.id);
         socket.close();
@@ -186,14 +210,20 @@ async function runOne(sequence) {
 
 function openPlayer(roomID) {
   return new Promise((resolve, reject) => {
+    const remainingUntilDeadline = deadline - Date.now();
+    if (remainingUntilDeadline <= 0) {
+      reject(new Error('deadline'));
+      return;
+    }
+    const remainingMs = Math.min(timeoutMs, remainingUntilDeadline);
     const socket = new WebSocket(websocketEndpoint(`/rooms/${roomID}/ws`), {
       headers: { Origin: origin },
-      handshakeTimeout: timeoutMs,
+      handshakeTimeout: remainingMs,
     });
     let joined = false;
     let state = false;
     let settled = false;
-    const timer = setTimeout(() => finish(new Error('timeout')), timeoutMs);
+    const timer = setTimeout(() => finish(new Error(Date.now() >= deadline ? 'deadline' : 'timeout')), remainingMs);
     const finish = (error) => {
       if (settled) return;
       settled = true;
@@ -232,7 +262,7 @@ async function waitForCleanup(roomID, started) {
     const result = await request('/api/rooms');
     if (result.response) {
       try {
-        const rooms = await result.response.json();
+        const rooms = JSON.parse(result.body);
         if (result.response.ok && Array.isArray(rooms) && !rooms.some((room) => room && room.id === roomID)) {
           return { ok: true, started };
         }
@@ -285,12 +315,22 @@ function websocketEndpoint(path) {
 function inferOrigin(value) {
   try {
     const parsed = new URL(value);
-    return ['localhost', '127.0.0.1', '[::1]'].includes(parsed.hostname)
-      ? 'http://localhost:8080'
-      : 'https://pong.belacca.com';
+    return isLocalTarget(parsed) ? 'http://localhost:8080' : 'https://pong.belacca.com';
   } catch {
     return 'http://localhost:8080';
   }
+}
+
+function normalizeHostname(hostname) {
+  return hostname.toLowerCase().replace(/^\[|\]$/gu, '').replace(/\.$/u, '');
+}
+
+function isLocalTarget(url) {
+  const hostname = normalizeHostname(url.hostname);
+  if (hostname === 'localhost' || hostname.endsWith('.localhost')) return true;
+  if (isIP(hostname) === 4) return hostname.startsWith('127.');
+  if (isIP(hostname) === 6) return hostname === '::1' || hostname.startsWith('::ffff:127.');
+  return false;
 }
 
 function parseFlags(argv) {

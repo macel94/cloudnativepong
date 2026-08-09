@@ -5,6 +5,12 @@ on:
     - cron: '*/15 * * * *'
   workflow_dispatch:
 
+# A scheduled run and a manual low-rate check must never exercise the public
+# journey at the same time.
+concurrency:
+  group: synthetic-check
+  cancel-in-progress: false
+
 # The canonical target is public and does not require credentials. A repository
 # or organization variable may override it for an approved alternate ingress;
 # the optional token is only for a protected front door. The runner fails if

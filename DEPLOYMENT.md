@@ -390,10 +390,17 @@ LOAD_SMOKE_BASE_URL=http://127.0.0.1:8080 \
   ./scripts/load-smoke.sh --iterations=5 --concurrency=2
 ```
 
-Use the scheduled synthetic script for the public workflow. For local or
-alternate targets, set `SYNTHETIC_BASE_URL` explicitly; the shell wrapper
-refuses to run without it. The runner is bounded and verifies cleanup, but do
-not run sustained load against the public endpoint without an approved window.
+Use the scheduled synthetic script for the public workflow; it is a low-rate
+availability check, not a load generator. The availability objective is 99% per
+public service over 30 days; the controlled-drill recovery objective is P95 under
+six minutes and is separate from availability. For local or disposable load-smoke
+runs, set `LOAD_SMOKE_BASE_URL` explicitly. Loopback targets work without extra
+authorization; every non-local target requires the explicit operator marker
+`LOAD_SMOKE_EXPERIMENT_APPROVED=1` for an approved experiment. The marker is not
+configured by the workflow, and the canonical public Pong target is never a
+default for this harness. The load runner is bounded and verifies cleanup, but
+do not run traffic against public production without a separately approved
+window.
 
 ## Useful checks
 

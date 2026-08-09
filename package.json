@@ -4,6 +4,7 @@
   "scripts": {
     "test": "npx playwright test",
     "test:synthetic": "node --test scripts/synthetic-check.test.mjs",
+    "test:load-smoke": "node --test scripts/load-smoke.test.mjs",
     "test:ui": "npx playwright test --ui"
   },
   "devDependencies": {
