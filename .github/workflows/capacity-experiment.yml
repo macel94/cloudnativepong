@@ -34,8 +34,8 @@ permissions:
   contents: read
 
 env:
-  CLUSTER_NAME: cloudnativepong-capacity-${{ github.run_id }}
-  KUBE_CONTEXT: k3d-cloudnativepong-capacity-${{ github.run_id }}
+  CLUSTER_NAME: cnp-capacity-${{ github.run_id }}
+  KUBE_CONTEXT: k3d-cnp-capacity-${{ github.run_id }}
   ITERATIONS: '${{ inputs.iterations }}'
   EXPERIMENT_CONCURRENCY: '${{ inputs.concurrency }}'
   TIMEOUT_MS: '${{ inputs.timeout_ms }}'

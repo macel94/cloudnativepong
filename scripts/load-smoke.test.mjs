@@ -4,6 +4,7 @@ import { createServer } from 'node:http';
 import { once } from 'node:events';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { readFile } from 'node:fs/promises';
 
 const PROJECT_ROOT = fileURLToPath(new URL('../', import.meta.url));
 const SCRIPT = fileURLToPath(new URL('./load-smoke.mjs', import.meta.url));
@@ -48,6 +49,13 @@ async function runAsync(args = [], environment = {}) {
     stderr: Buffer.concat(stderr).toString(),
   };
 }
+
+test('capacity workflow keeps its disposable cluster name within k3d limits', async () => {
+  const workflow = await readFile(new URL('../.github/workflows/capacity-experiment.yml', import.meta.url), 'utf8');
+  assert.match(workflow, /CLUSTER_NAME: cnp-capacity-\$\{\{ github\.run_id \}\}/u);
+  assert.match(workflow, /KUBE_CONTEXT: k3d-cnp-capacity-\$\{\{ github\.run_id \}\}/u);
+  assert.doesNotMatch(workflow, /cloudnativepong-capacity-/u);
+});
 
 test('dry-run defaults to a local target and emits aggregate metadata only', () => {
   const result = run(['--dry-run']);

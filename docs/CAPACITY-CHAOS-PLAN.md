@@ -41,7 +41,8 @@ creation. The permitted bounds are:
 | `max_duration_ms` | 60000 | 1000-180000 |
 
 The experiment has no GitHub matrix, retry fan-out, or parallel workflow jobs.
-It builds and imports the four local images (`api`, `room`, `static`, and
+The run-ID-derived cluster name is deliberately short enough for k3d's 32-character
+limit while remaining unique to the run. It builds and imports the four local images (`api`, `room`, `static`, and
 `gateway`) sequentially. The cluster name is exactly derived from the run ID;
 cleanup runs even when a later step fails and names only that exact cluster.
 An ownership marker prevents cleanup from deleting a cluster if creation did
