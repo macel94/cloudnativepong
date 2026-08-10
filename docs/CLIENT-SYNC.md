@@ -21,7 +21,10 @@ client cannot move a paddle, ball, or score by sending a fabricated coordinate.
 
 The browser-facing room connection sends authoritative snapshots and accepts
 input over both WebSocket and the optional WebTransport stream. Both
-transports use the same JSON game protocol.
+transports use the same JSON game protocol. A spectator connects with the
+`spectator=1` query parameter and receives a `{"type":"spectator"}` acknowledgement
+followed by the same snapshots. Spectators do not occupy either player slot,
+do not send input, and do not affect room start or cleanup lifecycle.
 
 ## Input acknowledgement protocol
 
@@ -100,7 +103,9 @@ acknowledgements. `tests/prediction.spec.ts` uses a controlled delayed socket to
 verify that the local paddle moves before another authoritative snapshot is
 available and that sequence-bearing inputs are sent. The regular Playwright
 room workflow continues to verify that two real clients join and exchange
-playing state.
+playing state; the room workflow also verifies that a third client can watch a
+playing room without increasing its player count. The Go proxy test verifies
+that spectator disconnect does not disconnect the players or finish the room.
 
 When changing this contract, run:
 

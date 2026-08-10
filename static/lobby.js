@@ -41,11 +41,20 @@ function renderRooms(rooms) {
                 <span class="room-name">${esc(r.name || 'Untitled')}</span>
                 <span class="room-meta"> &middot; ${r.players}/2 players &middot; ${r.status}</span>
             </div>
-            <button class="btn primary join-btn" onclick="joinRoom('${r.id}')" ${r.players >= 2 ? 'disabled' : ''}>
-                ${r.players >= 2 ? 'Full' : 'Join'}
-            </button>
+            <div class="room-actions">
+                <button class="btn primary join-btn" onclick="joinRoom('${r.id}')" ${r.players >= 2 ? 'disabled' : ''}>
+                    ${r.players >= 2 ? 'Full' : 'Join'}
+                </button>
+                ${r.status === 'playing' && r.players >= 2
+                    ? `<button class="btn secondary watch-btn" onclick="watchRoom('${r.id}')">Watch</button>`
+                    : ''}
+            </div>
         </div>
     `).join('');
+}
+
+function watchRoom(id) {
+    window.location.href = '/game.html?room=' + encodeURIComponent(id) + '&mode=spectator';
 }
 
 function playAgainstComputer() {

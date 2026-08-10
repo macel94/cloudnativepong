@@ -790,6 +790,151 @@ func TestProxyRoomWSRoutesFourRoomsToTheirOwnBackends(t *testing.T) {
 	}
 }
 
+func TestProxyRoomWSSupportsSpectatorsWithoutTakingPlayerSlot(t *testing.T) {
+	oldAdmission := publicAdmission
+	publicAdmission = admission.NewController(admission.Config{
+		Window:              time.Minute,
+		CreatePerWindow:     100,
+		JoinPerWindow:       100,
+		HTTPPerClient:       16,
+		WebSocketsPerClient: 8,
+		MaxWebSockets:       16,
+		MaxClients:          8,
+	})
+	t.Cleanup(func() { publicAdmission = oldAdmission })
+
+	store, err := db.New(":memory:")
+	if err != nil {
+		t.Fatalf("db.New() error = %v", err)
+	}
+	defer store.Close()
+
+	lobbySrv := lobby.NewServer(store, "local", "", "")
+	room, err := lobbySrv.CreateRoom("spectator-room")
+	if err != nil {
+		t.Fatalf("CreateRoom() error = %v", err)
+	}
+	if err := lobbySrv.JoinRoom(room.ID); err != nil {
+		t.Fatalf("first JoinRoom() error = %v", err)
+	}
+	if err := lobbySrv.JoinRoom(room.ID); err != nil {
+		t.Fatalf("second JoinRoom() error = %v", err)
+	}
+
+	roomMux := http.NewServeMux()
+	setupRoomRoutes(roomMux, room.ID, "")
+	roomServer := httptest.NewServer(roomMux)
+	defer roomServer.Close()
+	lobbySrv.RegisterLocalRoom(room.ID, &lobby.RoomHandler{
+		ID:   room.ID,
+		Addr: strings.TrimPrefix(roomServer.URL, "http://"),
+	})
+
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxyRoomWS(w, r, lobbySrv, store)
+	}))
+	defer proxy.Close()
+
+	dial := func(query string) *websocket.Conn {
+		conn, response, err := websocket.DefaultDialer.Dial(
+			"ws"+strings.TrimPrefix(proxy.URL, "http")+"/rooms/"+room.ID+"/ws"+query,
+			http.Header{"Origin": []string{"http://localhost:8080"}},
+		)
+		if err != nil {
+			if response != nil {
+				response.Body.Close()
+			}
+			t.Fatalf("proxy Dial(%q) error = %v", query, err)
+		}
+		if err := conn.WriteJSON(map[string]string{"type": "proxy-ready"}); err != nil {
+			_ = conn.Close()
+			t.Fatalf("proxy-ready(%q) error = %v", query, err)
+		}
+		return conn
+	}
+
+	readMessage := func(t *testing.T, conn *websocket.Conn) (string, []byte) {
+		t.Helper()
+		conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+		messageType, payload, err := conn.ReadMessage()
+		if err != nil {
+			t.Fatalf("ReadMessage() error = %v", err)
+		}
+		if messageType != websocket.TextMessage {
+			t.Fatalf("message type = %d, want text", messageType)
+		}
+		var envelope struct {
+			Type string `json:"type"`
+		}
+		if err := json.Unmarshal(payload, &envelope); err != nil {
+			t.Fatalf("decode message envelope: %v", err)
+		}
+		return envelope.Type, payload
+	}
+
+	readUntil := func(t *testing.T, conn *websocket.Conn, wantType string, stateStatus game.Status) []byte {
+		t.Helper()
+		for {
+			typeName, payload := readMessage(t, conn)
+			if typeName != wantType {
+				continue
+			}
+			if stateStatus == "" {
+				return payload
+			}
+			var message struct {
+				State game.State `json:"state"`
+			}
+			if err := json.Unmarshal(payload, &message); err != nil {
+				t.Fatalf("decode state: %v", err)
+			}
+			if message.State.Status == stateStatus {
+				return payload
+			}
+		}
+	}
+
+	spectator := dial("?spectator=1")
+	defer spectator.Close()
+	if typeName, _ := readMessage(t, spectator); typeName != "spectator" {
+		t.Fatalf("spectator first message type = %q, want spectator", typeName)
+	}
+	readUntil(t, spectator, "state", game.StatusWaiting)
+
+	player1 := dial("")
+	defer player1.Close()
+	var firstJoined struct {
+		Player int `json:"player"`
+	}
+	if payload := readUntil(t, player1, "joined", ""); json.Unmarshal(payload, &firstJoined) != nil || firstJoined.Player != 1 {
+		t.Fatalf("first player assignment = %+v, want Player 1", firstJoined)
+	}
+
+	player2 := dial("")
+	defer player2.Close()
+	var secondJoined struct {
+		Player int `json:"player"`
+	}
+	if payload := readUntil(t, player2, "joined", ""); json.Unmarshal(payload, &secondJoined) != nil || secondJoined.Player != 2 {
+		t.Fatalf("second player assignment = %+v, want Player 2", secondJoined)
+	}
+
+	var playing struct {
+		State game.State `json:"state"`
+	}
+	if err := json.Unmarshal(readUntil(t, spectator, "state", game.StatusPlaying), &playing); err != nil {
+		t.Fatalf("decode spectator playing state: %v", err)
+	}
+	if !playing.State.P1Ready || !playing.State.P2Ready {
+		t.Fatalf("spectator state readiness = p1:%v p2:%v, want both ready", playing.State.P1Ready, playing.State.P2Ready)
+	}
+
+	if err := spectator.Close(); err != nil {
+		t.Fatalf("close spectator: %v", err)
+	}
+	readUntil(t, player2, "state", game.StatusPlaying)
+}
+
 func TestRelayBrowserToTargetSuppressesProxyReady(t *testing.T) {
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	received := make(chan string, 1)

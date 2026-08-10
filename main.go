@@ -656,6 +656,11 @@ func handleGameConnection(conn gameConnection, r *http.Request, roomID, lobbyAdd
 	defer conn.Close()
 
 	room := getOrCreateLocalRoom(roomID)
+	if isSpectatorRequest(r) {
+		handleSpectatorConnection(conn, room, transport)
+		return
+	}
+
 	room.mu.Lock()
 	var player int
 	if room.players[0] == nil {
@@ -722,24 +727,65 @@ func handleGameConnection(conn gameConnection, r *http.Request, roomID, lobbyAdd
 	}()
 
 	room.loopOnce.Do(func() { go runGameLoop(room) })
+	streamRoomStates(conn, room, transport, true, roomID)
+}
+
+func handleSpectatorConnection(conn gameConnection, room *localRoom, transport string) {
+	appMetrics.Inc("pong_" + transport + "_spectator_accepted")
+	if err := conn.WriteJSON(map[string]string{"type": "spectator"}); err != nil {
+		appMetrics.Inc("pong_" + transport + "_spectator_joined_write_failure")
+		return
+	}
+	appMetrics.Inc("pong_" + transport + "_spectator_joined_write_success")
+
+	// Spectators do not send game inputs, but drain unexpected application
+	// frames so WebSocket control frames continue to be serviced.
+	go func() {
+		for {
+			var ignored json.RawMessage
+			if err := conn.ReadJSON(&ignored); err != nil {
+				return
+			}
+		}
+	}()
+
+	streamRoomStates(conn, room, transport, false, "")
+}
+
+func streamRoomStates(conn gameConnection, room *localRoom, transport string, finishRoom bool, roomID string) {
 	ticker := time.NewTicker(game.TickDuration)
 	defer ticker.Stop()
 	for range ticker.C {
 		state := room.engine.State()
 		if err := conn.WriteJSON(map[string]interface{}{"type": "state", "state": state}); err != nil {
 			appMetrics.Inc("pong_" + transport + "_state_write_failure")
-			room.signalFinished()
+			if finishRoom {
+				room.signalFinished()
+			}
 			return
 		}
 		appMetrics.Inc("pong_" + transport + "_state_write_success")
 		if state.Status == game.StatusFinished {
-			appMetrics.Inc("pong_room_finished")
-			room.signalFinished()
-			time.Sleep(3 * time.Second)
-			localRooms.Delete(roomID)
+			if finishRoom {
+				appMetrics.Inc("pong_room_finished")
+				room.signalFinished()
+				time.Sleep(3 * time.Second)
+				localRooms.Delete(roomID)
+			}
 			return
 		}
 	}
+}
+
+func isSpectatorRequest(r *http.Request) bool {
+	return r.URL.Query().Get("spectator") == "1"
+}
+
+func roomWebSocketURL(addr string, spectator bool) string {
+	if spectator {
+		return "ws://" + addr + "/ws?spectator=1"
+	}
+	return "ws://" + addr + "/ws"
 }
 
 func runGameLoop(room *localRoom) {
@@ -1171,7 +1217,7 @@ func proxyRoomWebTransport(session *webtransport.Session, r *http.Request, roomI
 	telemetry.Inject(r.Context(), targetHeader)
 	var target *websocket.Conn
 	for i := 0; i < 10; i++ {
-		target, _, err = dialer.Dial("ws://"+addr+"/ws", targetHeader)
+		target, _, err = dialer.Dial(roomWebSocketURL(addr, isSpectatorRequest(r)), targetHeader)
 		if err == nil {
 			break
 		}
@@ -1328,7 +1374,7 @@ func proxyRoomWS(w http.ResponseWriter, r *http.Request, lobbySrv *lobby.Server,
 	targetHeader.Set(correlationIDHeader, requestID(r))
 	telemetry.Inject(r.Context(), targetHeader)
 	for i := 0; i < 10; i++ {
-		target, _, err = dialer.Dial("ws://"+addr+"/ws", targetHeader)
+		target, _, err = dialer.Dial(roomWebSocketURL(addr, isSpectatorRequest(r)), targetHeader)
 		if err == nil {
 			break
 		}

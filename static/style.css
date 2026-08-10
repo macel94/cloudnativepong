@@ -156,7 +156,14 @@ h1 {
     color: #888;
 }
 
-.room-card .join-btn {
+.room-actions {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+}
+
+.room-card .join-btn,
+.room-card .watch-btn {
     padding: 6px 16px;
     font-size: 0.85rem;
 }

@@ -191,6 +191,57 @@ test.describe('Two-player game', () => {
     await p1Ctx.close();
     await p2Ctx.close();
   });
+
+  test('a third client can watch a live game without joining as a player', async ({ browser, request }) => {
+    const p1Ctx = await browser.newContext();
+    const p1Page = await p1Ctx.newPage();
+    await p1Page.goto(LOBBY_URL);
+    await p1Page.locator('#playerName').fill('SpectatorAlice');
+    await p1Page.locator('#btnNewRoom').click();
+    await p1Page.waitForURL(/game\.html\?room=/);
+    const roomId = new URL(p1Page.url()).searchParams.get('room');
+    expect(roomId).toBeTruthy();
+    await expect(p1Page.locator('#status')).toContainText('Player 1', {
+      timeout: process.env.TEST_MODE === 'k8s' ? 20_000 : 5_000,
+    });
+
+    const spectatorCtx = await browser.newContext();
+    const spectatorPage = await spectatorCtx.newPage();
+    await spectatorPage.goto(LOBBY_URL);
+
+    const p2Ctx = await browser.newContext();
+    const p2Page = await p2Ctx.newPage();
+    const joinResponse = await p2Page.request.post('/api/rooms/join', {
+      data: { room_id: roomId },
+    });
+    expect(joinResponse.ok()).toBeTruthy();
+    await p2Page.goto(`/game.html?room=${roomId}&name=SpectatorBob`);
+    await expect.poll(async () => (await p2Page.locator('#status').textContent()) || '', {
+      timeout: process.env.TEST_MODE === 'k8s' ? 20_000 : 5_000,
+    }).toMatch(/Player 2|Playing/);
+    await expect(p1Page.locator('#status')).toContainText('Playing!', {
+      timeout: process.env.TEST_MODE === 'k8s' ? 20_000 : 5_000,
+    });
+
+    const watchButton = spectatorPage.locator(`.watch-btn[onclick="watchRoom('${roomId}')"]`);
+    await expect(watchButton).toBeVisible({ timeout: 10_000 });
+    await watchButton.click();
+    await spectatorPage.waitForURL(new RegExp(`game\\.html\\?room=${roomId}&mode=spectator`));
+    await expect(spectatorPage.locator('#roomLabel')).toContainText('Live spectator');
+    await expect(spectatorPage.locator('#controlHint')).toHaveText('Watching live · controls disabled');
+    await expect(spectatorPage.locator('#touchControls')).toBeHidden();
+    await expect(spectatorPage.locator('#status')).toContainText('Playing!', {
+      timeout: process.env.TEST_MODE === 'k8s' ? 20_000 : 5_000,
+    });
+
+    const rooms = await (await request.get('/api/rooms')).json();
+    const room = rooms.find((candidate: { id: string }) => candidate.id === roomId);
+    expect(room?.players).toBe(2);
+
+    await spectatorCtx.close();
+    await p1Ctx.close();
+    await p2Ctx.close();
+  });
 });
 
 test.describe('API endpoints', () => {

@@ -447,6 +447,8 @@ The lobby keeps the browser-facing HTTP connection hijacked because the gateway 
 
 Room capacity reservations and actual connections are separate lifecycle events: creating a room reserves the creator's slot, `/api/rooms/join` reserves the opponent's slot, and the room Pod calls the internal `started` callback only after both room-side WebSocket connections are accepted. A public WebTransport session is bridged to that same room-side contract. A disconnect or game completion calls the `finished` callback, while a waiting room that never starts expires after 10 minutes. The lobby reconciles these waiting rooms every minute. The internal callbacks are reachable through the API ClusterIP only, not through the public gateway.
 
+Spectators use `/game.html?room=<id>&mode=spectator`; the browser adds `spectator=1` to the WebSocket or WebTransport room connection. The room sends a `{"type":"spectator"}` acknowledgement followed by the same authoritative state snapshots, but never assigns a player, accepts inputs, reserves capacity, starts a waiting room, or finishes/cleans up a room when a spectator disconnects. The lobby shows **Watch** only for rooms already in the playing state.
+
 The browser sends a small `{"type":"proxy-ready"}` message immediately after `WebSocket.onopen`. The lobby consumes that marker, releases the first room-to-browser frames only after the outer gateway handoff, and forwards all subsequent application messages. The browser-to-room relay validates masked client frames, reassembles fragmented messages, handles control frames, and enforces a 16 MiB message limit. The marker is harmless in local mode, where the browser connects directly to the in-process room handler.
 
 Online play deliberately decouples presentation from authoritative tick delivery:
@@ -584,7 +586,8 @@ contract and the separate availability/recovery objectives.
 2. Enter a display name.
 3. Click **New Room** (and share the link) or **Join** an existing room.
 4. Use **W/S** (Player 1) or **↑/↓** (Player 2) to move your paddle.
-5. First to 7 points wins!
+5. When a room is already playing, click **Watch** to view it live without taking a player slot.
+6. First to 7 points wins!
 
 ---
 

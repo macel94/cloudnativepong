@@ -7,10 +7,12 @@
     const playerName = params.get('name') || 'Player';
     const mode = params.get('mode') || 'local';
     const isAI = mode === 'ai';
+    const isSpectator = mode === 'spectator';
 
     const roomLabel = document.getElementById('roomLabel');
     const statusElement = document.getElementById('status');
     const controlHint = document.getElementById('controlHint');
+    const touchControls = document.getElementById('touchControls');
     const score1Element = document.getElementById('score1');
     const score2Element = document.getElementById('score2');
     const winnerOverlay = document.getElementById('winnerOverlay');
@@ -24,8 +26,11 @@
         return;
     }
 
-    document.body.dataset.gameMode = isAI ? 'ai' : 'online';
-    roomLabel.textContent = isAI ? 'vs Computer · Local AI' : 'Room: ' + roomId;
+    document.body.dataset.gameMode = isAI ? 'ai' : (isSpectator ? 'spectator' : 'online');
+    roomLabel.textContent = isAI
+        ? 'vs Computer · Local AI'
+        : (isSpectator ? 'Room: ' + roomId + ' · Live spectator' : 'Room: ' + roomId);
+    if (isSpectator && touchControls) touchControls.classList.add('hidden');
 
     let ws = null;
     let connection = null;
@@ -70,6 +75,10 @@
 
     function setControlHint() {
         if (!controlHint) return;
+        if (isSpectator) {
+            controlHint.textContent = 'Watching live · controls disabled';
+            return;
+        }
         const keyboard = player === 2 ? 'Arrow Up/Down' : 'W/S';
         controlHint.textContent = isAI
             ? `Playing vs Computer · ${keyboard} or touch buttons`
@@ -84,7 +93,9 @@
     function showWinner(winner) {
         if (gameOverShown || !winnerOverlay || !winnerText) return;
         gameOverShown = true;
-        winnerText.textContent = winner === player ? '🎉 You Win!' : '💀 You Lose!';
+        winnerText.textContent = isSpectator
+            ? `Player ${winner} wins!`
+            : (winner === player ? '🎉 You Win!' : '💀 You Lose!');
         winnerOverlay.classList.remove('hidden');
         statusElement.textContent = 'Game Over';
         if (connection) connection.close();
@@ -129,12 +140,12 @@
     }
 
     document.addEventListener('keydown', (event) => {
-        if (!movementKeys.has(event.key)) return;
+        if (isSpectator || !movementKeys.has(event.key)) return;
         event.preventDefault();
         keys[event.key] = true;
     });
     document.addEventListener('keyup', (event) => {
-        if (!movementKeys.has(event.key)) return;
+        if (isSpectator || !movementKeys.has(event.key)) return;
         event.preventDefault();
         keys[event.key] = false;
     });
@@ -236,6 +247,15 @@
     }
 
     function handleMessage(message) {
+        if (message.type === 'spectator') {
+            player = 0;
+            stateBuffer.length = 0;
+            predictedLocalPaddleY = null;
+            reconciliationTargetY = null;
+            setControlHint();
+            statusElement.textContent = 'Spectating live game. Waiting for players...';
+        }
+
         if (message.type === 'joined') {
             player = message.player;
             stateBuffer.length = 0;
@@ -262,7 +282,7 @@
             const receivedAt = performance.now();
             updatePresentationCorrection(lastRenderedState, state);
             gameState = state;
-            reconcileLocalPaddle(state, receivedAt);
+            if (!isSpectator) reconcileLocalPaddle(state, receivedAt);
             stateBuffer.push({ state, receivedAt });
             while (stateBuffer.length > 4 ||
                 (stateBuffer.length > 2 && receivedAt - stateBuffer[0].receivedAt > 160)) {
@@ -287,7 +307,8 @@
     function connectWebSocket() {
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
         const wsURL = `${protocol}//${window.location.host}/rooms/${encodeURIComponent(roomId)}/ws`;
-        ws = new WebSocket(wsURL);
+        const spectatorQuery = isSpectator ? '?spectator=1' : '';
+        ws = new WebSocket(wsURL + spectatorQuery);
         connection = {
             send: (value) => ws.send(JSON.stringify(value)),
             close: () => ws.close(),
@@ -295,7 +316,9 @@
         };
 
         ws.onopen = function () {
-            statusElement.textContent = 'Connected via WebSocket. Waiting for opponent...';
+            statusElement.textContent = isSpectator
+                ? 'Connected via WebSocket. Joining spectator view...'
+                : 'Connected via WebSocket. Waiting for opponent...';
             ws.send(JSON.stringify({ type: 'proxy-ready' }));
         };
         ws.onmessage = function (event) {
@@ -384,7 +407,8 @@
                 const capabilities = await response.json();
                 if (capabilities.webtransport && capabilities.webtransport_url) {
                     const url = capabilities.webtransport_url.replace('{room}', encodeURIComponent(roomId));
-                    await connectWebTransport(url);
+                    const spectatorQuery = isSpectator ? (url.includes('?') ? '&' : '?') + 'spectator=1' : '';
+                    await connectWebTransport(url + spectatorQuery);
                     return;
                 }
             } catch {
@@ -399,7 +423,7 @@
     // sequence is an acknowledgement marker, not a movement command: the
     // server remains authoritative and echoes the latest sequence it applied.
     setInterval(() => {
-        if (isAI || !connection || !connection.isOpen() || !player) return;
+        if (isAI || isSpectator || !connection || !connection.isOpen() || !player) return;
         const input = readLocalInput();
         const sequence = ++nextInputSequence;
         pendingInputs.push({ sequence, sentAt: performance.now() });
