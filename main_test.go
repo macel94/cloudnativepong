@@ -15,6 +15,7 @@ import (
 
 	"github.com/cloudnativepong/admission"
 	"github.com/cloudnativepong/db"
+	"github.com/cloudnativepong/game"
 	"github.com/cloudnativepong/lobby"
 	"github.com/cloudnativepong/metrics"
 	"github.com/gorilla/websocket"
@@ -588,6 +589,204 @@ func TestProxyRoomWSForwardsImmediateJoinedFrame(t *testing.T) {
 	}
 	if messageType != websocket.TextMessage || string(payload) != `{"type":"joined","player":1}` {
 		t.Fatalf("received message type=%d payload=%s, want immediate joined frame", messageType, payload)
+	}
+}
+
+func TestProxyRoomWSRoutesFourRoomsToTheirOwnBackends(t *testing.T) {
+	oldAdmission := publicAdmission
+	publicAdmission = admission.NewController(admission.Config{
+		Window:              time.Minute,
+		CreatePerWindow:     100,
+		JoinPerWindow:       100,
+		HTTPPerClient:       32,
+		WebSocketsPerClient: 16,
+		MaxWebSockets:       32,
+		MaxClients:          16,
+	})
+	t.Cleanup(func() { publicAdmission = oldAdmission })
+
+	store, err := db.New(":memory:")
+	if err != nil {
+		t.Fatalf("db.New() error = %v", err)
+	}
+	defer store.Close()
+
+	lobbySrv := lobby.NewServer(store, "local", "", "")
+	const roomCount = 4
+	type roomFixture struct {
+		id      string
+		backend *httptest.Server
+	}
+	fixtures := make([]roomFixture, 0, roomCount)
+	for index := 0; index < roomCount; index++ {
+		room, createErr := lobbySrv.CreateRoom("routing-room")
+		if createErr != nil {
+			t.Fatalf("CreateRoom(%d) error = %v", index, createErr)
+		}
+		if joinErr := lobbySrv.JoinRoom(room.ID); joinErr != nil {
+			t.Fatalf("first JoinRoom(%d) error = %v", index, joinErr)
+		}
+		if joinErr := lobbySrv.JoinRoom(room.ID); joinErr != nil {
+			t.Fatalf("second JoinRoom(%d) error = %v", index, joinErr)
+		}
+
+		roomID := room.ID
+		backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			conn, upgradeErr := upgrader.Upgrade(w, r, nil)
+			if upgradeErr != nil {
+				return
+			}
+			if writeErr := conn.WriteJSON(map[string]string{
+				"type":    "backend",
+				"room_id": roomID,
+			}); writeErr != nil {
+				_ = conn.Close()
+				return
+			}
+			handleGameConnection(webSocketGameConnection{conn: conn}, r, roomID, "", "websocket")
+		}))
+		lobbySrv.RegisterLocalRoom(room.ID, &lobby.RoomHandler{
+			ID:   room.ID,
+			Addr: strings.TrimPrefix(backend.URL, "http://"),
+		})
+		fixtures = append(fixtures, roomFixture{id: room.ID, backend: backend})
+	}
+	defer func() {
+		for _, fixture := range fixtures {
+			fixture.backend.Close()
+		}
+	}()
+
+	newProxy := func() *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			proxyRoomWS(w, r, lobbySrv, store)
+		}))
+	}
+	proxies := []*httptest.Server{newProxy(), newProxy()}
+	defer func() {
+		for _, proxy := range proxies {
+			proxy.Close()
+		}
+	}()
+
+	readType := func(t *testing.T, conn *websocket.Conn, wantType string, value interface{}) {
+		t.Helper()
+		conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+		for {
+			_, payload, readErr := conn.ReadMessage()
+			if readErr != nil {
+				t.Fatalf("ReadMessage(%s) error = %v", wantType, readErr)
+			}
+			var envelope struct {
+				Type string `json:"type"`
+			}
+			if unmarshalErr := json.Unmarshal(payload, &envelope); unmarshalErr != nil {
+				t.Fatalf("decode %s envelope: %v", wantType, unmarshalErr)
+			}
+			if envelope.Type != wantType {
+				continue
+			}
+			if unmarshalErr := json.Unmarshal(payload, value); unmarshalErr != nil {
+				t.Fatalf("decode %s message: %v", wantType, unmarshalErr)
+			}
+			return
+		}
+	}
+
+	readPlayingStateWithInput := func(t *testing.T, conn *websocket.Conn, sequence uint64) game.State {
+		t.Helper()
+		conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+		for {
+			_, payload, readErr := conn.ReadMessage()
+			if readErr != nil {
+				t.Fatalf("ReadMessage(state) error = %v", readErr)
+			}
+			var message struct {
+				Type  string     `json:"type"`
+				State game.State `json:"state"`
+			}
+			if unmarshalErr := json.Unmarshal(payload, &message); unmarshalErr != nil {
+				t.Fatalf("decode state message: %v", unmarshalErr)
+			}
+			if message.Type != "state" || message.State.Status != game.StatusPlaying || message.State.P1InputSequence < sequence {
+				continue
+			}
+			return message.State
+		}
+	}
+
+	connections := make([]*websocket.Conn, 0, roomCount*2)
+	defer func() {
+		for _, conn := range connections {
+			_ = conn.Close()
+		}
+	}()
+
+	for index, fixture := range fixtures {
+		proxy := proxies[index%len(proxies)]
+		dial := func() *websocket.Conn {
+			conn, response, dialErr := websocket.DefaultDialer.Dial(
+				"ws"+strings.TrimPrefix(proxy.URL, "http")+"/rooms/"+fixture.id+"/ws",
+				http.Header{"Origin": []string{"http://localhost:8080"}},
+			)
+			if dialErr != nil {
+				if response != nil {
+					response.Body.Close()
+				}
+				t.Fatalf("room %d proxy Dial() error = %v", index, dialErr)
+			}
+			if writeErr := conn.WriteJSON(map[string]string{"type": "proxy-ready"}); writeErr != nil {
+				_ = conn.Close()
+				t.Fatalf("room %d proxy-ready error = %v", index, writeErr)
+			}
+			connections = append(connections, conn)
+			return conn
+		}
+
+		player1 := dial()
+		var firstBackend struct {
+			Type   string `json:"type"`
+			RoomID string `json:"room_id"`
+		}
+		readType(t, player1, "backend", &firstBackend)
+		if firstBackend.RoomID != fixture.id {
+			t.Fatalf("room %d player 1 reached backend %q, want %q", index, firstBackend.RoomID, fixture.id)
+		}
+		var firstJoined struct {
+			Type   string `json:"type"`
+			Player int    `json:"player"`
+		}
+		readType(t, player1, "joined", &firstJoined)
+		if firstJoined.Player != 1 {
+			t.Fatalf("room %d first connection assigned Player %d, want Player 1", index, firstJoined.Player)
+		}
+
+		player2 := dial()
+		var secondBackend struct {
+			Type   string `json:"type"`
+			RoomID string `json:"room_id"`
+		}
+		readType(t, player2, "backend", &secondBackend)
+		if secondBackend.RoomID != fixture.id {
+			t.Fatalf("room %d player 2 reached backend %q, want %q", index, secondBackend.RoomID, fixture.id)
+		}
+		var secondJoined struct {
+			Type   string `json:"type"`
+			Player int    `json:"player"`
+		}
+		readType(t, player2, "joined", &secondJoined)
+		if secondJoined.Player != 2 {
+			t.Fatalf("room %d second connection assigned Player %d, want Player 2", index, secondJoined.Player)
+		}
+
+		sequence := uint64(index + 1)
+		if writeErr := player1.WriteJSON(game.Input{Up: true, Sequence: sequence}); writeErr != nil {
+			t.Fatalf("room %d player 1 input error = %v", index, writeErr)
+		}
+		state := readPlayingStateWithInput(t, player2, sequence)
+		if !state.P1Ready || !state.P2Ready {
+			t.Fatalf("room %d shared state readiness = p1:%v p2:%v, want both ready", index, state.P1Ready, state.P2Ready)
+		}
 	}
 }
 
