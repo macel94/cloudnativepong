@@ -28,7 +28,11 @@ async function readJSON(request) {
   return JSON.parse(Buffer.concat(chunks).toString('utf8'));
 }
 
-async function startFixture({ retainRooms = false } = {}) {
+async function startFixture({
+  retainRooms = false,
+  createResponseDelayMs = 0,
+  transientCreateFailures = 0,
+} = {}) {
   const prefix = '/pong/';
   const rooms = new Map();
   const sockets = new Set();
@@ -54,17 +58,25 @@ async function startFixture({ retainRooms = false } = {}) {
       return;
     }
     if (request.method === 'GET' && path === '/api/rooms') {
-      json(response, 200, [...rooms.values()].map(({ id }) => ({
+      json(response, 200, [...rooms.values()].map(({ id, name }) => ({
         id,
+        name,
         status: 'waiting',
         players: 1,
       })));
       return;
     }
     if (request.method === 'POST' && path === '/api/rooms/create') {
+      if (transientCreateFailures > 0) {
+        transientCreateFailures -= 1;
+        json(response, 503, { error: 'fixture temporarily unavailable' });
+        return;
+      }
+      const body = await readJSON(request);
       const id = `ab${String(nextRoom++).padStart(4, '0')}`;
-      rooms.set(id, { id, sockets: new Set() });
-      json(response, 200, { id, name: 'synthetic fixture', status: 'waiting', players: 1 });
+      rooms.set(id, { id, name: body.name, sockets: new Set() });
+      if (createResponseDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, createResponseDelayMs));
+      json(response, 200, { id, name: body.name, status: 'waiting', players: 1 });
       return;
     }
     if (request.method === 'POST' && path === '/api/rooms/join') {
@@ -169,6 +181,38 @@ test('the complete fixture journey validates HTTP, two players, and cleanup', as
 
   assert.equal(result.dryRun, false);
   assert.ok(result.durationMs >= 0);
+  assert.equal(fixture.rooms.size, 0);
+});
+
+test('recovers a room when create is accepted before its response times out', async (t) => {
+  const fixture = await startFixture({ createResponseDelayMs: 150 });
+  t.after(() => fixture.close());
+
+  const result = await runSynthetic({
+    baseURL: fixture.baseURL,
+    timeoutMs: 5_000,
+    requestTimeoutMs: 50,
+    cleanupTimeoutMs: 2_000,
+    cleanupPollMs: 10,
+  });
+
+  assert.equal(result.dryRun, false);
+  assert.equal(fixture.rooms.size, 0);
+});
+
+test('retries an explicit transient create response without leaking a room', async (t) => {
+  const fixture = await startFixture({ transientCreateFailures: 1 });
+  t.after(() => fixture.close());
+
+  const result = await runSynthetic({
+    baseURL: fixture.baseURL,
+    timeoutMs: 5_000,
+    requestTimeoutMs: 1_000,
+    cleanupTimeoutMs: 2_000,
+    cleanupPollMs: 10,
+  });
+
+  assert.equal(result.dryRun, false);
   assert.equal(fixture.rooms.size, 0);
 });
 

@@ -13,8 +13,13 @@ import { randomUUID } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 import WebSocket from 'ws';
 
-const DEFAULT_TIMEOUT_MS = 20_000;
-const DEFAULT_REQUEST_TIMEOUT_MS = 8_000;
+const DEFAULT_TIMEOUT_MS = 60_000;
+const DEFAULT_REQUEST_TIMEOUT_MS = 20_000;
+const CREATE_MAX_ATTEMPTS = 2;
+const CREATE_RECOVERY_TIMEOUT_MS = 8_000;
+const CREATE_RECOVERY_REQUEST_TIMEOUT_MS = 2_000;
+const CREATE_RECOVERY_POLL_MS = 250;
+const CREATE_ERROR_RECOVERY_TIMEOUT_MS = 2_000;
 const CLEANUP_TIMEOUT_MS = 12_000;
 const CLEANUP_POLL_MS = 250;
 const MAX_RESPONSE_BYTES = 64 * 1024;
@@ -22,9 +27,12 @@ const ROOM_ID_PATTERN = /^[0-9a-f]{6}$/u;
 const VALID_GAME_STATUSES = new Set(['waiting', 'playing', 'finished']);
 
 export class SyntheticError extends Error {
-  constructor(message, options) {
+  constructor(message, options = {}) {
     super(message, options);
     this.name = 'SyntheticError';
+    this.retryable = options.retryable === true;
+    this.ambiguous = options.ambiguous === true;
+    this.status = options.status;
   }
 }
 
@@ -136,7 +144,11 @@ async function readLimitedBody(response, label) {
     }
   } catch (error) {
     if (error instanceof SyntheticError) throw error;
-    throw new SyntheticError(`${label} response could not be read`);
+    throw new SyntheticError(`${label} response could not be read`, {
+      retryable: true,
+      ambiguous: true,
+      cause: error,
+    });
   }
   return Buffer.concat(chunks, size).toString('utf8');
 }
@@ -158,10 +170,18 @@ async function requestBody({ fetchImpl, url, init, label, deadline, requestTimeo
     return { response, body };
   } catch (error) {
     if (controller.signal.aborted) {
-      throw new SyntheticError(`${label} timed out after ${timeoutMs}ms`);
+      throw new SyntheticError(`${label} timed out after ${timeoutMs}ms`, {
+        retryable: true,
+        ambiguous: true,
+        cause: error,
+      });
     }
     if (error instanceof SyntheticError) throw error;
-    throw new SyntheticError(`${label} request failed`);
+    throw new SyntheticError(`${label} request failed`, {
+      retryable: true,
+      ambiguous: true,
+      cause: error,
+    });
   } finally {
     clearTimeout(timer);
   }
@@ -169,7 +189,12 @@ async function requestBody({ fetchImpl, url, init, label, deadline, requestTimeo
 
 function requireStatus(response, label, expected = 200) {
   if (response.status !== expected) {
-    throw new SyntheticError(`${label} returned HTTP ${response.status}; expected HTTP ${expected}`);
+    const retryable = response.status === 408 || response.status === 425 ||
+      response.status === 429 || response.status >= 500;
+    throw new SyntheticError(`${label} returned HTTP ${response.status}; expected HTTP ${expected}`, {
+      retryable,
+      status: response.status,
+    });
   }
 }
 
@@ -216,9 +241,99 @@ async function postJSON(client, path, payload, label) {
   requireStatus(response, label);
   try {
     return JSON.parse(body);
-  } catch {
-    throw new SyntheticError(`${label} returned invalid JSON`);
+  } catch (error) {
+    throw new SyntheticError(`${label} returned invalid JSON`, {
+      retryable: true,
+      ambiguous: true,
+      cause: error,
+    });
   }
+}
+
+function isRetryable(error) {
+  return error instanceof SyntheticError && error.retryable;
+}
+
+function sleep(delayMs) {
+  return new Promise((resolve) => setTimeout(resolve, delayMs));
+}
+
+function roomWithName(room, name) {
+  return room && typeof room === 'object' && room.name === name &&
+    ROOM_ID_PATTERN.test(room.id || '');
+}
+
+async function collectMatchingRooms(client, name, rememberRoom) {
+  try {
+    const rooms = await getRooms(client);
+    const matches = rooms.filter((room) => roomWithName(room, name));
+    for (const room of matches) rememberRoom(room);
+    return matches;
+  } catch {
+    // This is supplementary reconciliation. The primary journey result must
+    // not become a false negative because a best-effort room list is delayed.
+    return [];
+  }
+}
+
+async function recoverCreatedRoom(client, name, rememberRoom, recoveryTimeoutMs) {
+  const deadline = Math.min(
+    client.deadline,
+    Date.now() + recoveryTimeoutMs,
+  );
+  const recoveryClient = {
+    ...client,
+    deadline,
+    requestTimeoutMs: Math.max(client.requestTimeoutMs, CREATE_RECOVERY_REQUEST_TIMEOUT_MS),
+  };
+  while (Date.now() < deadline) {
+    const matches = await collectMatchingRooms(recoveryClient, name, rememberRoom);
+    if (matches.length > 0) return matches;
+    const delay = Math.min(CREATE_RECOVERY_POLL_MS, deadline - Date.now());
+    if (delay > 0) await sleep(delay);
+  }
+  return [];
+}
+
+async function createRoom(client, name, rememberRoom) {
+  let lastError;
+  let retried = false;
+
+  for (let attempt = 1; attempt <= CREATE_MAX_ATTEMPTS; attempt += 1) {
+    try {
+      const room = await postJSON(client, '/api/rooms/create', { name }, 'room creation');
+      rememberRoom(room);
+      // If an earlier request timed out after the server accepted it, a second
+      // room may become visible shortly after the successful retry. Track it
+      // so the finalizer can clean both rooms rather than leaking capacity.
+      if (retried) await collectMatchingRooms(client, name, rememberRoom);
+      return room;
+    } catch (error) {
+      lastError = error;
+      if (!isRetryable(error)) throw error;
+
+      const recovered = await recoverCreatedRoom(
+        client,
+        name,
+        rememberRoom,
+        error.ambiguous
+          ? CREATE_RECOVERY_TIMEOUT_MS
+          : (error.status >= 500 ? CREATE_ERROR_RECOVERY_TIMEOUT_MS : CREATE_RECOVERY_POLL_MS),
+      );
+      if (recovered.length > 0) {
+        console.warn('room creation response was delayed; recovered the created room by name');
+        return recovered[0];
+      }
+      if (attempt === CREATE_MAX_ATTEMPTS) break;
+
+      retried = true;
+      const delay = Math.min(500 * 2 ** (attempt - 1), remaining(client.deadline));
+      console.warn(`room creation attempt ${attempt} was transient (${error.message}); retrying in ${delay}ms`);
+      await sleep(delay);
+    }
+  }
+
+  throw lastError;
 }
 
 function validateHomepage(body) {
@@ -462,13 +577,13 @@ async function waitForCleanup(client, roomID, timeoutMs, pollMs) {
       const rooms = await getRooms(cleanupClient);
       if (!rooms.some((room) => room && room.id === roomID)) return;
     } catch (error) {
+      if (!isRetryable(error)) throw error;
       if (Date.now() >= deadline) {
         throw new SyntheticError('synthetic check exceeded its overall timeout', { cause: error });
       }
-      throw error;
     }
     const delay = Math.min(pollMs, remaining(deadline));
-    await new Promise((resolve) => setTimeout(resolve, delay));
+    await sleep(delay);
   }
 }
 
@@ -514,9 +629,16 @@ export async function runSynthetic({
   const client = makeClient({ base, env, fetchImpl, deadline, requestTimeoutMs });
   const startedAt = Date.now();
   let roomID = null;
+  const roomIDs = new Set();
+  let roomName = null;
   let sockets = [];
   let primaryError = null;
   let cleanupError = null;
+  const rememberRoom = (room) => {
+    if (!room || typeof room !== 'object' || !ROOM_ID_PATTERN.test(room.id || '')) return;
+    roomIDs.add(room.id);
+    if (roomID === null) roomID = room.id;
+  };
 
   try {
     const homepage = await getText(client, '/', 'homepage');
@@ -527,12 +649,12 @@ export async function runSynthetic({
 
     await getRooms(client);
 
-    const roomName = `synthetic-${Date.now().toString(36)}-${randomUUID().slice(0, 8)}`;
-    const room = await postJSON(client, '/api/rooms/create', { name: roomName }, 'room creation');
+    roomName = `synthetic-${Date.now().toString(36)}-${randomUUID().slice(0, 8)}`;
+    const room = await createRoom(client, roomName, rememberRoom);
     // Preserve a valid identifier before checking the rest of the response so
     // a malformed status/players field cannot strand a successfully-created
     // room.
-    if (room && typeof room === 'object' && ROOM_ID_PATTERN.test(room.id || '')) roomID = room.id;
+    rememberRoom(room);
     validateRoom(room);
 
     const joined = await postJSON(client, '/api/rooms/join', { room_id: roomID }, 'room join');
@@ -557,14 +679,35 @@ export async function runSynthetic({
     primaryError = safeError(error, 'synthetic journey failed');
   } finally {
     await Promise.all(sockets.map(({ socket }) => closeSocket(socket)));
-    if (roomID !== null && primaryError) {
-      await triggerRoomCleanup(client, roomID, syntheticOrigin, WebSocketImpl, cleanupTimeout);
+    // Reconcile once more after an ambiguous create. This catches a delayed
+    // first request that completed after a retry and prevents leaked rooms.
+    if (roomName !== null) {
+      await collectMatchingRooms(
+        { ...client, deadline: Date.now() + cleanupTimeout },
+        roomName,
+        rememberRoom,
+      );
     }
-    if (roomID !== null) {
+    const cleanupIDs = [...roomIDs];
+    const roomsNeedingForcedCleanup = cleanupIDs.filter((id) => primaryError || id !== roomID);
+    const cleanupClient = {
+      ...client,
+      deadline: Date.now() + cleanupTimeout,
+    };
+    await Promise.all(roomsNeedingForcedCleanup.map((id) => triggerRoomCleanup(
+      cleanupClient,
+      id,
+      syntheticOrigin,
+      WebSocketImpl,
+      cleanupTimeout,
+    )));
+    for (const id of cleanupIDs) {
       try {
-        await waitForCleanup(client, roomID, cleanupTimeout, cleanupPoll);
+        await waitForCleanup(client, id, cleanupTimeout, cleanupPoll);
       } catch (error) {
-        cleanupError = safeError(error, 'room cleanup verification failed');
+        cleanupError = cleanupError
+          ? new SyntheticError(`${cleanupError.message}; ${safeError(error, 'room cleanup verification failed').message}`)
+          : safeError(error, 'room cleanup verification failed');
       }
     }
   }

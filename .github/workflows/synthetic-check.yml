@@ -22,12 +22,17 @@ jobs:
   public-endpoints:
     name: Public endpoint and Pong journey
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # The runner has a bounded 60-second journey and this step retains
+    # independent retries for transient public-ingress failures.
+    timeout-minutes: 10
     env:
       SYNTHETIC_BASE_URL: ${{ vars.SYNTHETIC_PONG_URL || 'https://pong.belacca.com' }}
       SYNTHETIC_AUTH_TOKEN: ${{ secrets.SYNTHETIC_AUTH_TOKEN }}
-      SYNTHETIC_TIMEOUT_MS: '20000'
-      SYNTHETIC_REQUEST_TIMEOUT_MS: '8000'
+      # Room provisioning may wait up to 15 seconds for a Kubernetes pod IP.
+      # Keep one journey budget while allowing that bounded server operation to
+      # finish without turning normal cold-start latency into a false negative.
+      SYNTHETIC_TIMEOUT_MS: '60000'
+      SYNTHETIC_REQUEST_TIMEOUT_MS: '20000'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
