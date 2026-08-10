@@ -74,7 +74,16 @@ jobs:
 
       - name: Validate immutable release contract
         if: matrix.component == 'api'
-        run: python3 scripts/validate-release.py
+        env:
+          ALLOW_PENDING_PUBLICATION: "${{ github.event_name == 'push' && !startsWith(github.event.head_commit.message, 'deploy: publish images') }}"
+        run: |
+          if [[ "$ALLOW_PENDING_PUBLICATION" == "true" ]]; then
+            # The publish workflow has not yet converged both overlays for a
+            # source push. Each overlay is still checked for immutable refs.
+            python3 scripts/validate-release.py --allow-pending-publication
+          else
+            python3 scripts/validate-release.py
+          fi
 
       - name: Upload vulnerability report
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

@@ -26,10 +26,22 @@ jobs:
           cache: true
 
       - name: Validate immutable release metadata and deployment tooling
+        env:
+          ALLOW_PENDING_PUBLICATION: "${{ github.event_name == 'push' && !startsWith(github.event.head_commit.message, 'deploy: publish images') }}"
         run: |
-          python3 scripts/validate-release.py
-          bash -n scripts/update-image-tag.sh scripts/update-image-tag.test.sh scripts/promote-digests.sh
+          if [[ "$ALLOW_PENDING_PUBLICATION" == "true" ]]; then
+            # A source push can briefly contain different immutable releases:
+            # image publication updates both overlays in the follow-up commit.
+            python3 scripts/validate-release.py --allow-pending-publication
+          else
+            # Pull requests and generated deployment commits must be fully
+            # converged; never weaken the release gate for reviewed changes.
+            python3 scripts/validate-release.py
+          fi
+          bash -n scripts/update-image-tag.sh scripts/update-image-tag.test.sh scripts/validate-release.test.sh scripts/promote-digests.sh
           scripts/update-image-tag.test.sh
+          scripts/validate-release.test.sh
+          scripts/publish-image-tags.test.sh
 
       - name: Build binary
         run: CGO_ENABLED=0 go build -ldflags="-s -w" -o cloudnativepong .

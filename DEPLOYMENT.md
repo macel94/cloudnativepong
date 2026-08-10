@@ -107,7 +107,13 @@ certificate, and `PONG_WEBTRANSPORT_PUBLIC_URL`; it remains disabled until
 those platform prerequisites are reviewed.
 
 The image-publish workflow updates both `k8s/overlays/native-staging/` (the
-live native Flux target) and the retained server overlay. Verify the native
+live native Flux target) and the retained server overlay. A source push may
+briefly leave those two overlays on different immutable releases until the
+publisher's generated `deploy: publish images ...` commit lands; CI validates
+each overlay strictly during that short publication window, but generated
+deployment commits must pass the full same-release contract. The publisher is
+serialized per branch, rejects stale source commits, and retries branch
+advances so it cannot overwrite newer application changes. Verify the native
 overlay tag, Flux source/kustomization revision, static build marker, and
 served JavaScript after reconciliation; successful image publication alone
 does not prove that production has rolled out.

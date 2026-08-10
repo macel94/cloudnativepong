@@ -20,6 +20,14 @@ on:
       - '.github/workflows/publish-images.yml'
   workflow_dispatch:
 
+# Only one publisher may update a branch at a time. A publisher can still
+# overlap an unrelated merge, so the deployment job also retries from the
+# latest remote branch and refuses to publish an older source commit over a
+# newer one.
+concurrency:
+  group: publish-images-${{ github.ref }}
+  cancel-in-progress: false
+
 # The image jobs use GitHub Artifact Attestations for signed SLSA provenance.
 # The deployment-recording job only needs permission to write the generated
 # immutable tag references back to this repository.
@@ -91,18 +99,11 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
 
       - name: Update production image references
         shell: bash
-        run: |
-          set -euo pipefail
-          tag="sha-${GITHUB_SHA}"
-          ./scripts/update-image-tag.sh "$tag"
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add k8s/overlays/server k8s/overlays/native-staging
-          if git diff --cached --quiet; then
-            exit 0
-          fi
-          git commit -m "deploy: publish images ${tag}"
-          git push
+        env:
+          GIT_TERMINAL_PROMPT: '0'
+        run: ./scripts/publish-image-tags.sh
