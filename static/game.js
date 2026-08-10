@@ -39,13 +39,18 @@
     let lastAcknowledgedInputSequence = 0;
     const pendingInputs = [];
 
-    // Network delivery is not perfectly periodic through the Kubernetes
-    // WebSocket proxy. A short authoritative-state buffer hides packet bursts
-    // without changing the server-authoritative game decisions. Only remote
-    // entities use this delayed view; the local paddle is predicted from input
-    // on every animation frame so rendering never waits for a server tick.
+    // Keep only recent snapshots for velocity estimation. Online rendering
+    // uses the newest snapshot immediately and dead-reckons between packets;
+    // it never intentionally renders 50ms in the past.
     const stateBuffer = [];
-    const interpolationDelay = 50;
+    const maxExtrapolationMs = 120;
+    const correctionDecayMs = 80;
+    let presentationCorrection = {
+        ball: { x: 0, y: 0 },
+        p1: 0,
+        p2: 0,
+    };
+    let presentationCorrectionAt = performance.now();
 
     const keys = Object.create(null);
     const touchInput = { up: false, down: false };
@@ -200,7 +205,7 @@
         // always correct the presentation if the prediction was wrong.
         const roundTrip = acknowledgedSentAt > 0
             ? Math.max(0, receivedAt - acknowledgedSentAt)
-            : interpolationDelay * 2;
+            : 100;
         const oneWay = Math.min(150, roundTrip / 2);
         reconciliationTargetY = applyPaddleInput(
             authoritativeY,
@@ -233,6 +238,13 @@
     function handleMessage(message) {
         if (message.type === 'joined') {
             player = message.player;
+            stateBuffer.length = 0;
+            presentationCorrection = {
+                ball: { x: 0, y: 0 },
+                p1: 0,
+                p2: 0,
+            };
+            presentationCorrectionAt = performance.now();
             nextInputSequence = 0;
             predictedLocalPaddleY = null;
             reconciliationTargetY = null;
@@ -248,11 +260,12 @@
         if (message.type === 'state' && message.state && message.state.ball) {
             const state = message.state;
             const receivedAt = performance.now();
+            updatePresentationCorrection(lastRenderedState, state);
             gameState = state;
             reconcileLocalPaddle(state, receivedAt);
             stateBuffer.push({ state, receivedAt });
-            while (stateBuffer.length > 8 ||
-                (stateBuffer.length > 2 && receivedAt - stateBuffer[0].receivedAt > 250)) {
+            while (stateBuffer.length > 4 ||
+                (stateBuffer.length > 2 && receivedAt - stateBuffer[0].receivedAt > 160)) {
                 stateBuffer.shift();
             }
 
@@ -545,6 +558,11 @@
 
     function render(state) {
         canvas.dataset.playerPaddleY = state.p1 ? String(state.p1.y) : '';
+        canvas.dataset.ballX = state.ball ? String(state.ball.x) : '';
+        canvas.dataset.ballY = state.ball ? String(state.ball.y) : '';
+        canvas.dataset.opponentPaddleY = player === 1
+            ? (state.p2 ? String(state.p2.y) : '')
+            : (state.p1 ? String(state.p1.y) : '');
         ctx.clearRect(0, 0, W, H);
 
         ctx.strokeStyle = '#333';
@@ -584,39 +602,105 @@
         }
     }
 
-    function interpolatedState(now) {
-        if (stateBuffer.length === 0) return lastRenderedState;
+    function clampUnit(value) {
+        return Math.max(0, Math.min(1, value));
+    }
 
-        const target = now - interpolationDelay;
-        let older = stateBuffer[0];
-        let newer = stateBuffer[stateBuffer.length - 1];
-        for (let index = 1; index < stateBuffer.length; index += 1) {
-            if (stateBuffer[index].receivedAt >= target) {
-                newer = stateBuffer[index];
-                older = stateBuffer[index - 1];
-                break;
+    function reflectBallY(value, direction) {
+        let y = value;
+        let dy = direction;
+        while (y < BALL_SIZE / 2 || y > 1 - BALL_SIZE / 2) {
+            if (y < BALL_SIZE / 2) {
+                y = BALL_SIZE - y;
+                dy = Math.abs(dy);
+            } else if (y > 1 - BALL_SIZE / 2) {
+                y = 2 - BALL_SIZE - y;
+                dy = -Math.abs(dy);
             }
         }
+        return { y, dy };
+    }
 
+    function snapshotVelocity(older, newer, key) {
         const span = newer.receivedAt - older.receivedAt;
-        const amount = span > 0
-            ? Math.max(0, Math.min(1, (target - older.receivedAt) / span))
-            : 1;
-        const lerp = (a, b) => a + (b - a) * amount;
-        const a = older.state;
-        const b = newer.state;
+        if (span <= 0) return { x: 0, y: 0 };
+        const first = older.state[key];
+        const second = newer.state[key];
+        return {
+            x: (second.x - first.x) / span,
+            y: (second.y - first.y) / span,
+        };
+    }
+
+    function paddleVelocity(older, newer, key) {
+        const span = newer.receivedAt - older.receivedAt;
+        if (span <= 0) return 0;
+        return (newer.state[key].y - older.state[key].y) / span;
+    }
+
+    function decayPresentationCorrection(now) {
+        const elapsed = Math.max(0, now - presentationCorrectionAt);
+        const amount = Math.exp(-elapsed / correctionDecayMs);
+        presentationCorrectionAt = now;
+        presentationCorrection.ball.x *= amount;
+        presentationCorrection.ball.y *= amount;
+        presentationCorrection.p1 *= amount;
+        presentationCorrection.p2 *= amount;
+    }
+
+    function extrapolatedState(now) {
+        if (stateBuffer.length === 0) return lastRenderedState;
+
+        const newest = stateBuffer[stateBuffer.length - 1];
+        const older = stateBuffer.length > 1
+            ? stateBuffer[stateBuffer.length - 2]
+            : newest;
+        const elapsedMs = Math.min(maxExtrapolationMs, Math.max(0, now - newest.receivedAt));
+        // Ball velocity is part of the authoritative state, so it can be
+        // rendered immediately even before a second snapshot arrives. The
+        // snapshot-derived remote-paddle velocity is only used where the wire
+        // protocol does not carry paddle velocity.
+        const ballVelocity = {
+            x: newest.state.ball.dx / TICK_MS,
+            y: newest.state.ball.dy / TICK_MS,
+        };
+        const p1Velocity = paddleVelocity(older, newest, 'p1');
+        const p2Velocity = paddleVelocity(older, newest, 'p2');
+        const ballX = newest.state.ball.x + ballVelocity.x * elapsedMs;
+        const rawBallY = newest.state.ball.y + ballVelocity.y * elapsedMs;
+        const reflected = reflectBallY(rawBallY, newest.state.ball.dy);
         const localPaddle = localPaddleKey();
-        lastRenderedState = {
-            ...b,
-            ball: { ...b.ball, x: lerp(a.ball.x, b.ball.x), y: lerp(a.ball.y, b.ball.y) },
+
+        decayPresentationCorrection(now);
+        const state = {
+            ...newest.state,
+            ball: {
+                ...newest.state.ball,
+                x: clampUnit(ballX + presentationCorrection.ball.x),
+                y: clampUnit(reflected.y + presentationCorrection.ball.y),
+                dy: reflected.dy,
+            },
             p1: { y: localPaddle === 'p1' && predictedLocalPaddleY !== null
                 ? predictedLocalPaddleY
-                : lerp(a.p1.y, b.p1.y) },
+                : clampPaddle(newest.state.p1.y + p1Velocity * elapsedMs + presentationCorrection.p1) },
             p2: { y: localPaddle === 'p2' && predictedLocalPaddleY !== null
                 ? predictedLocalPaddleY
-                : lerp(a.p2.y, b.p2.y) },
+                : clampPaddle(newest.state.p2.y + p2Velocity * elapsedMs + presentationCorrection.p2) },
         };
-        return lastRenderedState;
+        lastRenderedState = state;
+        return state;
+    }
+
+    function updatePresentationCorrection(previous, next) {
+        if (!previous || !next) return;
+        presentationCorrection.ball.x += previous.ball.x - next.ball.x;
+        presentationCorrection.ball.y += previous.ball.y - next.ball.y;
+        presentationCorrection.p1 += previous.p1.y - next.p1.y;
+        presentationCorrection.p2 += previous.p2.y - next.p2.y;
+        presentationCorrection.ball.x = Math.max(-0.2, Math.min(0.2, presentationCorrection.ball.x));
+        presentationCorrection.ball.y = Math.max(-0.2, Math.min(0.2, presentationCorrection.ball.y));
+        presentationCorrection.p1 = Math.max(-0.2, Math.min(0.2, presentationCorrection.p1));
+        presentationCorrection.p2 = Math.max(-0.2, Math.min(0.2, presentationCorrection.p2));
     }
 
     let previousFrame = performance.now();
@@ -636,7 +720,7 @@
             updatePredictedLocalPaddle(elapsed);
         }
 
-        const state = isAI ? gameState : interpolatedState(now);
+        const state = isAI ? gameState : extrapolatedState(now);
         if (state) {
             render(state);
             updateScore(state);

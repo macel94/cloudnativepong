@@ -9,8 +9,14 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-OVERLAY = ROOT / "k8s" / "overlays" / "server" / "kustomization.yaml"
-ROOM_TEMPLATE = ROOT / "k8s" / "overlays" / "server" / "room-template.yaml"
+OVERLAYS = [
+    ROOT / "k8s" / "overlays" / "server" / "kustomization.yaml",
+    ROOT / "k8s" / "overlays" / "native-staging" / "kustomization.yaml",
+]
+ROOM_TEMPLATES = [
+    ROOT / "k8s" / "overlays" / "server" / "room-template.yaml",
+    ROOT / "k8s" / "overlays" / "native-staging" / "room-template.yaml",
+]
 RELEASE = ROOT / "release-metadata.json"
 SHA_TAG = re.compile(r"sha-[0-9a-f]{40}")
 DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
@@ -22,16 +28,25 @@ def fail(message: str) -> None:
 
 def main() -> int:
     try:
-        overlay = OVERLAY.read_text()
-        room = ROOM_TEMPLATE.read_text()
-        tags = re.findall(r"newTag:\s*(\S+)", overlay)
-        digests = re.findall(r"digest:\s*(sha256:[0-9a-f]{64})", overlay)
-        if not ((len(tags) == 4 and all(SHA_TAG.fullmatch(tag) for tag in tags)) or len(digests) == 4):
-            fail("all four Pong image references must use full SHA tags or full sha256 digests")
-        if "latest" in overlay or "latest" in room:
-            fail("production Pong references must not use latest")
-        if not (SHA_TAG.search(room) or DIGEST.search(room)):
-            fail("room template must carry an immutable release reference")
+        overlays = [path.read_text() for path in OVERLAYS]
+        rooms = [path.read_text() for path in ROOM_TEMPLATES]
+        release_refs = []
+        for overlay, room in zip(overlays, rooms):
+            tags = re.findall(r"newTag:\s*(\S+)", overlay)
+            digests = re.findall(r"digest:\s*(sha256:[0-9a-f]{64})", overlay)
+            if len(tags) == 4 and all(SHA_TAG.fullmatch(tag) for tag in tags):
+                release_refs.append(tuple(tags))
+            elif len(digests) == 4:
+                release_refs.append(tuple(digests))
+            else:
+                fail("all four Pong image references must use full SHA tags or full sha256 digests")
+            if "latest" in overlay or "latest" in room:
+                fail("production Pong references must not use latest")
+            room_refs = SHA_TAG.findall(room) + DIGEST.findall(room)
+            if not room_refs:
+                fail("room template must carry an immutable release reference")
+        if len(set(release_refs)) != 1:
+            fail("native and compatibility Pong overlays must reference the same release")
 
         metadata = json.loads(RELEASE.read_text())
         if metadata.get("schema_version") != "belacca.release-metadata.v2":

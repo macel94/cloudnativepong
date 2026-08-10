@@ -225,11 +225,12 @@ repository is one independently reconciled application source.
 2. Merge the reviewed change into `main`.
 3. `.github/workflows/publish-images.yml` builds and publishes immutable
    `sha-<commit>` images to GHCR for `api`, `room`, `static`, and `gateway`.
-4. The workflow updates `k8s/overlays/server/` with those image tags and commits
-   the generated deployment update.
+4. The workflow updates both `k8s/overlays/native-staging/` (the live native
+   production target) and the retained `k8s/overlays/server/` compatibility
+   overlay with those image tags, then commits the generated deployment update.
 5. Flux watches `main` at one-minute source intervals. The platform
-   repository's old-production root reconciles this repository's
-   `./k8s/overlays/server` application source every ten minutes. Force an
+   repository's native production Kustomization reconciles this repository's
+   `./k8s/overlays/native-staging` source every ten minutes. Force an
    immediate sync when needed:
 
    ```bash
@@ -450,12 +451,13 @@ The browser sends a small `{"type":"proxy-ready"}` message immediately after `We
 
 Online play deliberately decouples presentation from authoritative tick delivery:
 the local paddle is predicted immediately from held input and softly reconciled
-when the server acknowledges it; the opponent paddle and ball use a short
-snapshot interpolation buffer. The server remains authoritative for paddle
-positions, ball physics, collisions, scores, and game status. Input sequence
-acknowledgements make reconciliation bounded and deterministic across both
-WebSocket and WebTransport. See [`docs/CLIENT-SYNC.md`](docs/CLIENT-SYNC.md)
-for the protocol, presentation boundaries, and test contract.
+when the server acknowledges it; the opponent paddle and ball advance from the
+newest snapshot on every display frame with bounded dead reckoning. The server
+remains authoritative for paddle positions, ball physics, collisions, scores,
+and game status. Input sequence acknowledgements make local reconciliation
+bounded and deterministic across both WebSocket and WebTransport. See
+[`docs/CLIENT-SYNC.md`](docs/CLIENT-SYNC.md) for the protocol, presentation
+boundaries, and test contract.
 
 Caddy's `/rooms/` reverse proxy streams WebSocket upgrades with a one-hour timeout. The browser first checks `/api/capabilities`; if a public WebTransport URL is advertised and the browser supports `WebTransport`, it opens a reliable bidirectional stream with length-prefixed JSON messages. Otherwise it uses the existing WebSocket route. WebTransport is opt-in through `PONG_WEBTRANSPORT_ADDR`, certificate/key paths, and `PONG_WEBTRANSPORT_PUBLIC_URL`; the current Traefik HTTP Ingress does not expose UDP, so the default deployment remains WebSocket-compatible.
 

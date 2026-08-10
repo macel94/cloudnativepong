@@ -1,6 +1,6 @@
 import { test, expect } from '@playwright/test';
 
-test('predicts the local paddle while authoritative snapshots are delayed', async ({ page }) => {
+test('keeps presentation moving while authoritative snapshots are delayed', async ({ page }) => {
   await page.addInitScript(() => {
     class DelayedSocket {
       static OPEN = 1;
@@ -19,24 +19,27 @@ test('predicts the local paddle while authoritative snapshots are delayed', asyn
           setTimeout(() => this.onmessage?.({
             data: JSON.stringify({ type: 'joined', player: 1 }),
           }), 0);
-          setTimeout(() => this.onmessage?.({
-            data: JSON.stringify({
-              type: 'state',
-              state: {
-                ball: { x: 0.5, y: 0.5, dx: 0.012, dy: 0 },
-                p1: { y: 0.5 },
-                p2: { y: 0.5 },
-                score1: 0,
-                score2: 0,
-                status: 'playing',
-                winner: 0,
-                p1_ready: true,
-                p2_ready: true,
-                p1_input_sequence: 0,
-                p2_input_sequence: 0,
-              },
-            }),
-          }), 10);
+          const state = (ballX, p2Y) => ({
+            type: 'state',
+            state: {
+              ball: { x: ballX, y: 0.5, dx: 0.012, dy: 0 },
+              p1: { y: 0.5 },
+              p2: { y: p2Y },
+              score1: 0,
+              score2: 0,
+              status: 'playing',
+              winner: 0,
+              p1_ready: true,
+              p2_ready: true,
+              p1_input_sequence: 0,
+              p2_input_sequence: 0,
+            },
+          });
+          setTimeout(() => this.onmessage?.({ data: JSON.stringify(state(0.5, 0.5)) }), 10);
+          // A second sample lets the client estimate velocity. No further
+          // samples arrive, so the assertions below exercise frame-time
+          // extrapolation rather than another server tick.
+          setTimeout(() => this.onmessage?.({ data: JSON.stringify(state(0.512, 0.51)) }), 35);
         }, 0);
       }
 
@@ -65,6 +68,14 @@ test('predicts the local paddle while authoritative snapshots are delayed', asyn
   await page.keyboard.down('w');
   await expect.poll(async () => Number(await page.locator('#pongCanvas').getAttribute('data-player-paddle-y')))
     .toBeLessThan(initial);
+
+  await page.waitForTimeout(140);
+  const presentation = await page.locator('#pongCanvas').evaluate((element) => ({
+    ballX: Number(element.dataset.ballX),
+    opponentY: Number(element.dataset.opponentPaddleY),
+  }));
+  expect(presentation.ballX).toBeGreaterThan(0.512);
+  expect(presentation.opponentY).toBeGreaterThan(0.51);
 
   const sentInputs = await page.evaluate(() => window.__pongSent
     .filter((message) => message.type !== 'proxy-ready'));

@@ -61,22 +61,22 @@ The browser does not render directly from the arrival of a server tick.
   reconciliation baseline, forecasts the short presentation delay, and eases
   any correction over a bounded window. The server remains authoritative; this
   is only a visual prediction.
-- **Other paddle:** snapshot-interpolated. The browser keeps a short buffer and
-  renders the opponent between two received authoritative snapshots. This
-  intentionally shows the opponent slightly in the past so packet timing does
-  not produce visible jumps.
-- **Ball:** snapshot-interpolated from authoritative positions. It is not
-  locally simulated for online play, because collisions and scoring must remain
-  exactly server-controlled. A packet burst can therefore make the ball's
-  presentation marginally behind the server, but it remains smooth and does
-  not block the render loop.
+- **Other paddle:** latest-snapshot dead reckoning. The browser estimates the
+  opponent's recent vertical velocity and advances the newest authoritative
+  position on each display frame. A bounded correction decays when the next
+  snapshot disagrees; the opponent is no longer intentionally rendered in the
+  past.
+- **Ball:** latest-snapshot dead reckoning. The authoritative ball velocity is
+  used immediately to advance the ball between packets, with local wall
+  reflection for presentation only. Collisions, paddle hits, scoring, and
+  resets remain server-controlled; a new snapshot corrects any visual error.
 - **Score and game status:** updated from the newest authoritative snapshot,
   not from predicted presentation state.
 
-The result is that a player sees their own paddle in the present, while the
-opponent and ball are rendered from a smooth, very short historical window.
-The small visual difference is preferable to input lag or tick-driven
-stuttering and has no effect on the authoritative outcome.
+The result is that all visible entities continue moving on the display frame
+clock, while authoritative snapshots periodically correct the presentation.
+This removes the deliberate tick/network delay without changing the
+authoritative outcome.
 
 ## Reconciliation and boundaries
 
@@ -89,9 +89,9 @@ Prediction is intentionally conservative:
 - prediction stops affecting authoritative state when the connection closes or
   the server reports a finished game.
 
-This is not a rollback or client-authoritative physics system. The ball is not
-predicted online, and clients never decide whether a paddle collision or point
-happened.
+This is not a rollback or client-authoritative physics system. Online
+extrapolation is display-only, bounded in time and position, and clients never
+decide whether a paddle collision or point happened.
 
 ## Tests
 

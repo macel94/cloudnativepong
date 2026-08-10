@@ -58,31 +58,35 @@ refs = {
 }
 verified = os.environ.get("VERIFY_ATTESTATIONS") == "1"
 
-room_template = root / "k8s/overlays/server/room-template.yaml"
-text = room_template.read_text()
-text = re.sub(r'ghcr\.io/macel94/cloudnativepong-room:[^"\s]+', refs["room"], text)
-room_template.write_text(text)
+for overlay, api_file in [
+    ("server", "api-production.yaml"),
+    ("native-staging", "api-native-staging.yaml"),
+]:
+    room_template = root / f"k8s/overlays/{overlay}/room-template.yaml"
+    text = room_template.read_text()
+    text = re.sub(r'ghcr\.io/macel94/cloudnativepong-room:[^"\s]+', refs["room"], text)
+    room_template.write_text(text)
 
-api_production = root / "k8s/overlays/server/api-production.yaml"
-text = api_production.read_text()
-text = re.sub(
-    r'--room-image=ghcr\.io/macel94/cloudnativepong-room:[^\s]+',
-    '--room-image=' + refs["room"],
-    text,
-)
-api_production.write_text(text)
-
-kustomization = root / "k8s/overlays/server/kustomization.yaml"
-text = kustomization.read_text()
-for component, ref in refs.items():
-    name = f"ghcr.io/macel94/cloudnativepong-{component}"
-    digest = ref.split("@", 1)[1]
+    api = root / f"k8s/overlays/{overlay}/{api_file}"
+    text = api.read_text()
     text = re.sub(
-        rf'(newName: {re.escape(name)}\n\s+)(newTag: ).*',
-        rf'\1digest: {digest}',
+        r'--room-image=ghcr\.io/macel94/cloudnativepong-room:[^\s]+',
+        '--room-image=' + refs["room"],
         text,
     )
-kustomization.write_text(text)
+    api.write_text(text)
+
+    kustomization = root / f"k8s/overlays/{overlay}/kustomization.yaml"
+    text = kustomization.read_text()
+    for component, ref in refs.items():
+        name = f"ghcr.io/macel94/cloudnativepong-{component}"
+        digest = ref.split("@", 1)[1]
+        text = re.sub(
+            rf'(newName: {re.escape(name)}\n\s+)(?:newTag|digest): .*',
+            rf'\1digest: {digest}',
+            text,
+        )
+    kustomization.write_text(text)
 
 metadata = root / "release-metadata.json"
 data = json.loads(metadata.read_text())

@@ -59,7 +59,8 @@ repository as an independent child source:
 - Platform repository: `https://github.com/macel94/belacca-gitops.git`
 - Application repository: `https://github.com/macel94/cloudnativepong.git`
 - Branch: `main`
-- Flux application path: `./k8s/overlays/server`
+- Flux application path: `./k8s/overlays/native-staging` (native production;
+  the historical `./k8s/overlays/server` path is retained for compatibility/audit)
 - Source refresh interval: 1 minute
 - Application reconciliation interval: 10 minutes (force it for immediate validation with `flux reconcile kustomization pong -n flux-system --with-source`)
 
@@ -104,6 +105,12 @@ mounted into native Traefik. Native
 WebTransport requires a separate UDP-capable public service, matching TLS
 certificate, and `PONG_WEBTRANSPORT_PUBLIC_URL`; it remains disabled until
 those platform prerequisites are reviewed.
+
+The image-publish workflow updates both `k8s/overlays/native-staging/` (the
+live native Flux target) and the retained server overlay. Verify the native
+overlay tag, Flux source/kustomization revision, static build marker, and
+served JavaScript after reconciliation; successful image publication alone
+does not prove that production has rolled out.
 
 ## Project clusters and operational state
 
@@ -204,12 +211,13 @@ rather than drift from manual `kubectl apply` operations.
 
 The observed lag was caused by bursty delivery of small authoritative state
 frames through the multi-hop real-time path, not by node saturation: node CPU
-remained below 20% and application pods used little CPU. The browser rendered
-only when a network frame arrived, making packet bursts visible as paddle/ball
-stutter. The fix enables TCP_NODELAY on Go WebSocket connections and adds a
-short client-side interpolation buffer rendered continuously with
-`requestAnimationFrame`. The server remains authoritative; interpolation does
-not predict or alter gameplay decisions.
+remained below 20% and application pods used little CPU. The browser previously
+rendered the ball and opponent from a deliberate 50ms historical interpolation
+window, making network delay visible as paddle/ball lag. Online rendering now
+uses the newest snapshot immediately, advances the ball from its authoritative
+velocity and the opponent from recent velocity on `requestAnimationFrame`, and
+smoothly decays bounded corrections when snapshots arrive. The server remains
+authoritative; presentation extrapolation does not alter gameplay decisions.
 
 Validation on the local `k3d-pong` cluster passed all 12 Kubernetes Playwright
 checks after the change. Frame-cadence measurements remain intentionally
@@ -228,7 +236,7 @@ ghcr.io/macel94/cloudnativepong-static
 ghcr.io/macel94/cloudnativepong-gateway
 ```
 
-The packages are configured for anonymous pulls. The workflow updates the
+The packages are configured for anonymous pulls. The workflow updates both the live native-staging overlay and the retained
 server overlay with `sha-<40-hex-commit>` tags and commits the deployment change
 back to the feature branch. A future merge to `main` should use the same
 workflow after the production branch policy is chosen.
