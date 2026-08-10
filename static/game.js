@@ -33,10 +33,17 @@
     let gameState = null;
     let gameOverShown = false;
     let lastRenderedState = null;
+    let predictedLocalPaddleY = null;
+    let reconciliationTargetY = null;
+    let nextInputSequence = 0;
+    let lastAcknowledgedInputSequence = 0;
+    const pendingInputs = [];
 
     // Network delivery is not perfectly periodic through the Kubernetes
     // WebSocket proxy. A short authoritative-state buffer hides packet bursts
-    // without changing the server-authoritative game decisions.
+    // without changing the server-authoritative game decisions. Only remote
+    // entities use this delayed view; the local paddle is predicted from input
+    // on every animation frame so rendering never waits for a server tick.
     const stateBuffer = [];
     const interpolationDelay = 50;
 
@@ -144,9 +151,93 @@
         };
     }
 
+    function localPaddleKey() {
+        return player === 2 ? 'p2' : 'p1';
+    }
+
+    function localInputSequenceKey() {
+        return player === 2 ? 'p2_input_sequence' : 'p1_input_sequence';
+    }
+
+    function localPaddleY(state) {
+        const paddle = state && state[localPaddleKey()];
+        return paddle && Number.isFinite(paddle.y) ? paddle.y : 0.5;
+    }
+
+    function inputSequence(state) {
+        const value = state && state[localInputSequenceKey()];
+        return Number.isSafeInteger(value) && value >= 0 ? value : 0;
+    }
+
+    function applyPaddleInput(y, input, elapsedMs) {
+        const ticks = Math.min(8, Math.max(0, elapsedMs) / TICK_MS);
+        if (input.up) y -= PADDLE_SPEED * ticks;
+        if (input.down) y += PADDLE_SPEED * ticks;
+        return clampPaddle(y);
+    }
+
+    function reconcileLocalPaddle(state, receivedAt) {
+        const authoritativeY = localPaddleY(state);
+        const acknowledged = inputSequence(state);
+        let acknowledgedSentAt = 0;
+        if (acknowledged > lastAcknowledgedInputSequence) {
+            lastAcknowledgedInputSequence = acknowledged;
+            for (let index = pendingInputs.length - 1; index >= 0; index -= 1) {
+                if (pendingInputs[index].sequence <= acknowledged) {
+                    acknowledgedSentAt = pendingInputs[index].sentAt;
+                    break;
+                }
+            }
+            while (pendingInputs.length > 0 && pendingInputs[0].sequence <= acknowledged) {
+                pendingInputs.shift();
+            }
+        }
+
+        // The server state is historical by the time it is received. Forecast
+        // the currently held intent through one estimated one-way delay plus
+        // one authoritative tick, then ease the visible paddle toward that
+        // point. This is reconciliation, not authority: the next snapshot can
+        // always correct the presentation if the prediction was wrong.
+        const roundTrip = acknowledgedSentAt > 0
+            ? Math.max(0, receivedAt - acknowledgedSentAt)
+            : interpolationDelay * 2;
+        const oneWay = Math.min(150, roundTrip / 2);
+        reconciliationTargetY = applyPaddleInput(
+            authoritativeY,
+            readLocalInput(),
+            oneWay + TICK_MS,
+        );
+
+        if (predictedLocalPaddleY === null) {
+            predictedLocalPaddleY = reconciliationTargetY;
+        }
+    }
+
+    function updatePredictedLocalPaddle(elapsedMs) {
+        if (!gameState || gameState.status !== 'playing' || !player || predictedLocalPaddleY === null) return;
+        predictedLocalPaddleY = applyPaddleInput(
+            predictedLocalPaddleY,
+            readLocalInput(),
+            elapsedMs,
+        );
+        if (reconciliationTargetY !== null) {
+            // A 100 ms correction window hides packet jitter while keeping a
+            // real server correction bounded and observable to the player.
+            const correction = Math.min(1, Math.max(0, elapsedMs) / 100);
+            predictedLocalPaddleY = clampPaddle(
+                predictedLocalPaddleY + (reconciliationTargetY - predictedLocalPaddleY) * correction,
+            );
+        }
+    }
+
     function handleMessage(message) {
         if (message.type === 'joined') {
             player = message.player;
+            nextInputSequence = 0;
+            predictedLocalPaddleY = null;
+            reconciliationTargetY = null;
+            lastAcknowledgedInputSequence = 0;
+            pendingInputs.length = 0;
             setControlHint();
             statusElement.textContent =
                 'You are Player ' + player + '. ' +
@@ -158,6 +249,7 @@
             const state = message.state;
             const receivedAt = performance.now();
             gameState = state;
+            reconcileLocalPaddle(state, receivedAt);
             stateBuffer.push({ state, receivedAt });
             while (stateBuffer.length > 8 ||
                 (stateBuffer.length > 2 && receivedAt - stateBuffer[0].receivedAt > 250)) {
@@ -290,11 +382,16 @@
         connectWebSocket();
     }
 
-    // Send input to the authoritative server at approximately 60Hz.
+    // Send input to the authoritative server at approximately 60Hz. The
+    // sequence is an acknowledgement marker, not a movement command: the
+    // server remains authoritative and echoes the latest sequence it applied.
     setInterval(() => {
         if (isAI || !connection || !connection.isOpen() || !player) return;
         const input = readLocalInput();
-        connection.send({ player, up: input.up, down: input.down });
+        const sequence = ++nextInputSequence;
+        pendingInputs.push({ sequence, sentAt: performance.now() });
+        while (pendingInputs.length > 128) pendingInputs.shift();
+        connection.send({ player, up: input.up, down: input.down, sequence });
     }, TICK_MS);
 
     function clampPaddle(value) {
@@ -508,11 +605,16 @@
         const lerp = (a, b) => a + (b - a) * amount;
         const a = older.state;
         const b = newer.state;
+        const localPaddle = localPaddleKey();
         lastRenderedState = {
             ...b,
             ball: { ...b.ball, x: lerp(a.ball.x, b.ball.x), y: lerp(a.ball.y, b.ball.y) },
-            p1: { y: lerp(a.p1.y, b.p1.y) },
-            p2: { y: lerp(a.p2.y, b.p2.y) },
+            p1: { y: localPaddle === 'p1' && predictedLocalPaddleY !== null
+                ? predictedLocalPaddleY
+                : lerp(a.p1.y, b.p1.y) },
+            p2: { y: localPaddle === 'p2' && predictedLocalPaddleY !== null
+                ? predictedLocalPaddleY
+                : lerp(a.p2.y, b.p2.y) },
         };
         return lastRenderedState;
     }
@@ -530,6 +632,8 @@
                 tickAI();
                 aiAccumulator -= TICK_MS;
             }
+        } else if (!isAI) {
+            updatePredictedLocalPaddle(elapsed);
         }
 
         const state = isAI ? gameState : interpolatedState(now);

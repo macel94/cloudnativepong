@@ -23,10 +23,10 @@ const WinScore = 7
 
 // Dimensions (normalized).
 const (
-	PaddleWidth  = 0.02
-	PaddleHeight = 0.15
-	BallSize     = 0.025
-	PaddleSpeed  = 0.025 // per tick when key held
+	PaddleWidth   = 0.02
+	PaddleHeight  = 0.15
+	BallSize      = 0.025
+	PaddleSpeed   = 0.025 // per tick when key held
 	BaseBallSpeed = 0.012
 	MaxBallSpeed  = 0.025
 )
@@ -49,22 +49,28 @@ type Paddle struct {
 
 // State is the full game state sent to clients each tick.
 type State struct {
-	Ball    Ball    `json:"ball"`
-	P1      Paddle  `json:"p1"`
-	P2      Paddle  `json:"p2"`
-	Score1  int     `json:"score1"`
-	Score2  int     `json:"score2"`
-	Status  Status  `json:"status"`
-	Winner  int     `json:"winner"` // 0=none, 1=p1, 2=p2
-	P1Ready bool    `json:"p1_ready"`
-	P2Ready bool    `json:"p2_ready"`
+	Ball            Ball   `json:"ball"`
+	P1              Paddle `json:"p1"`
+	P2              Paddle `json:"p2"`
+	Score1          int    `json:"score1"`
+	Score2          int    `json:"score2"`
+	Status          Status `json:"status"`
+	Winner          int    `json:"winner"` // 0=none, 1=p1, 2=p2
+	P1Ready         bool   `json:"p1_ready"`
+	P2Ready         bool   `json:"p2_ready"`
+	P1InputSequence uint64 `json:"p1_input_sequence"`
+	P2InputSequence uint64 `json:"p2_input_sequence"`
 }
 
-// Input represents a player's paddle movement intent.
+// Input represents a player's paddle movement intent. Sequence is assigned by
+// the client and echoed by State once the authoritative tick has processed it.
+// It lets a client reconcile its local prediction without making the client
+// authoritative.
 type Input struct {
-	Player int   `json:"player"` // 1 or 2
-	Up     bool  `json:"up"`
-	Down   bool  `json:"down"`
+	Player   int    `json:"player"` // 1 or 2
+	Up       bool   `json:"up"`
+	Down     bool   `json:"down"`
+	Sequence uint64 `json:"sequence"`
 }
 
 // Engine runs the authoritative game loop.
@@ -99,9 +105,18 @@ func (e *Engine) State() State {
 func (e *Engine) ApplyInput(in Input) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if in.Player == 1 {
+	switch in.Player {
+	case 1:
+		if (in.Sequence == 0 && e.input1.Sequence != 0) ||
+			(in.Sequence != 0 && in.Sequence <= e.input1.Sequence) {
+			return
+		}
 		e.input1 = in
-	} else {
+	case 2:
+		if (in.Sequence == 0 && e.input2.Sequence != 0) ||
+			(in.Sequence != 0 && in.Sequence <= e.input2.Sequence) {
+			return
+		}
 		e.input2 = in
 	}
 }
@@ -145,9 +160,13 @@ func (e *Engine) Tick() State {
 		return e.state
 	}
 
-	// Move paddles
+	// Move paddles and acknowledge the exact input intent applied by this
+	// authoritative tick. Clients use this acknowledgement to replay only
+	// inputs the server has not processed yet.
 	e.movePaddle(&e.state.P1, &e.input1)
 	e.movePaddle(&e.state.P2, &e.input2)
+	e.state.P1InputSequence = e.input1.Sequence
+	e.state.P2InputSequence = e.input2.Sequence
 
 	// Move ball
 	b := &e.state.Ball

@@ -448,6 +448,15 @@ Room capacity reservations and actual connections are separate lifecycle events:
 
 The browser sends a small `{"type":"proxy-ready"}` message immediately after `WebSocket.onopen`. The lobby consumes that marker, releases the first room-to-browser frames only after the outer gateway handoff, and forwards all subsequent application messages. The browser-to-room relay validates masked client frames, reassembles fragmented messages, handles control frames, and enforces a 16 MiB message limit. The marker is harmless in local mode, where the browser connects directly to the in-process room handler.
 
+Online play deliberately decouples presentation from authoritative tick delivery:
+the local paddle is predicted immediately from held input and softly reconciled
+when the server acknowledges it; the opponent paddle and ball use a short
+snapshot interpolation buffer. The server remains authoritative for paddle
+positions, ball physics, collisions, scores, and game status. Input sequence
+acknowledgements make reconciliation bounded and deterministic across both
+WebSocket and WebTransport. See [`docs/CLIENT-SYNC.md`](docs/CLIENT-SYNC.md)
+for the protocol, presentation boundaries, and test contract.
+
 Caddy's `/rooms/` reverse proxy streams WebSocket upgrades with a one-hour timeout. The browser first checks `/api/capabilities`; if a public WebTransport URL is advertised and the browser supports `WebTransport`, it opens a reliable bidirectional stream with length-prefixed JSON messages. Otherwise it uses the existing WebSocket route. WebTransport is opt-in through `PONG_WEBTRANSPORT_ADDR`, certificate/key paths, and `PONG_WEBTRANSPORT_PUBLIC_URL`; the current Traefik HTTP Ingress does not expose UDP, so the default deployment remains WebSocket-compatible.
 
 ## 📈 Application observability and reliability contract
@@ -520,11 +529,12 @@ contract and the separate availability/recovery objectives.
 ## 📊 Verification Status
 
 - Local Go tests, race tests, vet, and static builds pass.
-- The local Chromium suite passes 14/14, including build metadata, computer play, and online two-player play.
+- The local Chromium suite passes 15/15, including build metadata, computer play, online two-player play, and delayed-snapshot client prediction.
 - Dedicated Pixel 7 and iPhone 13/WebKit touch emulation cover responsive layout, touch controls, and actual paddle movement.
 - The production-style static image build was verified with a full source SHA, full commit URL, and `Cache-Control: no-store` metadata response.
 - Isolated Chromium checks through the Caddy k3d gateway pass, including two-player joining.
 - The full k3d suite passes 12/12 when host traffic is mapped to the gateway NodePort with `8080:30080@agent:0`. The earlier intermittent 11/12 result came from using the cluster's port-80 ingress path or an unstable `kubectl port-forward`, not from a reproducible room/proxy failure.
+- The client synchronization contract is covered by Go engine acknowledgement tests and a delayed-snapshot Playwright prediction test; see [`docs/CLIENT-SYNC.md`](docs/CLIENT-SYNC.md).
 
 ## 📁 Project Structure
 
