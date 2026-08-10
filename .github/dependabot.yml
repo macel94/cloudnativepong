@@ -1,52 +1,40 @@
 version: 2
 updates:
-  # — Go modules —
+  # Go modules.
   - package-ecosystem: gomod
     directory: /
     schedule:
-      interval: weekly
-      day: monday
-    cooldown:
-      default-days: 7
+      interval: daily
     groups:
       go-deps:
         patterns:
           - "*"
 
-  # — npm (Playwright tests) —
+  # npm dependencies used by Playwright tests.
   - package-ecosystem: npm
     directory: /
     schedule:
-      interval: weekly
-      day: monday
-    cooldown:
-      default-days: 7
+      interval: daily
     groups:
       npm-deps:
         patterns:
           - "*"
 
-  # — Docker base images —
+  # Docker base images.
   - package-ecosystem: docker
     directory: /
     schedule:
-      interval: weekly
-      day: monday
-    cooldown:
-      default-days: 7
+      interval: daily
     groups:
       docker-deps:
         patterns:
           - "*"
 
-  # — GitHub Actions —
+  # GitHub Actions.
   - package-ecosystem: github-actions
     directory: /
     schedule:
-      interval: weekly
-      day: monday
-    cooldown:
-      default-days: 7
+      interval: daily
     groups:
       actions-deps:
         patterns:
