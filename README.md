@@ -121,7 +121,7 @@ Browser WebSocket-compatible connections are served over TLS. The browser checks
 listener is advertised; otherwise WebSockets remain the default.
 
 Native `belacca-production` is the public production cluster. Native Traefik
-serves `pong.belacca.com` on `.41` and `.42`; Cloudflare DNS-only records use
+serves `pong.belacca.com` on `.73`, `.41`, and `.42`; Cloudflare DNS-only records use
 direct round-robin rather than health-aware failover. Native cert-manager uses
 Cloudflare DNS-01 and namespace-local TLS Secrets. The retired old `k3d-pong`
 ACME/PVC state was not mounted into native Traefik.
@@ -171,7 +171,7 @@ flowchart TB
 
 | Role | kubeconfig context | Target | Access | Status |
 |------|--------------------|--------|--------|--------|
-| Native production | `belacca-production` | Native k3s; Traefik on `.41` and `.42` | Public Pong URL and Flux-managed workloads | Running; public traffic is native |
+| Native production | `belacca-production` | Native k3s; Traefik on `.73`, `.41`, and `.42` | Public Pong URL and Flux-managed workloads | Running; public traffic is native |
 | Retired old production | historical `k3d-pong` | Former k3d cluster on `.73` | Audit/reference only | Retired after state handoff |
 | CI integration test | generated/ephemeral | Disposable k3d cluster | Job-local gateway on `localhost:8080` | Created, tested, and deleted by CI |
 
@@ -198,7 +198,8 @@ route. Longhorn must remain healthy and SQLite must remain single-writer.
 
 Native production is live. The following ongoing controls remain important:
 
-- **Public edge:** Traefik serves `.41` and `.42`; Cloudflare DNS is direct
+- **Public edge:** Traefik serves all three native edges (`.73`, `.41`, and
+  `.42`); Cloudflare DNS is direct
   round-robin rather than health-aware failover. Remove an unhealthy address
   manually until a load balancer is provisioned.
 - **Certificate ownership:** cert-manager uses Cloudflare DNS-01 and

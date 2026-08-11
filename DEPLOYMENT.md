@@ -6,7 +6,7 @@ an independently reconciled child source of the platform
 root. The current operational state is:
 
 - **Native production:** `belacca-production` serves players through native
-  Traefik on `.41` and `.42`, with Flux-managed Pong and a Longhorn-backed
+  Traefik on `.73`, `.41`, and `.42`, with Flux-managed Pong and a Longhorn-backed
   single-writer SQLite PVC. Cloudflare DNS is direct round-robin, not
   health-aware failover.
 - **Retired old production:** the former `k3d-pong` runtime on `.73` was
@@ -69,7 +69,7 @@ The Flux controllers are `source-controller`, `kustomize-controller`,
 the generated Flux bootstrap manifests and old-production root; change them
 only through the documented Flux upgrade/bootstrap process.
 
-Native Traefik is the current public ingress on `.41` and `.42`. The
+Native Traefik is the current public ingress on `.73`, `.41`, and `.42`. The
 cluster-level platform repository owns the host-based Pong Ingress for
 `pong.belacca.com`, using class `traefik` and the `web,websecure` entrypoints.
 It forwards all paths to `pong-gateway`; Caddy in that gateway handles static
@@ -85,8 +85,8 @@ correlation headers; callback retries are bounded, and a failed start callback
 closes the room path so reconciliation can clean it rather than leaving a
 half-started game.
 
-Native Traefik on `.41` and `.42` is the public ingress. Native TLS uses
-cert-manager DNS-01 and namespace-local Secrets. Monitor both direct-DNS edges
+Native Traefik on `.73`, `.41`, and `.42` is the public ingress. Native TLS uses
+cert-manager DNS-01 and namespace-local Secrets. Monitor all direct-DNS edges
 and remove an unhealthy address manually until a health-aware load balancer is
 available.
 
@@ -122,7 +122,7 @@ does not prove that production has rolled out.
 
 | Context | Cluster/target | Topology or access | Purpose | Status |
 |---|---|---|---|---|
-| `belacca-production` | Native k3s cluster | Traefik on `.41` and `.42` | Public production and Flux target | Running; serves players |
+| `belacca-production` | Native k3s cluster | Traefik on `.73`, `.41`, and `.42` | Public production and Flux target | Running; serves players |
 | retired `k3d-pong` | historical k3d `pong` on `.73` | Removed containers | Audit/reference only | Retired after state handoff |
 | generated CI context | disposable k3d | Job-local gateway | Kubernetes integration tests | Created and deleted per workflow run |
 | capacity experiment context | `cnp-capacity-*` k3d | Loopback-only gateway | Bounded capacity baseline | Manual, serialized, redacted evidence, disposable |
@@ -152,7 +152,8 @@ following controls are required for state operations:
 4. Restore the verified copy into an isolated target or approved native
    maintenance window, run integrity and application checks, and preserve the
    single-writer contract.
-5. Keep Cloudflare records limited to healthy `.41` and `.42` edges until a
+5. Keep Cloudflare application records limited to healthy native edge
+   addresses (`.73`, `.41`, `.42`) until a
    health-aware load balancer exists; remove an unhealthy address manually.
 
 ## Fastest safe debug, local test, and GitOps workflow
