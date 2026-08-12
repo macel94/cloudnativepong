@@ -128,6 +128,42 @@ func (f *fakeOrchestrator) DeleteService(string) error {
 func (f *fakeOrchestrator) ListPods() ([]RoomResource, error)     { return f.pods, nil }
 func (f *fakeOrchestrator) ListServices() ([]RoomResource, error) { return f.services, nil }
 
+func TestRoomEndpointHasReadyAddress(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want bool
+	}{
+		{
+			name: "ready address",
+			body: `{"subsets":[{"addresses":[{"ip":"10.0.0.4"}]}]}`,
+			want: true,
+		},
+		{
+			name: "not ready",
+			body: `{"subsets":[{"notReadyAddresses":[{"ip":"10.0.0.4"}]}]}`,
+			want: false,
+		},
+		{
+			name: "empty",
+			body: `{"subsets":[]}`,
+			want: false,
+		},
+		{
+			name: "malformed",
+			body: `{`,
+			want: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := roomEndpointHasReadyAddress([]byte(tt.body)); got != tt.want {
+				t.Fatalf("roomEndpointHasReadyAddress() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestK8sClientReusesTransport(t *testing.T) {
 	first := k8sClient()
 	second := k8sClient()
