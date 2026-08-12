@@ -28,9 +28,8 @@ jobs:
     env:
       SYNTHETIC_BASE_URL: ${{ vars.SYNTHETIC_PONG_URL || 'https://pong.belacca.com' }}
       SYNTHETIC_AUTH_TOKEN: ${{ secrets.SYNTHETIC_AUTH_TOKEN }}
-      # Room provisioning may wait up to 15 seconds for a Kubernetes pod IP.
-      # Keep one journey budget while allowing that bounded server operation to
-      # finish without turning normal cold-start latency into a false negative.
+      # Room provisioning returns after the Service and Pod are accepted;
+      # the WebSocket proxy absorbs bounded scheduling/image-pull cold starts.
       SYNTHETIC_TIMEOUT_MS: '60000'
       SYNTHETIC_REQUEST_TIMEOUT_MS: '20000'
     steps:

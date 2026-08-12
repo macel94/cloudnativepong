@@ -403,14 +403,36 @@ func (s *Server) ReconcileRooms() (err error) {
 		return err
 	}
 	s.metric("pong_service_list_success")
+	liveServices := make(map[string]struct{}, len(services))
 	for _, service := range services {
 		if service.RoomID == "" {
 			continue
 		}
+		liveServices[service.RoomID] = struct{}{}
 		if _, ok := livePods[service.RoomID]; ok {
 			continue
 		}
 		if cleanupErr := s.CleanupRoom(service.RoomID); cleanupErr != nil {
+			s.metric("pong_reconcile_cleanup_failure")
+		} else {
+			s.metric("pong_reconcile_cleanup_success")
+		}
+	}
+
+	// A room that reached playing must have both resources. If the Pod or its
+	// Service disappeared without delivering the finish callback, remove the
+	// persisted row as well; otherwise every list request retains a dead room
+	// and each restart repeats the same orphan indefinitely.
+	for _, room := range rooms {
+		if room.Status != "playing" {
+			continue
+		}
+		_, podExists := livePods[room.ID]
+		_, serviceExists := liveServices[room.ID]
+		if podExists && serviceExists {
+			continue
+		}
+		if cleanupErr := s.CleanupRoom(room.ID); cleanupErr != nil {
 			s.metric("pong_reconcile_cleanup_failure")
 		} else {
 			s.metric("pong_reconcile_cleanup_success")
@@ -817,14 +839,14 @@ func (s *Server) createK8sPod(roomID string) (string, error) {
 		},
 	}
 
-	// Create the ClusterIP Service for the room (before the pod, so DNS is ready)
+	// Create the ClusterIP Service before the pod. Routing uses this stable
+	// Service DNS name, so a Service failure makes the room unusable and must
+	// fail provisioning rather than leaving an orphaned database reservation.
 	if err := s.createK8sService(roomID, apiHost, apiPort, ns, token); err != nil {
 		s.metric("pong_service_create_failure")
-		log.Printf("event=pod_service_create_failed")
-		// Non-fatal: the pod IP can still be used directly.
-	} else {
-		s.metric("pong_service_create_success")
+		return "", fmt.Errorf("create service: %w", err)
 	}
+	s.metric("pong_service_create_success")
 
 	body, _ := json.Marshal(pod)
 	url := fmt.Sprintf("https://%s:%s/api/v1/namespaces/%s/pods", apiHost, apiPort, ns)
@@ -855,7 +877,10 @@ func (s *Server) createK8sPod(roomID string) (string, error) {
 		return "", fmt.Errorf("kubernetes pod create returned HTTP %d", resp.StatusCode)
 	}
 
-	// Parse the optional pod IP from the response without trusting its shape.
+	// The Pod may still be Pending when the API returns. Routing uses the
+	// per-room Service DNS name rather than this transient Pod IP, so do not
+	// block room creation on scheduler/image-pull latency. Preserve an IP when
+	// Kubernetes assigned one immediately for diagnostics only.
 	var result struct {
 		Status struct {
 			PodIP string `json:"podIP"`
@@ -864,17 +889,7 @@ func (s *Server) createK8sPod(roomID string) (string, error) {
 	if err := json.Unmarshal(respBody, &result); err != nil {
 		return "", errors.New("invalid kubernetes pod response")
 	}
-	podIP := result.Status.PodIP
-
-	// Wait briefly for pod IP to be assigned
-	if podIP == "" {
-		podIP = s.waitForPodIP(roomID, string(token), apiHost, apiPort, ns)
-		if podIP == "" {
-			return "", errors.New("timed out waiting for pod IP")
-		}
-	}
-
-	return podIP, nil
+	return result.Status.PodIP, nil
 }
 
 // createK8sService creates a ClusterIP Service for a room pod so it has a
@@ -975,49 +990,39 @@ func (s *Server) lobbyAddr() string {
 	return "localhost:8080"
 }
 
-func (s *Server) waitForPodIP(roomID, token, apiHost, apiPort, ns string) string {
-	url := fmt.Sprintf("https://%s:%s/api/v1/namespaces/%s/pods/pong-room-%s", apiHost, apiPort, ns, roomID)
-	for i := 0; i < 15; i++ {
-		time.Sleep(1 * time.Second)
-		req, _ := http.NewRequest("GET", url, nil)
-		req.Header.Set("Authorization", "Bearer "+token)
-		client := k8sClient()
-		resp, err := client.Do(req)
-		if err != nil {
-			continue
-		}
-		body, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		var result map[string]interface{}
-		json.Unmarshal(body, &result)
-		if status, ok := result["status"].(map[string]interface{}); ok {
-			if ip, ok := status["podIP"].(string); ok && ip != "" {
-				return ip
-			}
-		}
-	}
-	return ""
-}
+var (
+	k8sClientOnce sync.Once
+	k8sHTTPClient *http.Client
+)
 
-// k8sClient creates an HTTP client configured with the K8s API CA cert.
+// k8sClient creates the shared HTTP client configured with the K8s API CA
+// cert. Reusing its transport is important: reconciliation runs continuously,
+// and creating a new transport for every list/create/delete operation retains
+// idle connections and transport state until garbage collection.
 func k8sClient() *http.Client {
-	const caCertPath = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
-	tlsCfg := &tls.Config{}
-	caData, err := os.ReadFile(caCertPath)
-	if err == nil {
-		pool, _ := x509.SystemCertPool()
-		if pool == nil {
-			pool = x509.NewCertPool()
+	k8sClientOnce.Do(func() {
+		const caCertPath = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+		tlsCfg := &tls.Config{}
+		caData, err := os.ReadFile(caCertPath)
+		if err == nil {
+			pool, _ := x509.SystemCertPool()
+			if pool == nil {
+				pool = x509.NewCertPool()
+			}
+			pool.AppendCertsFromPEM(caData)
+			tlsCfg.RootCAs = pool
 		}
-		pool.AppendCertsFromPEM(caData)
-		tlsCfg.RootCAs = pool
-	}
-	return &http.Client{
-		Timeout: 15 * time.Second,
-		Transport: &http.Transport{
-			TLSClientConfig: tlsCfg,
-		},
-	}
+		k8sHTTPClient = &http.Client{
+			Timeout: 15 * time.Second,
+			Transport: &http.Transport{
+				TLSClientConfig:     tlsCfg,
+				MaxIdleConns:        4,
+				MaxIdleConnsPerHost: 2,
+				IdleConnTimeout:     90 * time.Second,
+			},
+		}
+	})
+	return k8sHTTPClient
 }
 
 func writeJSON(w http.ResponseWriter, v interface{}) {

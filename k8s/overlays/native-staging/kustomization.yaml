@@ -29,6 +29,7 @@ patches:
       name: pong-api
       namespace: pong
   - path: deployment-pull-policy.yaml
+  - path: api-resources.yaml
   - path: static-resources.yaml
   - path: gateway-private.yaml
     target:

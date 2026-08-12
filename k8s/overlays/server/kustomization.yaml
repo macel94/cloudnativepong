@@ -24,6 +24,7 @@ images:
 
 patches:
   - path: deployment-pull-policy.yaml
+  - path: api-resources.yaml
   - path: api-recreate-strategy.yaml
     target:
       group: apps

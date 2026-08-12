@@ -128,6 +128,17 @@ func (f *fakeOrchestrator) DeleteService(string) error {
 func (f *fakeOrchestrator) ListPods() ([]RoomResource, error)     { return f.pods, nil }
 func (f *fakeOrchestrator) ListServices() ([]RoomResource, error) { return f.services, nil }
 
+func TestK8sClientReusesTransport(t *testing.T) {
+	first := k8sClient()
+	second := k8sClient()
+	if first != second {
+		t.Fatal("k8sClient() returned different clients")
+	}
+	if first.Transport != second.Transport {
+		t.Fatal("k8sClient() returned clients with different transports")
+	}
+}
+
 func TestCreateRoomPodFailureRemovesDatabaseReservation(t *testing.T) {
 	store, err := db.New(":memory:")
 	if err != nil {
@@ -215,6 +226,41 @@ func TestReconcileRemovesFailedPodAndOrphanServiceAfterRestart(t *testing.T) {
 	}
 	if orchestrator.podDeletes == 0 || orchestrator.serviceDeletes == 0 {
 		t.Fatalf("reconciliation delete counts = pods:%d services:%d, want both", orchestrator.podDeletes, orchestrator.serviceDeletes)
+	}
+}
+
+func TestReconcileRemovesPlayingRoomWithoutLiveResources(t *testing.T) {
+	store, err := db.New(":memory:")
+	if err != nil {
+		t.Fatalf("db.New() error = %v", err)
+	}
+	defer store.Close()
+
+	orchestrator := &fakeOrchestrator{}
+	server := NewServerWithDependencies(store, "kubernetes", "", "", time.Minute, nil, orchestrator)
+	room, err := server.CreateRoom("stale-playing")
+	if err != nil {
+		t.Fatalf("CreateRoom() error = %v", err)
+	}
+	if err := server.JoinRoom(room.ID); err != nil {
+		t.Fatalf("first JoinRoom() error = %v", err)
+	}
+	if err := server.JoinRoom(room.ID); err != nil {
+		t.Fatalf("second JoinRoom() error = %v", err)
+	}
+	if err := server.MarkRoomStarted(room.ID); err != nil {
+		t.Fatalf("MarkRoomStarted() error = %v", err)
+	}
+
+	if err := server.ReconcileRooms(); err != nil {
+		t.Fatalf("ReconcileRooms() error = %v", err)
+	}
+	got, err := store.GetRoom(room.ID)
+	if err != nil {
+		t.Fatalf("GetRoom() error = %v", err)
+	}
+	if got != nil {
+		t.Fatalf("stale playing room survived reconciliation: %+v", got)
 	}
 }
 
