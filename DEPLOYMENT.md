@@ -380,14 +380,51 @@ exporter documentation:
 - <https://pkg.go.dev/go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp>
 
 Scrape `/metrics` through the existing private/cluster monitoring path. The
-machine-readable `slo-contract.json` defines the external 99%/30d journey SLI;
-internal metrics are diagnostics and do not establish public availability. Do
-not add labels or relabel rules containing room IDs, names, IPs, tokens, URLs,
-or request IDs. Alerting should use aggregate success/failure counters,
-bounded duration distributions, and active/waiting/playing gauges; request IDs
-are for short-lived request correlation only and are not a metric dimension.
-The separate controlled-drill recovery objective is P95 under six minutes and
-must not be derived from these availability signals.
+machine-readable [`slo-contract.json`](slo-contract.json) is the collector
+contract. It defines the external 99%/30d journey SLI; internal metrics are
+diagnostics and do not establish public availability. Do not add labels or
+relabel rules containing room IDs, names, IPs, tokens, URLs, or request IDs.
+
+### Collector/runbook contract
+
+The external synthetic workflow is the canonical SLI input. Every executed
+check emits one bounded `synthetic_result {json}` record using
+`belacca.pong-slo-journey-result.v1`; it must be retained as durable evidence
+with the run timestamp and target identity held by the collector, not printed
+by the runner. Compute availability only as:
+
+```text
+sum(pong_slo_journey_good_total) / sum(pong_slo_journey_total)
+```
+
+For an external result, `total` is always 1, `good` is 1 only if every stage
+passes, and `failed` is 1 otherwise. `failure_stage` is one of the fixed
+stages in `slo-contract.json`; `failure_code` is an aggregate lower-case code.
+The result contains no room IDs, names, addresses, tokens, URLs, response
+bodies, or request IDs. A cleanup failure is reported separately in
+`cleanup_failure_code`, but a primary journey stage remains the failure owner.
+Missing, malformed, or non-executed evidence is not a good observation.
+
+Private native scraping uses the same fixed semantic names for diagnostics:
+raw journey counters (`pong_slo_journey_total`,
+`pong_slo_journey_good_total`, and `pong_slo_journey_failed_total`) are event
+accounting, while `pong_slo_journey_status` is only a debounced operational
+health hint. Never calculate the SLO from that gauge or from HTTP request
+success counters. Use fixed cumulative duration series for HTTP and room
+create/join/start/cleanup/reconciliation latency, plus room state, WebSocket,
+cleanup, and admission counters. All series are label-free; the registry also
+caps logical metric families at 256.
+
+On alert, identify the fixed external `failure_stage`, then correlate private
+aggregate counters and duration percentiles. Do not attempt to reconstruct a
+room or user from telemetry. The separate controlled-drill recovery objective
+is P95 under six minutes and must not be derived from these availability
+signals. Production rollout, private scraping, and durable evidence retention
+require GitOps/collector access unavailable in this worktree; the operator
+follow-up is to deploy the branch through the reviewed Flux path and verify
+one `/metrics` scrape plus one scheduled synthetic artifact against the
+`contract_revision: 2` fields in the v1-compatible contract before enabling
+the SLO alert.
 
 The orchestration contract is intentionally conservative:
 

@@ -1,6 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "schema_version": "belacca.pong-slo-contract.v1",
+  "contract_revision": 2,
   "service": "cloud-native-pong",
   "availability": {
     "target": 0.99,
@@ -8,28 +9,80 @@
     "window": "30d",
     "sla": false,
     "source": "external-durable-synthetic",
-    "measurement": "One hourly observation is good only when the public homepage, health, room create/join, two-player WebSocket-compatible playing state, and cleanup journey all pass."
+    "observation_period": "1h",
+    "measurement": "One hourly observation is good only when every canonical external journey stage passes.",
+    "numerator": "sum(pong_slo_journey_good_total)",
+    "denominator": "sum(pong_slo_journey_total)",
+    "error_budget": "1% of canonical external journey observations",
+    "status_is_not_sli_input": true
   },
   "journey": {
     "id": "pong-user-journey",
+    "result_contract": "belacca.pong-slo-journey-result.v1",
     "good_conditions": [
       "homepage marker is served",
-      "health endpoint returns ok",
+      "health endpoint returns exactly ok",
+      "room list returns a JSON array",
       "room creation returns a valid waiting room",
       "room join returns the exact connection contract",
-      "two unique WebSocket players receive joined and playing state",
+      "two unique WebSocket players receive joined messages",
+      "both players receive playing state",
       "room cleanup is observed after disconnect"
     ],
-    "failure_stages": [
+    "stages": [
       "homepage",
       "health",
+      "room-list",
       "room-create",
       "room-join",
       "websocket-assignment",
       "playing-state",
       "cleanup"
     ],
-    "failure_output": "Aggregate stage identifier and bounded failure code only; no room IDs, player names, addresses, tokens, URLs, response bodies, or request IDs."
+    "failure_stages": [
+      "homepage",
+      "health",
+      "room-list",
+      "room-create",
+      "room-join",
+      "websocket-assignment",
+      "playing-state",
+      "cleanup"
+    ],
+    "failure_output": "Aggregate stage identifier and bounded failure code only; no room IDs, player names, addresses, tokens, URLs, response bodies, or request IDs.",
+    "failure_classification": {
+      "stage_field": "failure_stage",
+      "code_field": "failure_code",
+      "allowed_code_pattern": "^[a-z0-9_]+$",
+      "code_is_aggregate_only": true,
+      "primary_failure_wins_over_cleanup": true,
+      "cleanup_failure_field": "cleanup_failure_code",
+      "privacy_exclusions": [
+        "room IDs",
+        "player names",
+        "client addresses",
+        "tokens",
+        "URLs",
+        "response bodies",
+        "request IDs"
+      ]
+    }
+  },
+  "external_result": {
+    "contract_version": "belacca.pong-slo-journey-result.v1",
+    "required_fields": [
+      "contract_version",
+      "total",
+      "good",
+      "failed",
+      "duration_ms",
+      "failure_stage",
+      "failure_code",
+      "cleanup_failure_code"
+    ],
+    "one_observation_rule": "total is exactly 1 for every executed check; good is 1 only when all stages pass; failed is 1 otherwise",
+    "latency_unit": "milliseconds",
+    "machine_output_prefix": "synthetic_result "
   },
   "diagnostics": {
     "metric_names": [
@@ -42,6 +95,63 @@
     ],
     "labels": [],
     "purpose": "Private native metrics diagnose latency, saturation, and lifecycle behavior; they do not calculate public availability or replace external SLO evidence."
+  },
+  "metrics": {
+    "labels": [],
+    "privacy": "No metric series may contain user, room, address, token, URL, request ID, or arbitrary input data.",
+    "bounded_name_limit": 256,
+    "journey": {
+      "pong_slo_journey_total": {
+        "type": "counter",
+        "meaning": "raw executed canonical external journey observations",
+        "role": "denominator"
+      },
+      "pong_slo_journey_good_total": {
+        "type": "counter",
+        "meaning": "raw canonical external journey observations where every stage passed",
+        "role": "numerator"
+      },
+      "pong_slo_journey_failed_total": {
+        "type": "counter",
+        "meaning": "raw canonical external journey observations that failed at any stage",
+        "role": "error_events"
+      },
+      "pong_slo_journey_status": {
+        "type": "gauge",
+        "meaning": "derived operational health status only; 1 healthy, 0 unhealthy",
+        "role": "alerting_hint",
+        "excluded_from_sli_arithmetic": true
+      }
+    },
+    "latency_distributions": [
+      "pong_http_request_duration_seconds",
+      "pong_room_create_duration_seconds",
+      "pong_room_join_duration_seconds",
+      "pong_room_start_duration_seconds",
+      "pong_room_cleanup_duration_seconds",
+      "pong_room_reconcile_duration_seconds"
+    ],
+    "lifecycle_and_admission_signals": [
+      "pong_rooms_active",
+      "pong_rooms_waiting",
+      "pong_rooms_playing",
+      "pong_websockets_active",
+      "pong_websocket_upgrade_success_total",
+      "pong_websocket_upgrade_failure_total",
+      "pong_websocket_disconnect_total",
+      "pong_room_cleanup_success_total",
+      "pong_room_cleanup_failure_total",
+      "pong_admission_http_rejected_total",
+      "pong_admission_websocket_rejected_total",
+      "pong_http_requests_success_total",
+      "pong_http_requests_failure_total"
+    ],
+    "duration_encoding": "Fixed cumulative bucket series use names <family>_bucket_le_<bound>_total and <family>_bucket_le_inf_total, plus <family>_sum and <family>_count; no le label is used."
+  },
+  "hysteresis": {
+    "raw_accounting": "Update total, good, and failed for every executed observation before any status threshold is applied.",
+    "status_accounting": "Status may require consecutive failures to become 0 and consecutive successes to return to 1.",
+    "collector_rule": "Use raw counters for the 99%/30d SLI; never derive the numerator or denominator from status transitions."
   },
   "recovery": {
     "target": "P95 under 6 minutes",

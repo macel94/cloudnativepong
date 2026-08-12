@@ -52,6 +52,48 @@ var webTransportServer *webtransport.Server
 var webTransportEnabled bool
 var webTransportURL string
 
+func registerCanonicalMetrics(registry *metrics.Registry) {
+	for _, name := range []string{
+		metrics.JourneyTotalMetric,
+		metrics.JourneyGoodMetric,
+		metrics.JourneyFailedMetric,
+		"pong_http_requests",
+		"pong_http_requests_success",
+		"pong_http_requests_failure",
+		"pong_admission_create_rejected",
+		"pong_admission_join_rejected",
+		"pong_admission_http_rejected",
+		"pong_admission_websocket_rejected",
+		"pong_websocket_upgrade_success",
+		"pong_websocket_upgrade_failure",
+		"pong_websocket_disconnect",
+		"pong_room_cleanup_success",
+		"pong_room_cleanup_failure",
+	} {
+		registry.RegisterCounter(name)
+	}
+	for _, name := range []string{
+		metrics.JourneyStatusMetric,
+		"pong_websockets_active",
+		"pong_rooms_active",
+		"pong_rooms_waiting",
+		"pong_rooms_playing",
+	} {
+		registry.RegisterGauge(name)
+	}
+	registry.SetGauge(metrics.JourneyStatusMetric, 1)
+	registry.RegisterDuration("pong_http_request_duration_seconds")
+	for _, name := range []string{
+		"pong_room_create_duration_seconds",
+		"pong_room_join_duration_seconds",
+		"pong_room_start_duration_seconds",
+		"pong_room_cleanup_duration_seconds",
+		"pong_room_reconcile_duration_seconds",
+	} {
+		registry.RegisterDuration(name)
+	}
+}
+
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool { return websocketOrigins.allowed(r.Header.Get("Origin")) },
 }
@@ -199,6 +241,7 @@ func writeWebTransportJSON(stream io.Writer, value interface{}) error {
 }
 
 func main() {
+	registerCanonicalMetrics(appMetrics)
 	mode := flag.String("mode", "local", "Mode: local, lobby, room")
 	port := flag.String("port", "8080", "HTTP listen port")
 	roomID := flag.String("room-id", "", "Room ID (for room mode)")
@@ -405,6 +448,7 @@ func setupLocalRoutes(mux *http.ServeMux, lobbySrv *lobby.Server, store *db.Stor
 	mux.Handle("/api/rooms/create", publicAPIHandler(corsMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !publicAdmission.AllowCreate(clientKey(r)) {
 			appMetrics.Inc("pong_admission_create_rejected")
+			appMetrics.Inc("pong_admission_http_rejected")
 			tooManyRequests(w)
 			return
 		}
@@ -461,6 +505,7 @@ func setupLocalRoutes(mux *http.ServeMux, lobbySrv *lobby.Server, store *db.Stor
 	mux.Handle("/api/rooms/join", publicAPIHandler(corsMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !publicAdmission.AllowJoin(clientKey(r)) {
 			appMetrics.Inc("pong_admission_join_rejected")
+			appMetrics.Inc("pong_admission_http_rejected")
 			tooManyRequests(w)
 			return
 		}
@@ -1005,6 +1050,7 @@ func publicAPIHandler(next http.Handler) http.Handler {
 		}
 		release, ok := publicAdmission.AcquireHTTP(clientKey(r))
 		if !ok {
+			appMetrics.Inc("pong_admission_http_rejected")
 			tooManyRequests(w)
 			return
 		}

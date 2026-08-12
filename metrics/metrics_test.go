@@ -66,6 +66,63 @@ func TestRegistryHandler(t *testing.T) {
 	}
 }
 
+func TestRegistryRegistersZeroValuedCanonicalFamiliesWithoutLabels(t *testing.T) {
+	registry := NewRegistry()
+	registry.RegisterCounter(JourneyTotalMetric)
+	registry.RegisterCounter(JourneyGoodMetric)
+	registry.RegisterCounter(JourneyFailedMetric)
+	registry.RegisterGauge(JourneyStatusMetric)
+	registry.RegisterDuration("pong_room_create_duration_seconds")
+
+	body := registry.Render()
+	for _, want := range []string{
+		"pong_slo_journey_total 0\n",
+		"pong_slo_journey_good_total 0\n",
+		"pong_slo_journey_failed_total 0\n",
+		"pong_slo_journey_status 0\n",
+		"pong_room_create_duration_seconds_count 0\n",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("Render() = %q, missing %q", body, want)
+		}
+	}
+	if strings.Contains(body, "{") || strings.Contains(body, "}") {
+		t.Fatalf("registered canonical metrics contain labels: %q", body)
+	}
+}
+
+func TestJourneyRawAccountingIsIndependentOfStatusHysteresis(t *testing.T) {
+	registry := NewRegistry()
+	accounting := NewJourneyAccounting(registry, 2, 2)
+
+	accounting.Observe(false)
+	if got := accounting.Snapshot(); got.Total != 1 || got.Good != 0 || got.Failed != 1 || got.Status != 1 {
+		t.Fatalf("after transient failure snapshot = %+v", got)
+	}
+	accounting.Observe(true)
+	accounting.Observe(false)
+	if got := accounting.Snapshot(); got.Total != 3 || got.Good != 1 || got.Failed != 2 || got.Status != 1 {
+		t.Fatalf("raw counters/status after hysteresis = %+v", got)
+	}
+	accounting.Observe(false)
+	if got := accounting.Snapshot(); got.Status != 0 || got.Total != 4 || got.Failed != 3 {
+		t.Fatalf("status did not trip independently of raw failure accounting = %+v", got)
+	}
+	accounting.Observe(true)
+	if got := accounting.Snapshot(); got.Status != 0 || got.SuccessStreak != 1 {
+		t.Fatalf("status recovered before threshold = %+v", got)
+	}
+	accounting.Observe(true)
+	if got := accounting.Snapshot(); got.Status != 1 || got.Total != 6 || got.Good != 3 || got.Failed != 3 {
+		t.Fatalf("final accounting snapshot = %+v", got)
+	}
+
+	counters, gauges := registry.Snapshot()
+	if counters[JourneyTotalMetric] != 6 || counters[JourneyGoodMetric] != 3 || counters[JourneyFailedMetric] != 3 || gauges[JourneyStatusMetric] != 1 {
+		t.Fatalf("rendered accounting = counters:%v gauges:%v", counters, gauges)
+	}
+}
+
 func TestRegistryRendersBoundedDurationDistributionWithoutLabels(t *testing.T) {
 	registry := NewRegistry()
 	registry.ObserveDuration("pong_http_request_duration_seconds", 5*time.Millisecond)
@@ -119,31 +176,36 @@ func TestSLOContractDefinesExternalJourneyAndPrivateDiagnostics(t *testing.T) {
 	var contract struct {
 		SchemaVersion string `json:"schema_version"`
 		Availability  struct {
-			Target    float64 `json:"target"`
-			Window    string  `json:"window"`
-			SLA       bool    `json:"sla"`
-			SLOSource string  `json:"source"`
+			Target         float64 `json:"target"`
+			Window         string  `json:"window"`
+			SLA            bool    `json:"sla"`
+			SLOSource      string  `json:"source"`
+			Numerator      string  `json:"numerator"`
+			Denominator    string  `json:"denominator"`
+			StatusExcluded bool    `json:"status_is_not_sli_input"`
 		} `json:"availability"`
 		Journey struct {
 			ID             string   `json:"id"`
 			GoodConditions []string `json:"good_conditions"`
-			FailureStages  []string `json:"failure_stages"`
+			Stages         []string `json:"stages"`
 		} `json:"journey"`
-		Diagnostics struct {
-			MetricNames []string `json:"metric_names"`
-			Labels      []string `json:"labels"`
-		} `json:"diagnostics"`
+		Metrics struct {
+			Labels  []string `json:"labels"`
+			Journey map[string]struct {
+				Type string `json:"type"`
+			} `json:"journey"`
+		} `json:"metrics"`
 	}
 	if err := json.Unmarshal(contents, &contract); err != nil {
 		t.Fatalf("decode SLO contract: %v", err)
 	}
-	if contract.SchemaVersion != "belacca.pong-slo-contract.v1" || contract.Availability.Target != 0.99 || contract.Availability.Window != "30d" || contract.Availability.SLA || contract.Availability.SLOSource != "external-durable-synthetic" {
+	if contract.SchemaVersion != "belacca.pong-slo-contract.v1" || contract.Availability.Target != 0.99 || contract.Availability.Window != "30d" || contract.Availability.SLA || contract.Availability.SLOSource != "external-durable-synthetic" || contract.Availability.Numerator != "sum(pong_slo_journey_good_total)" || contract.Availability.Denominator != "sum(pong_slo_journey_total)" || !contract.Availability.StatusExcluded {
 		t.Fatalf("unexpected availability contract: %+v", contract.Availability)
 	}
-	if contract.Journey.ID != "pong-user-journey" || len(contract.Journey.GoodConditions) < 5 || len(contract.Journey.FailureStages) < 5 {
+	if contract.Journey.ID != "pong-user-journey" || len(contract.Journey.GoodConditions) < 5 || len(contract.Journey.Stages) < 5 {
 		t.Fatalf("incomplete journey contract: %+v", contract.Journey)
 	}
-	if len(contract.Diagnostics.MetricNames) == 0 || len(contract.Diagnostics.Labels) != 0 {
-		t.Fatalf("diagnostic privacy contract = %+v", contract.Diagnostics)
+	if len(contract.Metrics.Journey) < 4 || len(contract.Metrics.Labels) != 0 {
+		t.Fatalf("metric privacy contract = %+v", contract.Metrics)
 	}
 }

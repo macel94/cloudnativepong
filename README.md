@@ -471,9 +471,15 @@ Caddy's `/rooms/` reverse proxy streams WebSocket upgrades with a one-hour timeo
 `/metrics` exposes dependency-free Prometheus text format. The machine-readable
 [`slo-contract.json`](slo-contract.json) defines the public 99%/30d SLI boundary:
 one hourly external observation is good only when the complete user journey
-passes. Internal metrics are diagnostics, not the public availability SLI, and
-there is no SLA. The separate controlled-drill recovery objective is P95 under
-six minutes and is excluded from availability arithmetic.
+passes. The synthetic runner emits one `synthetic_result` JSON record per
+executed observation with a fixed failure stage/code and no room, user,
+address, token, URL, response-body, or request-ID data. Collectors calculate
+`sum(pong_slo_journey_good_total) / sum(pong_slo_journey_total)` from raw
+observation evidence; the status gauge is hysteresis-only and is never an SLO
+numerator or denominator. Internal metrics are diagnostics, not the public
+availability SLI, and there is no SLA. The separate controlled-drill recovery
+objective is P95 under six minutes and is excluded from availability arithmetic.
+See [`DEPLOYMENT.md`](DEPLOYMENT.md) for the collector/runbook contract.
 
 Metrics are aggregate fixed-name counters, gauges, and bounded duration
  distributions only: there are no labels, room IDs, names, IPs, tokens, URLs, or
