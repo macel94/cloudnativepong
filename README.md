@@ -529,7 +529,11 @@ aggregate load-smoke journey, uploads bounded resource evidence, and deletes
 only that exact disposable cluster. It is serialized, manual-only, has no
 matrix or chaos injection, and never targets production or a public URL. See
 [`docs/CAPACITY-CHAOS-PLAN.md`](docs/CAPACITY-CHAOS-PLAN.md) for the safety
-contract and the separate availability/recovery objectives.
+contract and the separate availability/recovery objectives. The machine-readable
+[`capacity-policy.json`](capacity-policy.json) records the current single-writer
+boundary, configured admission ceilings, 20% headroom review thresholds, and
+alert signals; it does not claim production capacity without a reviewed
+isolated benchmark artifact.
 
 ## 📊 Verification Status
 

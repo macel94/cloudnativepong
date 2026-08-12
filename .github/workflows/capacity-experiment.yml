@@ -23,6 +23,11 @@ on:
         required: true
         default: 60000
         type: number
+      overload_ws_limit:
+        description: 'Disposable global WebSocket ceiling (1-128; use 128 for topology baseline)'
+        required: true
+        default: 128
+        type: number
 
 # Capacity experiments are deliberately serialized. A cancelled run must not
 # interrupt another run's disposable cluster or leave two load journeys active.
@@ -40,6 +45,7 @@ env:
   EXPERIMENT_CONCURRENCY: '${{ inputs.concurrency }}'
   TIMEOUT_MS: '${{ inputs.timeout_ms }}'
   MAX_DURATION_MS: '${{ inputs.max_duration_ms }}'
+  OVERLOAD_WS_LIMIT: '${{ inputs.overload_ws_limit }}'
 
 jobs:
   capacity:
@@ -83,6 +89,7 @@ jobs:
           validate_integer EXPERIMENT_CONCURRENCY "$EXPERIMENT_CONCURRENCY" 1 8
           validate_integer TIMEOUT_MS "$TIMEOUT_MS" 500 30000
           validate_integer MAX_DURATION_MS "$MAX_DURATION_MS" 1000 180000
+          validate_integer OVERLOAD_WS_LIMIT "$OVERLOAD_WS_LIMIT" 1 128
 
           if [[ ! "$GITHUB_RUN_ID" =~ ^[0-9]+$ ]]; then
             echo 'GITHUB_RUN_ID must be numeric' >&2
@@ -171,6 +178,20 @@ jobs:
           kubectl --context "$KUBE_CONTEXT" -n pong get pods -o wide
           curl --fail --silent --show-error --max-time 10 \
             "http://127.0.0.1:${HOST_PORT}/health" >/dev/null
+
+      - name: Apply disposable overload ceiling
+        shell: bash
+        run: |
+          set -euo pipefail
+          # This changes only the newly-created disposable cluster. A value of
+          # 128 is the current topology baseline; a lower value makes the
+          # predictable 429/WebSocket rejection path repeatable for validation.
+          kubectl --context "$KUBE_CONTEXT" -n pong set env deployment/pong-api \
+            PONG_WS_CONCURRENCY_GLOBAL="$OVERLOAD_WS_LIMIT"
+          kubectl --context "$KUBE_CONTEXT" -n pong \
+            rollout status deployment/pong-api --timeout=120s
+          printf 'configured_websocket_limit=%s\n' "$OVERLOAD_WS_LIMIT" \
+            > "$ARTIFACT_DIR/capacity-config.txt"
 
       - name: Run guarded aggregate load-smoke on loopback
         id: load_smoke

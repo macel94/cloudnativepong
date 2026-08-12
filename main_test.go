@@ -166,6 +166,65 @@ func TestNotifyRoomStartedForwardsOnlyCorrelationID(t *testing.T) {
 	}
 }
 
+func TestTooManyRequestsIsExplicitAndNonCacheable(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	tooManyRequests(recorder)
+	if recorder.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429", recorder.Code)
+	}
+	if recorder.Header().Get("Retry-After") != "60" {
+		t.Fatalf("Retry-After = %q, want 60", recorder.Header().Get("Retry-After"))
+	}
+	if recorder.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("Cache-Control = %q, want no-store", recorder.Header().Get("Cache-Control"))
+	}
+}
+
+func TestHTTPAdmissionRejectionIsMeasured(t *testing.T) {
+	oldAdmission := publicAdmission
+	oldMetrics := appMetrics
+	publicAdmission = admission.NewController(admission.Config{
+		Window:              time.Minute,
+		CreatePerWindow:     10,
+		JoinPerWindow:       10,
+		HTTPPerClient:       1,
+		WebSocketsPerClient: 1,
+		MaxWebSockets:       1,
+		MaxClients:          2,
+	})
+	appMetrics = metrics.NewRegistry()
+	defer func() {
+		publicAdmission = oldAdmission
+		appMetrics = oldMetrics
+	}()
+
+	entered := make(chan struct{})
+	releaseHandler := make(chan struct{})
+	next := publicAPIHandler(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		close(entered)
+		<-releaseHandler
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	firstDone := make(chan struct{})
+	go func() {
+		recorder := httptest.NewRecorder()
+		next.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/rooms", nil))
+		close(firstDone)
+	}()
+	<-entered
+	second := httptest.NewRecorder()
+	next.ServeHTTP(second, httptest.NewRequest(http.MethodGet, "/api/rooms", nil))
+	close(releaseHandler)
+	<-firstDone
+	if second.Code != http.StatusTooManyRequests {
+		t.Fatalf("second request status = %d, want 429", second.Code)
+	}
+	counters, _ := appMetrics.Snapshot()
+	if counters["pong_admission_http_rejected"] != 1 {
+		t.Fatalf("HTTP admission metrics = %+v", counters)
+	}
+}
+
 func TestLocalCreateAdmissionRejectionIsMeasured(t *testing.T) {
 	store, err := db.New(":memory:")
 	if err != nil {
@@ -508,6 +567,56 @@ func TestRoomWebSocketStartCallbackFailureDoesNotMarkPlaying(t *testing.T) {
 	}
 	_ = first.Close()
 	_ = second.Close()
+}
+
+func TestProxyRoomWSDialRetryBudgetIsBounded(t *testing.T) {
+	oldAdmission := publicAdmission
+	publicAdmission = admission.NewController(admission.Config{
+		Window:              time.Minute,
+		CreatePerWindow:     10,
+		JoinPerWindow:       10,
+		HTTPPerClient:       4,
+		WebSocketsPerClient: 4,
+		MaxWebSockets:       4,
+		MaxClients:          4,
+	})
+	t.Cleanup(func() { publicAdmission = oldAdmission })
+
+	store, err := db.New(":memory:")
+	if err != nil {
+		t.Fatalf("db.New() error = %v", err)
+	}
+	defer store.Close()
+	lobbySrv := lobby.NewServer(store, "local", "", "")
+	room, err := lobbySrv.CreateRoom("retry-budget")
+	if err != nil {
+		t.Fatalf("CreateRoom() error = %v", err)
+	}
+	lobbySrv.RegisterLocalRoom(room.ID, &lobby.RoomHandler{ID: room.ID, Addr: "127.0.0.1:1"})
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxyRoomWS(w, r, lobbySrv, store)
+	}))
+	defer proxy.Close()
+
+	started := time.Now()
+	client, response, dialErr := websocket.DefaultDialer.Dial(
+		"ws"+strings.TrimPrefix(proxy.URL, "http")+"/rooms/"+room.ID+"/ws",
+		http.Header{"Origin": []string{"http://localhost:8080"}},
+	)
+	if client != nil {
+		client.Close()
+	}
+	if response != nil {
+		response.Body.Close()
+	}
+	if dialErr == nil {
+		t.Fatal("proxy dial unexpectedly succeeded")
+	}
+	// Three attempts against a refused room address take only the two bounded
+	// backoffs. The old ten-attempt loop would take several seconds longer.
+	if time.Since(started) > 2*time.Second {
+		t.Fatal("proxy retry budget exceeded bounded failure window")
+	}
 }
 
 func TestProxyRoomWSForwardsImmediateJoinedFrame(t *testing.T) {

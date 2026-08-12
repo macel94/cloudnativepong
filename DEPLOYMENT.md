@@ -415,8 +415,11 @@ availability check, not a load generator. The availability objective is 99% per
 public service over 30 days; the controlled-drill recovery objective is P95 under
 six minutes and is separate from availability. The manual `capacity-experiment`
 workflow is the supported CI capacity path: it is loopback-only, serialized,
-bounded, and redacts uploaded snapshots. Its first 8-concurrent baseline hit the
-configured WebSocket admission boundary before CPU/RAM saturation. For local or
+bounded, and redacts uploaded snapshots. The configured WebSocket admission boundary is an intentional overload
+control, not a measured production capacity claim. Use the repeatable
+concurrency matrix and `capacity-policy.json` to identify whether admission,
+CPU/memory, SQLite, or Pod/Service quota is the first signal in an isolated
+run. For local or
 disposable load-smoke runs, set `LOAD_SMOKE_BASE_URL` explicitly. Loopback targets work without extra
 authorization; every non-local target requires the explicit operator marker
 `LOAD_SMOKE_EXPERIMENT_APPROVED=1` for an approved experiment. The marker is not

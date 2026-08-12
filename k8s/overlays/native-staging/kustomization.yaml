@@ -5,6 +5,7 @@ namespace: pong
 
 resources:
   - ../../base
+  - capacity-alerts.yaml
 
 images:
   - name: cloudnativepong-api

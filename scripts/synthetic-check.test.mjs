@@ -8,6 +8,7 @@ import {
   main,
   parseBaseURL,
   runSynthetic,
+  requireStatus,
   SyntheticError,
 } from './synthetic-check.mjs';
 
@@ -164,6 +165,13 @@ test('parseBaseURL preserves an ingress path and rejects unsafe targets', () => 
   assert.throws(() => parseBaseURL('ftp://example.test'), /http or https/);
   assert.throws(() => parseBaseURL('https://user:pass@example.test'), /credentials/);
   assert.throws(() => parseBaseURL('https://example.test/?token=secret'), /query/);
+});
+
+test('429 overload is not classified as retryable', () => {
+  assert.throws(
+    () => requireStatus(new Response('', { status: 429, headers: { 'retry-after': '60' } }), 'overload'),
+    (error) => error instanceof SyntheticError && error.status === 429 && error.retryable === false,
+  );
 });
 
 test('the complete fixture journey validates HTTP, two players, and cleanup', async (t) => {

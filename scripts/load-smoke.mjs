@@ -25,10 +25,24 @@ const flags = parseFlags(process.argv.slice(2));
 const dryRun = flags.has('dry-run');
 const configuredBase = flags.get('base-url') || process.env.LOAD_SMOKE_BASE_URL;
 const baseURL = configuredBase || 'http://localhost:8080';
-const iterations = boundedNumber(flags.get('iterations') || process.env.LOAD_SMOKE_ITERATIONS, DEFAULT_ITERATIONS, 1, MAX_ITERATIONS);
-const concurrency = boundedNumber(flags.get('concurrency') || process.env.LOAD_SMOKE_CONCURRENCY, DEFAULT_CONCURRENCY, 1, MAX_CONCURRENCY);
-const timeoutMs = boundedNumber(flags.get('timeout-ms') || process.env.LOAD_SMOKE_TIMEOUT_MS, DEFAULT_TIMEOUT_MS, 500, MAX_TIMEOUT_MS);
-const maxDurationMs = boundedNumber(flags.get('max-duration-ms') || process.env.LOAD_SMOKE_MAX_DURATION_MS, DEFAULT_DURATION_MS, 1_000, MAX_DURATION_MS);
+let iterations;
+let concurrency;
+let timeoutMs;
+let maxDurationMs;
+function configuredNumber(flagName, environmentName) {
+  if (flags.has(flagName)) return flags.get(flagName);
+  return process.env[environmentName] === '' ? undefined : process.env[environmentName];
+}
+
+try {
+  iterations = boundedNumber(configuredNumber('iterations', 'LOAD_SMOKE_ITERATIONS'), DEFAULT_ITERATIONS, 1, MAX_ITERATIONS, 'iterations');
+  concurrency = boundedNumber(configuredNumber('concurrency', 'LOAD_SMOKE_CONCURRENCY'), DEFAULT_CONCURRENCY, 1, MAX_CONCURRENCY, 'concurrency');
+  timeoutMs = boundedNumber(configuredNumber('timeout-ms', 'LOAD_SMOKE_TIMEOUT_MS'), DEFAULT_TIMEOUT_MS, 500, MAX_TIMEOUT_MS, 'timeout-ms');
+  maxDurationMs = boundedNumber(configuredNumber('max-duration-ms', 'LOAD_SMOKE_MAX_DURATION_MS'), DEFAULT_DURATION_MS, 1_000, MAX_DURATION_MS, 'max-duration-ms');
+} catch (error) {
+  console.error(`load smoke configuration rejected: ${error.message}`);
+  process.exit(2);
+}
 const origin = process.env.LOAD_SMOKE_ORIGIN || inferOrigin(baseURL);
 
 if (flags.has('help')) {
@@ -57,7 +71,7 @@ if (!isLocalTarget(base) && process.env.LOAD_SMOKE_EXPERIMENT_APPROVED !== EXPER
 if (dryRun) {
   console.log(JSON.stringify({
     mode: 'dry-run',
-    operations: ['health', 'create', 'join', 'websocket', 'cleanup'],
+    operations: ['health', 'create', 'join', 'websocket', 'api_read', 'cleanup'],
     limits: { iterations, concurrency, timeout_ms: timeoutMs, max_duration_ms: maxDurationMs },
     output: 'aggregate counts and latency percentiles only',
   }, null, 2));
@@ -70,14 +84,21 @@ if (!configuredBase) {
 }
 
 const deadline = Date.now() + maxDurationMs;
-const metrics = new Map(['health', 'create', 'join', 'websocket', 'cleanup'].map((name) => [name, { ok: 0, failed: 0, samples: [] }]));
+const metrics = new Map(['health', 'create', 'join', 'websocket', 'api_read', 'cleanup'].map((name) => [name, { ok: 0, failed: 0, samples: [], statuses: new Map() }]));
 const failures = new Map();
+const httpStatuses = new Map();
+const websocketStatuses = new Map();
+let requestsTotal = 0;
+let retryAfterResponses = 0;
+let websocketRetryAfterResponses = 0;
+let cleanupPollRequests = 0;
 let completed = 0;
 let nextIteration = 0;
 
-function record(name, started, ok, failureCode = '') {
+function record(name, started, ok, failureCode = '', status = null) {
   const item = metrics.get(name);
   if (!item) return;
+  if (status !== null) item.statuses.set(String(status), (item.statuses.get(String(status)) || 0) + 1);
   if (ok) {
     item.ok++;
     item.samples.push(Math.max(0, Date.now() - started));
@@ -93,6 +114,7 @@ function fail(code) {
 
 async function request(path, options = {}) {
   const started = Date.now();
+  requestsTotal++;
   const remainingUntilDeadline = deadline - started;
   if (remainingUntilDeadline <= 0) return { response: null, body: '', started, failureCode: 'deadline' };
   const remainingMs = Math.min(timeoutMs, remainingUntilDeadline);
@@ -101,6 +123,8 @@ async function request(path, options = {}) {
   const timer = setTimeout(() => controller.abort(), remainingMs);
   try {
     const response = await fetch(endpoint(path), { ...options, signal: controller.signal });
+    httpStatuses.set(String(response.status), (httpStatuses.get(String(response.status)) || 0) + 1);
+    if (response.headers.has('retry-after')) retryAfterResponses++;
     const body = await response.text();
     return { response, body, started };
   } catch {
@@ -116,18 +140,19 @@ async function jsonRequest(name, path, options = {}) {
     record(name, result.started, false, `${name}_${result.failureCode || 'transport'}`);
     return null;
   }
+  const status = result.response.status;
   let body;
   try {
     body = JSON.parse(result.body);
   } catch {
-    record(name, result.started, false, `${name}_body`);
+    record(name, result.started, false, `${name}_body`, status);
     return null;
   }
   if (!result.response.ok) {
-    record(name, result.started, false, `${name}_http_${statusClass(result.response.status)}`);
+    record(name, result.started, false, `${name}_http_${statusClass(status)}`, status);
     return null;
   }
-  record(name, result.started, true);
+  record(name, result.started, true, '', status);
   return body;
 }
 
@@ -139,14 +164,14 @@ async function runOne(sequence) {
 
   const healthResult = await request('/health');
   if (!healthResult.response || !healthResult.response.ok) {
-    record('health', healthResult.started, false, `health_${healthResult.failureCode || 'unavailable'}`);
+    record('health', healthResult.started, false, `health_${healthResult.failureCode || 'unavailable'}`, healthResult.response?.status ?? null);
     return false;
   }
   if (!healthResult.body.trim()) {
-    record('health', healthResult.started, false, 'health_body');
+    record('health', healthResult.started, false, 'health_body', healthResult.response.status);
     return false;
   }
-  record('health', healthResult.started, true);
+  record('health', healthResult.started, true, '', healthResult.response.status);
 
   const room = await jsonRequest('create', '/api/rooms/create', {
     method: 'POST',
@@ -159,7 +184,10 @@ async function runOne(sequence) {
   }
 
   let sockets = [];
-  let connectionAttempted = false;
+  // A created room owns the creator reservation. Always make one bounded
+  // cleanup connection attempt when no player socket exists, including after a
+  // rejected join, so overload does not leave a room waiting for reconciliation.
+  let connectionAttempted = true;
   let cleanupStarted = Date.now();
   try {
     const joined = await jsonRequest('join', '/api/rooms/join', {
@@ -182,6 +210,13 @@ async function runOne(sequence) {
       openPlayer(room.id),
     ]);
     sockets = results.filter((result) => result.status === 'fulfilled').map((result) => result.value);
+    for (const result of results) {
+      if (result.status === 'rejected' && result.reason?.status) {
+        const status = String(result.reason.status);
+        websocketStatuses.set(status, (websocketStatuses.get(status) || 0) + 1);
+        if (result.reason.retryAfter) websocketRetryAfterResponses++;
+      }
+    }
     if (results.some((result) => result.status === 'rejected')) {
       record('websocket', wsStarted, false, 'websocket_contract');
       return false;
@@ -249,6 +284,12 @@ function openPlayer(roomID) {
         finish(new Error('message'));
       }
     });
+    socket.on('unexpected-response', (_request, response) => {
+      finish(Object.assign(new Error('socket'), {
+        status: response.statusCode,
+        retryAfter: response.headers['retry-after'] !== undefined,
+      }));
+    });
     socket.on('error', () => finish(new Error('socket')));
     socket.on('close', () => {
       if (!settled) finish(new Error('closed'));
@@ -259,16 +300,22 @@ function openPlayer(roomID) {
 async function waitForCleanup(roomID, started) {
   const cleanupDeadline = Math.min(deadline, Date.now() + timeoutMs);
   while (Date.now() < cleanupDeadline) {
+    cleanupPollRequests++;
     const result = await request('/api/rooms');
     if (result.response) {
       try {
         const rooms = JSON.parse(result.body);
-        if (result.response.ok && Array.isArray(rooms) && !rooms.some((room) => room && room.id === roomID)) {
+        const validRead = result.response.ok && Array.isArray(rooms);
+        record('api_read', result.started, validRead, validRead ? '' : `api_read_${result.response.ok ? 'body' : `http_${statusClass(result.response.status)}`}`, result.response.status);
+        if (validRead && !rooms.some((room) => room && room.id === roomID)) {
           return { ok: true, started };
         }
       } catch {
+        record('api_read', result.started, false, 'api_read_body', result.response.status);
         // Retry until the bounded deadline.
       }
+    } else {
+      record('api_read', result.started, false, `api_read_${result.failureCode || 'transport'}`);
     }
     await sleep(50);
   }
@@ -291,9 +338,16 @@ const output = {
   completed_iterations: completed,
   failed_iterations: iterations - completed,
   limits: { concurrency, timeout_ms: timeoutMs, max_duration_ms: maxDurationMs },
+  requests_total: requestsTotal,
+  cleanup_poll_requests: cleanupPollRequests,
+  http_statuses: Object.fromEntries([...httpStatuses].sort(([a], [b]) => Number(a) - Number(b))),
+  retry_after_responses: retryAfterResponses,
+  websocket_statuses: Object.fromEntries([...websocketStatuses].sort(([a], [b]) => Number(a) - Number(b))),
+  websocket_retry_after_responses: websocketRetryAfterResponses,
   operations: Object.fromEntries([...metrics].map(([name, item]) => [name, {
     ok: item.ok,
     failed: item.failed,
+    status_codes: Object.fromEntries([...item.statuses].sort(([a], [b]) => Number(a) - Number(b))),
     p50_ms: percentile(item.samples, 0.50),
     p95_ms: percentile(item.samples, 0.95),
     max_ms: item.samples.length ? Math.max(...item.samples) : 0,
@@ -345,10 +399,19 @@ function parseFlags(argv) {
   return values;
 }
 
-function boundedNumber(value, fallback, minimum, maximum) {
-  const parsed = Number(value);
-  if (!Number.isFinite(parsed)) return fallback;
-  return Math.min(maximum, Math.max(minimum, Math.floor(parsed)));
+function boundedNumber(value, fallback, minimum, maximum, name) {
+  if (value === undefined) return fallback;
+  if (value === '') throw new Error(`${name} must be a decimal integer`);
+  if (typeof value !== 'string' && typeof value !== 'number') {
+    throw new Error(`${name} must be a decimal integer`);
+  }
+  const text = String(value);
+  if (!/^[0-9]+$/u.test(text)) throw new Error(`${name} must be a decimal integer`);
+  const parsed = Number(text);
+  if (!Number.isSafeInteger(parsed) || parsed < minimum || parsed > maximum) {
+    throw new Error(`${name} must be between ${minimum} and ${maximum}`);
+  }
+  return parsed;
 }
 
 function statusClass(status) {

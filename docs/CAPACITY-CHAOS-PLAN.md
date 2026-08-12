@@ -40,7 +40,9 @@ creation. The permitted bounds are:
 | `timeout_ms` | 10000 | 500-30000 |
 | `max_duration_ms` | 60000 | 1000-180000 |
 
-The experiment has no GitHub matrix, retry fan-out, or parallel workflow jobs.
+The experiment has no GitHub matrix, retry fan-out, or parallel workflow jobs;
+the operator may run the same serialized workflow sequentially at the documented
+concurrency points.
 The run-ID-derived cluster name is deliberately short enough for k3d's 32-character
 limit while remaining unique to the run. It builds and imports the four local images (`api`, `room`, `static`, and
 `gateway`) sequentially. The cluster name is exactly derived from the run ID;
@@ -72,6 +74,66 @@ targets. Browser tests can be added later for a separately justified user
 experience question, but they must not turn the capacity workflow into a
 public or unbounded browser load generator.
 
+## Capacity model and bounded overload policy
+
+The reviewable configured model is [`capacity-policy.json`](../capacity-policy.json).
+It is intentionally separate from benchmark output: the policy records current
+limits and the calculation for safe headroom, while a run artifact records what
+actually happened in an isolated environment. The current topology has one API
+replica and one SQLite writer, a global 128-session WebSocket admission limit,
+and a 120-pod/120-service namespace quota. After fixed API, gateway, static,
+and Service objects, the dynamic room ceiling is 117 Pods/116 Services. Until a
+measured result is lower, the review threshold is 80% of each boundary: 102
+WebSocket sessions (51 two-player games when there are no spectators) and 92
+active rooms. These are guardrails,
+not a production capacity claim.
+
+The first overload signal is expected to be an aggregate admission rejection,
+not a crash: HTTP admission, create, join, and WebSocket rejection counters
+increase; public HTTP admission returns `429 Too Many Requests`, `Retry-After:
+60`, and `Cache-Control: no-store`. The benchmark does not retry 429 responses.
+The lobby's room-backend dial is the only internal retrying layer and is capped
+at three attempts with 100ms/200ms backoff. This prevents a rejected request from
+becoming a retry storm while preserving health, room listing, existing-room
+cleanup, and already-admitted WebSocket journeys as critical work.
+
+The current capacity boundary remains the minimum of measured CPU/memory,
+SQLite failure/latency, room Pod/Service quota, gateway/WebSocket saturation,
+and the application admission ceilings. Never add a second `pong-api` replica
+to raise it: the RWO SQLite file has a deliberate single-writer contract.
+Future options are a serialized durable writer with read replicas, a
+transactional state service, or room-partitioned writable shards; none is
+implemented here.
+
+## Repeatable benchmark procedure
+
+Run the manual `capacity-experiment` workflow at `concurrency=1,2,4,8` with
+three or more iterations per point and the same timeout/duration. Repeat the
+matrix after changing images or resource limits. For explicit overload
+validation, rerun with `overload_ws_limit` below the requested concurrent
+sessions (the default 128 preserves the current topology baseline). The workflow
+always creates a new loopback-only k3d cluster, applies the test overlay, and
+deletes only its owned cluster.
+
+Each aggregate result contains health/create/join/WebSocket/API-read/cleanup
+counts, latency percentiles, HTTP status classes, `Retry-After` counts,
+WebSocket handshake statuses, and failure codes. Interpret the first signal as
+follows:
+
+1. admission rejection with low CPU/memory: configured ceiling is the boundary;
+2. quota rejection or pending room Pods: Pod/Service quota is the boundary;
+3. SQLite failures or rising create/join latency: the single writer/storage is
+   the boundary;
+4. resource pressure with no admission rejection: CPU/memory or gateway is the
+   boundary; and
+5. cleanup failures or rooms remaining after the run: the result is invalid
+   until reconciliation succeeds.
+
+Record the lowest stable concurrency/ceiling pair that has no unacceptable
+journey errors, then keep 20% headroom. Do not average across runs that used
+different images, resource requests, node sizes, admission settings, or quota.
+The workflow is evidence collection, not an automatic capacity promotion.
+
 ## Evidence and review
 
 Every manual run uploads a short-lived artifact containing:
@@ -89,9 +151,7 @@ condition is captured in the artifact rather than converted into an unbounded
 wait. Reviewers should correlate the aggregate operation results with pod
 readiness, resource requests/limits, and any snapshot errors. This evidence is
 for a disposable baseline and cannot establish the public 30-day availability
-objective or the drill recovery P95 by itself. If WebSocket failures occur
-while node CPU/memory remain low, inspect admission-rejection and WebSocket
-failure counters before calling the result resource saturation.
+objective or the drill recovery P95 by itself. If WebSocket failures occur while node CPU/memory remain low, inspect admission-rejection and WebSocket failure counters before calling the result resource saturation. A successful run must also verify that the room list returns to its pre-run state and that no room Pod/Service remains after bounded cleanup/reconciliation.
 
 ## Current non-goals
 

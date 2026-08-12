@@ -166,6 +166,14 @@ func startWebTransportServer(addr, certFile, keyFile string, mux http.Handler) (
 
 const maxWebTransportMessageSize = 1 << 20
 
+// Room dial retries are deliberately short and bounded. The lobby is the
+// only retrying layer for room startup; callers must not multiply this work
+// when the room or cluster is already overloaded.
+const (
+	maxRoomDialAttempts = 3
+	roomDialBackoff     = 100 * time.Millisecond
+)
+
 func readWebTransportJSON(stream io.Reader, value interface{}) error {
 	var lengthBytes [4]byte
 	if _, err := io.ReadFull(stream, lengthBytes[:]); err != nil {
@@ -637,6 +645,7 @@ func handleRoomWebTransport(session *webtransport.Session, r *http.Request, room
 	}
 	release, ok := publicAdmission.AcquireWebSocket(clientKey(r))
 	if !ok {
+		appMetrics.Inc("pong_admission_webtransport_rejected")
 		_ = session.CloseWithError(0, "too many sessions")
 		return
 	}
@@ -982,6 +991,10 @@ func clientKey(r *http.Request) string {
 }
 
 func tooManyRequests(w http.ResponseWriter) {
+	// Admission rejection is intentionally explicit and cache-proof. The
+	// single-writer API has no alternate writer for a caller to fan out to, so
+	// clients should honor this bounded delay instead of immediately retrying.
+	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Retry-After", "60")
 	http.Error(w, "too many requests", http.StatusTooManyRequests)
 }
@@ -1005,6 +1018,7 @@ func publicAPIHandler(next http.Handler) http.Handler {
 		}
 		release, ok := publicAdmission.AcquireHTTP(clientKey(r))
 		if !ok {
+			appMetrics.Inc("pong_admission_http_rejected")
 			tooManyRequests(w)
 			return
 		}
@@ -1216,13 +1230,15 @@ func proxyRoomWebTransport(session *webtransport.Session, r *http.Request, roomI
 	targetHeader.Set(correlationIDHeader, requestID(r))
 	telemetry.Inject(r.Context(), targetHeader)
 	var target *websocket.Conn
-	for i := 0; i < 10; i++ {
+	for attempt := 0; attempt < maxRoomDialAttempts; attempt++ {
 		target, _, err = dialer.Dial(roomWebSocketURL(addr, isSpectatorRequest(r)), targetHeader)
 		if err == nil {
 			break
 		}
-		appMetrics.Inc("pong_webtransport_proxy_dial_retry")
-		time.Sleep(500 * time.Millisecond)
+		if attempt+1 < maxRoomDialAttempts {
+			appMetrics.Inc("pong_webtransport_proxy_dial_retry")
+			time.Sleep(roomDialBackoff * time.Duration(1<<attempt))
+		}
 	}
 	if err != nil {
 		appMetrics.Inc("pong_webtransport_proxy_dial_failure")
@@ -1373,13 +1389,15 @@ func proxyRoomWS(w http.ResponseWriter, r *http.Request, lobbySrv *lobby.Server,
 	targetHeader.Set(requestIDHeader, requestID(r))
 	targetHeader.Set(correlationIDHeader, requestID(r))
 	telemetry.Inject(r.Context(), targetHeader)
-	for i := 0; i < 10; i++ {
+	for attempt := 0; attempt < maxRoomDialAttempts; attempt++ {
 		target, _, err = dialer.Dial(roomWebSocketURL(addr, isSpectatorRequest(r)), targetHeader)
 		if err == nil {
 			break
 		}
-		appMetrics.Inc("pong_websocket_proxy_dial_retry")
-		time.Sleep(500 * time.Millisecond)
+		if attempt+1 < maxRoomDialAttempts {
+			appMetrics.Inc("pong_websocket_proxy_dial_retry")
+			time.Sleep(roomDialBackoff * time.Duration(1<<attempt))
+		}
 	}
 	if err != nil {
 		appMetrics.Inc("pong_websocket_proxy_dial_failure")

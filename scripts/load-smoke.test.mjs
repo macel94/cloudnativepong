@@ -50,12 +50,28 @@ async function runAsync(args = [], environment = {}) {
   };
 }
 
+test('capacity policy matches the configured topology and safe headroom model', async () => {
+  const policy = JSON.parse(await readFile(new URL('../capacity-policy.json', import.meta.url), 'utf8'));
+  assert.equal(policy.topology.api_replicas, 1);
+  assert.equal(policy.topology.sqlite_writers, 1);
+  assert.equal(policy.admission.global_websocket_sessions, 128);
+  assert.equal(policy.capacity_model.safe_global_websocket_sessions, 102);
+  assert.equal(policy.capacity_model.safe_two_player_games_if_no_spectators, 51);
+  assert.equal(policy.capacity_model.room_quota_review_threshold, 92);
+  assert.equal(policy.topology.room_resource_quota.dynamic_room_pod_ceiling, 115);
+  assert.equal(policy.overload_policy.status, 429);
+  assert.equal(policy.overload_policy.retry_after_seconds, 60);
+  assert.equal(policy.scaling_boundary.not_implemented, true);
+});
+
 test('capacity workflow keeps its disposable cluster name within k3d limits', async () => {
   const workflow = await readFile(new URL('../.github/workflows/capacity-experiment.yml', import.meta.url), 'utf8');
   assert.match(workflow, /CLUSTER_NAME: cnp-capacity-\$\{\{ github\.run_id \}\}/u);
   assert.match(workflow, /KUBE_CONTEXT: k3d-cnp-capacity-\$\{\{ github\.run_id \}\}/u);
   assert.doesNotMatch(workflow, /cloudnativepong-capacity-/u);
   assert.match(workflow, /pong-metrics\.txt/u);
+  assert.match(workflow, /LOAD_SMOKE_ITERATIONS.*50|ITERATIONS.*50/u);
+  assert.match(workflow, /LOAD_SMOKE_EXPERIMENT_APPROVED/u);
 });
 
 test('dry-run defaults to a local target and emits aggregate metadata only', () => {
@@ -65,7 +81,7 @@ test('dry-run defaults to a local target and emits aggregate metadata only', () 
   assert.doesNotMatch(combinedOutput(result), /https?:\/\//u);
   assert.deepEqual(JSON.parse(result.stdout), {
     mode: 'dry-run',
-    operations: ['health', 'create', 'join', 'websocket', 'cleanup'],
+    operations: ['health', 'create', 'join', 'websocket', 'api_read', 'cleanup'],
     limits: {
       iterations: 3,
       concurrency: 1,
@@ -74,6 +90,14 @@ test('dry-run defaults to a local target and emits aggregate metadata only', () 
     },
     output: 'aggregate counts and latency percentiles only',
   });
+});
+
+test('invalid benchmark bounds fail closed instead of being clamped', () => {
+  for (const flag of ['iterations=0', 'concurrency=9', 'timeout-ms=499', 'max-duration-ms=180001', 'iterations=1.5']) {
+    const result = run(['--dry-run', `--${flag}`]);
+    assert.equal(result.status, 2, flag);
+    assert.match(combinedOutput(result), /configuration rejected/u);
+  }
 });
 
 test('loopback targets remain usable without experiment authorization', () => {
@@ -159,6 +183,37 @@ test('a malformed join response fails the journey contract', async (t) => {
 
   assert.equal(result.status, 1);
   assert.match(result.stdout, /join_contract/u);
+});
+
+test('overload evidence records HTTP statuses and Retry-After headers', async (t) => {
+  const server = createServer((request, response) => {
+    const url = new URL(request.url, 'http://127.0.0.1');
+    if (url.pathname === '/health') {
+      response.writeHead(200, { 'content-type': 'text/plain' });
+      response.end('ok\n');
+      return;
+    }
+    response.writeHead(429, { 'content-type': 'application/json', 'retry-after': '60' });
+    response.end(JSON.stringify({ error: 'too many requests' }));
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  t.after(() => server.close());
+  const { port } = server.address();
+
+  const result = await runAsync([
+    `--base-url=http://127.0.0.1:${port}`,
+    '--iterations=1',
+    '--concurrency=1',
+    '--timeout-ms=1000',
+    '--max-duration-ms=5000',
+  ]);
+  assert.equal(result.status, 1);
+  const output = JSON.parse(result.stdout);
+  assert.equal(output.http_statuses['429'], 1);
+  assert.equal(output.retry_after_responses, 1);
+  assert.equal(output.operations.create.status_codes['429'], 1);
+  assert.equal(output.failure_codes.create_http_4xx, 1);
 });
 
 test('request bodies cannot extend the overall experiment deadline', async (t) => {
