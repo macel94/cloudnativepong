@@ -515,9 +515,11 @@ LOAD_SMOKE_BASE_URL=http://localhost:8080 \
 
 The harness is intended for local smoke/load checks and explicitly approved
 disposable experiment targets, not as a replacement for a production rate
-limiter. Loopback targets need no authorization; every non-local target requires
-`LOAD_SMOKE_EXPERIMENT_APPROVED=1`, and the canonical public Pong production
-hostname is never selected by default. The scheduled `synthetic-check` workflow
+limiter. Loopback targets need no authorization; every non-local target
+requires `PONG_EXPERIMENT_MODE=capacity|chaos`,
+`PONG_EXPERIMENT_APPROVED=1`, and `PONG_EXPERIMENT_TARGET=isolated`. The
+canonical public Pong production hostname and documented public edges are
+always rejected; loopback is the only default execution target. The scheduled `synthetic-check` workflow
 is a separate low-rate availability check and does not run this load harness.
 
 ### Manual disposable capacity baseline
@@ -526,10 +528,17 @@ Repository maintainers can invoke **Actions → Disposable capacity experiment �
 Run workflow** with bounded numeric inputs. It builds the four local images,
 creates one run-ID-named k3d cluster, binds its gateway to `127.0.0.1`, runs the
 aggregate load-smoke journey, uploads bounded resource evidence, and deletes
-only that exact disposable cluster. It is serialized, manual-only, has no
-matrix or chaos injection, and never targets production or a public URL. See
+only that exact disposable cluster. It requires an explicit approval input, is
+serialized with the chaos workflow, has no matrix/retry fan-out, and never
+targets production or a public URL. The **Disposable chaos experiment**
+workflow accepts one reversible scenario at a time, repeats it three times,
+records aggregate recovery P95 against six minutes, and verifies namespace and
+cluster cleanup. See
 [`docs/CAPACITY-CHAOS-PLAN.md`](docs/CAPACITY-CHAOS-PLAN.md) for the safety
-contract and the separate availability/recovery objectives.
+contract and the separate availability/recovery objectives. No live production
+credentials or drill evidence are present in this repository; operators must
+run the manual workflows only against disposable or separately approved
+isolated targets.
 
 ## 📊 Verification Status
 

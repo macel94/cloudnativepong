@@ -7,59 +7,61 @@
  * URLs, client addresses, tokens, and response bodies never appear in output.
  */
 import process from 'node:process';
-import { isIP } from 'node:net';
 import WebSocket from 'ws';
+import {
+  isLocalTarget,
+  parseBoundedInteger,
+  parseExperimentURL,
+  validateExperimentTarget,
+} from './experiment-guard.mjs';
 
 const MAX_ITERATIONS = 50;
 const MAX_CONCURRENCY = 8;
 const MAX_TIMEOUT_MS = 30_000;
 const MAX_DURATION_MS = 180_000;
+const MAX_ABORT_FAILURES = 20;
 const DEFAULT_ITERATIONS = 3;
 const DEFAULT_CONCURRENCY = 1;
 const DEFAULT_TIMEOUT_MS = 10_000;
 const DEFAULT_DURATION_MS = 60_000;
-const CANONICAL_PUBLIC_HOSTNAME = 'pong.belacca.com';
-const EXPERIMENT_APPROVAL_VALUE = '1';
+const DEFAULT_ABORT_FAILURES = 3;
 
 const flags = parseFlags(process.argv.slice(2));
+if (flags.has('help')) {
+  console.log('usage: LOAD_SMOKE_BASE_URL=http://localhost:8080 node scripts/load-smoke.mjs [--dry-run]');
+  console.log('non-local targets require PONG_EXPERIMENT_MODE, PONG_EXPERIMENT_APPROVED=1, and PONG_EXPERIMENT_TARGET=isolated');
+  process.exit(0);
+}
 const dryRun = flags.has('dry-run');
 const configuredBase = flags.get('base-url') || process.env.LOAD_SMOKE_BASE_URL;
 const baseURL = configuredBase || 'http://localhost:8080';
-const iterations = boundedNumber(flags.get('iterations') || process.env.LOAD_SMOKE_ITERATIONS, DEFAULT_ITERATIONS, 1, MAX_ITERATIONS);
-const concurrency = boundedNumber(flags.get('concurrency') || process.env.LOAD_SMOKE_CONCURRENCY, DEFAULT_CONCURRENCY, 1, MAX_CONCURRENCY);
-const timeoutMs = boundedNumber(flags.get('timeout-ms') || process.env.LOAD_SMOKE_TIMEOUT_MS, DEFAULT_TIMEOUT_MS, 500, MAX_TIMEOUT_MS);
-const maxDurationMs = boundedNumber(flags.get('max-duration-ms') || process.env.LOAD_SMOKE_MAX_DURATION_MS, DEFAULT_DURATION_MS, 1_000, MAX_DURATION_MS);
-const origin = process.env.LOAD_SMOKE_ORIGIN || inferOrigin(baseURL);
-
-if (flags.has('help')) {
-  console.log('usage: LOAD_SMOKE_BASE_URL=http://localhost:8080 node scripts/load-smoke.mjs [--dry-run]');
-  console.log('non-local targets require LOAD_SMOKE_EXPERIMENT_APPROVED=1');
-  process.exit(0);
-}
-
 let base;
+let iterations;
+let concurrency;
+let timeoutMs;
+let maxDurationMs;
+let abortThreshold;
 try {
-  base = new URL(baseURL);
-  if (!['http:', 'https:'].includes(base.protocol)) throw new Error('unsupported protocol');
-} catch {
-  console.error('load smoke configuration rejected: base URL must use http or https');
+  base = parseExperimentURL(baseURL);
+  const target = validateExperimentTarget(base, process.env);
+  if (!target.ok) throw new Error(target.message);
+  iterations = parseBoundedInteger(flags.get('iterations') ?? process.env.LOAD_SMOKE_ITERATIONS, DEFAULT_ITERATIONS, 1, MAX_ITERATIONS, 'iterations');
+  concurrency = parseBoundedInteger(flags.get('concurrency') ?? process.env.LOAD_SMOKE_CONCURRENCY, DEFAULT_CONCURRENCY, 1, MAX_CONCURRENCY, 'concurrency');
+  timeoutMs = parseBoundedInteger(flags.get('timeout-ms') ?? process.env.LOAD_SMOKE_TIMEOUT_MS, DEFAULT_TIMEOUT_MS, 500, MAX_TIMEOUT_MS, 'timeout-ms');
+  maxDurationMs = parseBoundedInteger(flags.get('max-duration-ms') ?? process.env.LOAD_SMOKE_MAX_DURATION_MS, DEFAULT_DURATION_MS, 1_000, MAX_DURATION_MS, 'max-duration-ms');
+  abortThreshold = parseBoundedInteger(flags.get('abort-threshold') ?? process.env.LOAD_SMOKE_ABORT_THRESHOLD, DEFAULT_ABORT_FAILURES, 1, MAX_ABORT_FAILURES, 'abort-threshold');
+} catch (error) {
+  console.error(`load smoke configuration rejected: ${error.message}`);
   process.exit(2);
 }
-
-if (!isLocalTarget(base) && process.env.LOAD_SMOKE_EXPERIMENT_APPROVED !== EXPERIMENT_APPROVAL_VALUE) {
-  const targetDescription = normalizeHostname(base.hostname) === CANONICAL_PUBLIC_HOSTNAME
-    ? 'canonical public Pong production'
-    : 'a non-local target';
-  console.error(`load smoke configuration rejected: ${targetDescription} requires LOAD_SMOKE_EXPERIMENT_APPROVED=1`);
-  process.exit(2);
-}
+const origin = process.env.LOAD_SMOKE_ORIGIN || inferOrigin(baseURL);
 
 if (dryRun) {
   console.log(JSON.stringify({
     mode: 'dry-run',
     operations: ['health', 'create', 'join', 'websocket', 'cleanup'],
-    limits: { iterations, concurrency, timeout_ms: timeoutMs, max_duration_ms: maxDurationMs },
-    output: 'aggregate counts and latency percentiles only',
+    limits: { iterations, concurrency, timeout_ms: timeoutMs, max_duration_ms: maxDurationMs, abort_threshold: abortThreshold },
+    output: 'aggregate counts, throughput, recovery, and latency percentiles only',
   }, null, 2));
   process.exit(0);
 }
@@ -69,11 +71,16 @@ if (!configuredBase) {
   process.exit(2);
 }
 
-const deadline = Date.now() + maxDurationMs;
+const startedAt = Date.now();
+const deadline = startedAt + maxDurationMs;
 const metrics = new Map(['health', 'create', 'join', 'websocket', 'cleanup'].map((name) => [name, { ok: 0, failed: 0, samples: [] }]));
 const failures = new Map();
 let completed = 0;
+let attempted = 0;
+let failureCount = 0;
 let nextIteration = 0;
+let aborted = false;
+let cleanupFailures = 0;
 
 function record(name, started, ok, failureCode = '') {
   const item = metrics.get(name);
@@ -89,6 +96,11 @@ function record(name, started, ok, failureCode = '') {
 
 function fail(code) {
   failures.set(code, (failures.get(code) || 0) + 1);
+}
+
+function markJourneyFailure() {
+  failureCount++;
+  if (failureCount >= abortThreshold) aborted = true;
 }
 
 async function request(path, options = {}) {
@@ -132,18 +144,23 @@ async function jsonRequest(name, path, options = {}) {
 }
 
 async function runOne(sequence) {
+  let journeyOK = false;
+  let cleanupOK = true;
   if (Date.now() >= deadline) {
     fail('deadline');
+    markJourneyFailure();
     return false;
   }
 
   const healthResult = await request('/health');
   if (!healthResult.response || !healthResult.response.ok) {
     record('health', healthResult.started, false, `health_${healthResult.failureCode || 'unavailable'}`);
+    markJourneyFailure();
     return false;
   }
   if (!healthResult.body.trim()) {
     record('health', healthResult.started, false, 'health_body');
+    markJourneyFailure();
     return false;
   }
   record('health', healthResult.started, true);
@@ -155,6 +172,7 @@ async function runOne(sequence) {
   });
   if (!room || typeof room.id !== 'string' || !/^[0-9a-f]{6}$/.test(room.id)) {
     fail('create_contract');
+    markJourneyFailure();
     return false;
   }
 
@@ -172,6 +190,7 @@ async function runOne(sequence) {
     );
     if (!validConnectionContract) {
       fail('join_contract');
+      markJourneyFailure();
       return false;
     }
 
@@ -184,10 +203,11 @@ async function runOne(sequence) {
     sockets = results.filter((result) => result.status === 'fulfilled').map((result) => result.value);
     if (results.some((result) => result.status === 'rejected')) {
       record('websocket', wsStarted, false, 'websocket_contract');
+      markJourneyFailure();
       return false;
     }
     record('websocket', wsStarted, true);
-    return true;
+    journeyOK = true;
   } finally {
     cleanupStarted = Date.now();
     for (const socket of sockets) {
@@ -204,8 +224,15 @@ async function runOne(sequence) {
       }
     }
     const cleanup = await waitForCleanup(room.id, cleanupStarted);
+    cleanupOK = cleanup.ok;
     record('cleanup', cleanup.started, cleanup.ok, cleanup.ok ? '' : 'cleanup_timeout');
+    if (!cleanup.ok) {
+      cleanupFailures++;
+      aborted = true;
+      fail('cleanup_verification');
+    }
   }
+  return journeyOK && cleanupOK;
 }
 
 function openPlayer(roomID) {
@@ -277,20 +304,30 @@ async function waitForCleanup(roomID, started) {
 
 async function worker() {
   while (true) {
+    if (aborted) return;
     const sequence = nextIteration++;
     if (sequence >= iterations || Date.now() >= deadline) return;
+    attempted++;
     if (await runOne(sequence)) completed++;
   }
 }
 
 await Promise.all(Array.from({ length: concurrency }, () => worker()));
 
+const elapsedMs = Math.min(Date.now() - startedAt, maxDurationMs);
 const output = {
   mode: 'run',
   requested_iterations: iterations,
+  attempted_iterations: attempted,
   completed_iterations: completed,
-  failed_iterations: iterations - completed,
-  limits: { concurrency, timeout_ms: timeoutMs, max_duration_ms: maxDurationMs },
+  failed_iterations: attempted - completed,
+  failure_count: failureCount,
+  limits: { concurrency, timeout_ms: timeoutMs, max_duration_ms: maxDurationMs, abort_threshold: abortThreshold },
+  aborted,
+  deadline_reached: Date.now() >= deadline,
+  cleanup_verified: cleanupFailures === 0 && metrics.get('cleanup').failed === 0,
+  throughput_per_second: elapsedMs > 0 ? Number((completed / (elapsedMs / 1000)).toFixed(3)) : 0,
+  elapsed_ms: elapsedMs,
   operations: Object.fromEntries([...metrics].map(([name, item]) => [name, {
     ok: item.ok,
     failed: item.failed,
@@ -301,7 +338,7 @@ const output = {
   failure_codes: Object.fromEntries([...failures].sort(([a], [b]) => a.localeCompare(b))),
 };
 console.log(JSON.stringify(output, null, 2));
-if (completed !== iterations) process.exitCode = 1;
+if (completed !== iterations || aborted || !output.cleanup_verified) process.exitCode = 1;
 
 function endpoint(path) {
   return new URL(path, `${base.origin}/`).toString();
@@ -315,22 +352,10 @@ function websocketEndpoint(path) {
 function inferOrigin(value) {
   try {
     const parsed = new URL(value);
-    return isLocalTarget(parsed) ? 'http://localhost:8080' : 'https://pong.belacca.com';
+    return isLocalTarget(parsed) ? 'http://localhost:8080' : 'http://isolated.invalid';
   } catch {
     return 'http://localhost:8080';
   }
-}
-
-function normalizeHostname(hostname) {
-  return hostname.toLowerCase().replace(/^\[|\]$/gu, '').replace(/\.$/u, '');
-}
-
-function isLocalTarget(url) {
-  const hostname = normalizeHostname(url.hostname);
-  if (hostname === 'localhost' || hostname.endsWith('.localhost')) return true;
-  if (isIP(hostname) === 4) return hostname.startsWith('127.');
-  if (isIP(hostname) === 6) return hostname === '::1' || hostname.startsWith('::ffff:127.');
-  return false;
 }
 
 function parseFlags(argv) {
@@ -343,12 +368,6 @@ function parseFlags(argv) {
     }
   }
   return values;
-}
-
-function boundedNumber(value, fallback, minimum, maximum) {
-  const parsed = Number(value);
-  if (!Number.isFinite(parsed)) return fallback;
-  return Math.min(maximum, Math.max(minimum, Math.floor(parsed)));
 }
 
 function statusClass(status) {

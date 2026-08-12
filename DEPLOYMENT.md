@@ -417,13 +417,21 @@ six minutes and is separate from availability. The manual `capacity-experiment`
 workflow is the supported CI capacity path: it is loopback-only, serialized,
 bounded, and redacts uploaded snapshots. Its first 8-concurrent baseline hit the
 configured WebSocket admission boundary before CPU/RAM saturation. For local or
-disposable load-smoke runs, set `LOAD_SMOKE_BASE_URL` explicitly. Loopback targets work without extra
-authorization; every non-local target requires the explicit operator marker
-`LOAD_SMOKE_EXPERIMENT_APPROVED=1` for an approved experiment. The marker is not
-configured by the workflow, and the canonical public Pong target is never a
-default for this harness. The load runner is bounded and verifies cleanup, but
-do not run traffic against public production without a separately approved
-window.
+disposable load-smoke runs, set `LOAD_SMOKE_BASE_URL` explicitly. Loopback
+requires no authorization; every non-local target requires all three explicit
+markers: `PONG_EXPERIMENT_MODE=capacity|chaos`, `PONG_EXPERIMENT_APPROVED=1`, and
+`PONG_EXPERIMENT_TARGET=isolated`. Canonical public hosts and native edge
+addresses are always denied. Playwright is fixed to one worker with no retries.
+The capacity and chaos workflows share one global `capacity-chaos-experiment`
+lock, have no matrix/retry fan-out, and use run-owned disposable k3d resources.
+
+The chaos workflow runs one selected fault (`api-restart`, `gateway-restart`,
+`room-termination`, `node-drain`, or `resource-pressure`) three times after a
+passing concurrent-room baseline. It emits aggregate recovery P95, failure,
+cleanup, and resource evidence; it does not establish public availability.
+This branch has not executed a live cluster drill. An operator must run at
+least three comparable approved isolated drills and review P95 against six
+minutes; never run them against public production.
 
 ## Useful checks
 
