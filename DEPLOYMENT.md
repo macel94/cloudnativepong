@@ -248,6 +248,29 @@ server overlay with `sha-<40-hex-commit>` tags and commits the deployment change
 back to the feature branch. A future merge to `main` should use the same
 workflow after the production branch policy is chosen.
 
+## Release, change-failure, and rollback evidence
+
+The complete production promotion evidence contract is documented in
+[`docs/RELEASE-EVIDENCE.md`](docs/RELEASE-EVIDENCE.md). The manual
+`.github/workflows/release-evidence.yml` workflow requires the source SHA, four
+immutable GHCR digests, verified GitHub Artifact Attestations, observed
+Deployment/Flux revisions, and a post-deploy synthetic journey before it
+creates a privacy-safe `belacca.release-record.v1` artifact. Failed journeys
+produce a halted/pending-review result and fail the workflow; they cannot be
+reported as successful promotions.
+
+Production rollback remains a reviewed Git/Flux change. The workflow never
+runs production `kubectl` commands or fabricates revisions. Record detection
+and recovery timestamps after the reviewed revert has reconciled and the
+synthetic journey has recovered. The intentionally failed rollout path is the
+manual-only disposable `.github/workflows/negative-rollout.yml` workflow; its
+`kubectl rollout undo` is guarded to an exact disposable k3d context and is not
+an acceptable production rollback.
+
+The record defines deployment frequency, lead time, change failure rate, and
+recovery time with explicit UTC windows and arithmetic validation. It rejects
+mutable tags and private/user-data-shaped evidence.
+
 ## Supply-chain evidence and synthetic checks
 
 The published `sha-<40-hex-commit>` image tags are immutable references to a

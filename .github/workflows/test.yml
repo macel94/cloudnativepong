@@ -38,9 +38,11 @@ jobs:
             # converged; never weaken the release gate for reviewed changes.
             python3 scripts/validate-release.py
           fi
-          bash -n scripts/update-image-tag.sh scripts/update-image-tag.test.sh scripts/validate-release.test.sh scripts/promote-digests.sh
+          bash -n scripts/update-image-tag.sh scripts/update-image-tag.test.sh scripts/validate-release.test.sh scripts/promote-digests.sh scripts/release-record.test.sh scripts/negative-rollout.sh scripts/negative-rollout.test.sh
           scripts/update-image-tag.test.sh
           scripts/validate-release.test.sh
+          scripts/release-record.test.sh
+          scripts/negative-rollout.test.sh
           scripts/publish-image-tags.test.sh
 
       - name: Build binary
