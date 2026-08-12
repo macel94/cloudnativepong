@@ -353,10 +353,13 @@ async function recoverCreatedRoom(client, name, rememberRoom, recoveryTimeoutMs)
 async function createRoom(client, name, rememberRoom) {
   let lastError;
   let retried = false;
+  const createClient = client.createRequestTimeoutMs === undefined
+    ? client
+    : { ...client, requestTimeoutMs: client.createRequestTimeoutMs };
 
   for (let attempt = 1; attempt <= CREATE_MAX_ATTEMPTS; attempt += 1) {
     try {
-      const room = await postJSON(client, '/api/rooms/create', { name }, 'room creation');
+      const room = await postJSON(createClient, '/api/rooms/create', { name }, 'room creation');
       rememberRoom(room);
       // If an earlier request timed out after the server accepted it, a second
       // room may become visible shortly after the successful retry. Track it
@@ -648,8 +651,8 @@ async function waitForCleanup(client, roomID, timeoutMs, pollMs) {
   }
 }
 
-function makeClient({ base, env, fetchImpl, deadline, requestTimeoutMs }) {
-  return { base, env, fetchImpl, deadline, requestTimeoutMs };
+function makeClient({ base, env, fetchImpl, deadline, requestTimeoutMs, createRequestTimeoutMs }) {
+  return { base, env, fetchImpl, deadline, requestTimeoutMs, createRequestTimeoutMs };
 }
 
 /**
@@ -662,6 +665,7 @@ export async function runSynthetic({
   origin = env.SYNTHETIC_ORIGIN,
   timeoutMs = positiveInteger(env.SYNTHETIC_TIMEOUT_MS, 'SYNTHETIC_TIMEOUT_MS', DEFAULT_TIMEOUT_MS, 120_000),
   requestTimeoutMs = positiveInteger(env.SYNTHETIC_REQUEST_TIMEOUT_MS, 'SYNTHETIC_REQUEST_TIMEOUT_MS', DEFAULT_REQUEST_TIMEOUT_MS, 60_000),
+  createRequestTimeoutMs = requestTimeoutMs,
   fetchImpl = globalThis.fetch,
   WebSocketImpl = WebSocket,
   cleanupTimeoutMs = CLEANUP_TIMEOUT_MS,
@@ -677,6 +681,12 @@ export async function runSynthetic({
   const syntheticOrigin = parseOrigin(origin, base.origin);
   const cleanupTimeout = positiveInteger(cleanupTimeoutMs, 'cleanupTimeoutMs', CLEANUP_TIMEOUT_MS, 120_000);
   const cleanupPoll = positiveInteger(cleanupPollMs, 'cleanupPollMs', CLEANUP_POLL_MS, 60_000);
+  const createRequestTimeout = positiveInteger(
+    createRequestTimeoutMs,
+    'createRequestTimeoutMs',
+    requestTimeoutMs,
+    60_000,
+  );
   const deadline = Date.now() + timeoutMs;
 
   if (dryRun) {
@@ -687,7 +697,14 @@ export async function runSynthetic({
 
   if (typeof fetchImpl !== 'function') throw new SyntheticError('fetch is not available');
 
-  const client = makeClient({ base, env, fetchImpl, deadline, requestTimeoutMs });
+  const client = makeClient({
+    base,
+    env,
+    fetchImpl,
+    deadline,
+    requestTimeoutMs,
+    createRequestTimeoutMs: createRequestTimeout,
+  });
   const startedAt = Date.now();
   let roomID = null;
   const roomIDs = new Set();

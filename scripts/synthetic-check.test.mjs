@@ -221,7 +221,8 @@ test('recovers a room when create is accepted before its response times out', as
   const result = await runSynthetic({
     baseURL: fixture.baseURL,
     timeoutMs: 5_000,
-    requestTimeoutMs: 100,
+    requestTimeoutMs: 1_000,
+    createRequestTimeoutMs: 100,
     cleanupTimeoutMs: 2_000,
     cleanupPollMs: 10,
   });
