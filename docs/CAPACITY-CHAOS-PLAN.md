@@ -13,25 +13,29 @@ This plan separates two different questions:
   disposable load run. In shorthand, this is **99%/30d availability versus
   separate P95-under-6m drill recovery**.
 
-The next safe slice is the manual-only **Disposable capacity experiment**
-workflow (`capacity-experiment.yml`). It creates one temporary k3d cluster per
-run, uses only a localhost gateway, and serializes runs with the fixed
-`capacity-experiment` concurrency group.
+The supported runners are manual-only **Disposable capacity experiment**
+(`capacity-experiment.yml`) and **Disposable chaos experiment**
+(`chaos-experiment.yml`). Each creates one temporary k3d cluster per run,
+uses only a localhost gateway, and serializes both workflow files with the
+same fixed `capacity-chaos-experiment` concurrency group. They are not part of
+scheduled public synthetic monitoring.
 
 ## Safe targets and hard bounds
 
 The baseline target is a freshly created disposable k3d cluster from
 `k8s/overlays/test`. The gateway is bound to `127.0.0.1` on the GitHub-hosted
 runner and the load-smoke base URL is the corresponding loopback URL. The
-workflow has no public target variable, secret, production context, or
-approval marker. The existing load-smoke guard remains active: loopback is
-allowed, while non-local targets require an explicit approval marker that this
-workflow never supplies.
+workflow has no public target variable, secret, or production context. Every
+non-local target is rejected unless `PONG_EXPERIMENT_MODE` is `capacity` or
+`chaos`, `PONG_EXPERIMENT_APPROVED=1`, and
+`PONG_EXPERIMENT_TARGET=isolated`. The workflow additionally requires the
+manual boolean `approve_experiment=true`; `pong.belacca.com` and documented
+native public edge addresses are denied even when markers are present.
 
 Workflow inputs are validated again in Bash after GitHub has supplied them;
-workflow metadata is not treated as a security boundary. Invalid, fractional,
-negative, non-numeric, or out-of-range values fail closed before cluster
-creation. The permitted bounds are:
+workflow metadata is not treated as a security boundary. Invalid, fractional, negative, non-numeric, or out-of-range values fail closed
+before cluster creation. Malformed values are rejected, not clamped. The
+permitted bounds are:
 
 | Input | Default | Hard bound |
 | --- | ---: | ---: |
@@ -39,8 +43,12 @@ creation. The permitted bounds are:
 | `concurrency` | 1 | 1-8 |
 | `timeout_ms` | 10000 | 500-30000 |
 | `max_duration_ms` | 60000 | 1000-180000 |
+| `abort_threshold` | 3 | 1-20 |
 
 The experiment has no GitHub matrix, retry fan-out, or parallel workflow jobs.
+Load-smoke has a hard three-minute maximum, an abort threshold, and bounded
+cleanup. Cluster/namespace cleanup has a 120-second deadline and must produce
+a verification marker or the workflow fails.
 The run-ID-derived cluster name is deliberately short enough for k3d's 32-character
 limit while remaining unique to the run. It builds and imports the four local images (`api`, `room`, `static`, and
 `gateway`) sequentially. The cluster name is exactly derived from the run ID;
@@ -109,22 +117,24 @@ This slice does **not**:
 The scheduled synthetic workflow remains a separate, low-rate availability
 check. It must not be repurposed as a capacity or chaos runner.
 
-## Future one-fault-at-a-time drills
+## One-fault-at-a-time chaos drills
 
-After an isolated baseline has been reviewed, future drills should introduce
-exactly one reversible fault at a time, with an explicit hypothesis, bounded
-window, pre-check, recovery measurement, and post-check. Candidate scenarios
-on disposable targets include:
+`chaos-experiment.yml` accepts exactly one scenario and performs three
+sequential comparable repetitions after a passing concurrent-room baseline:
 
-1. restart one non-stateful gateway pod and measure readiness and journey
-   recovery;
-2. restart the single API pod only after confirming the SQLite/PVC safety
-   contract and measuring the resulting bounded outage;
-3. make one room pod unavailable and verify room cleanup/reconciliation; or
-4. apply a narrowly scoped disposable resource-pressure or network fault,
-   then remove it and verify the cluster returns to baseline.
+1. `api-restart` — restart the disposable API deployment;
+2. `gateway-restart` — restart the disposable gateway deployment;
+3. `room-termination` — create a disposable room and terminate its room pod;
+4. `node-drain` — drain and uncordon one disposable k3d agent; or
+5. `resource-pressure` — create and remove one bounded pressure pod.
 
-Each scenario needs its own reviewed guard and must never combine faults,
-parallelize failure injection, or target native production. A later recovery
-workflow can calculate P95 across repeated, separately approved drills; it
-must not mix that number with the 99%/30-day availability measurement.
+It emits aggregate recovery durations and P95, failures, cleanup markers, and
+resource snapshot availability. A recovery P95 under 360000 ms is marked as
+the controlled-drill objective; failed or incomplete runs record
+`objective_passed: false`. Faults are never combined or injected in parallel.
+
+This branch cannot provide live-cluster validation, production credentials, or
+three executed recovery-drill artifacts. Operator follow-up is required: run
+an approved isolated workflow invocation for at least three comparable runs,
+retain the aggregate JSON and cleanup markers, and review P95 against six
+minutes. Never point these workflows at native production or a public ingress.
