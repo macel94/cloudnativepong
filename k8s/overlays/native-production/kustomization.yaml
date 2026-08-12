@@ -21,7 +21,7 @@ images:
     newTag: sha-858b2847522a9043c00ad2f9ea1f90a578861c58
 
 patches:
-  - path: api-native-staging.yaml
+  - path: api-native-production.yaml
     target:
       group: apps
       version: v1

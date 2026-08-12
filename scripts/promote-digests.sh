@@ -60,7 +60,7 @@ verified = os.environ.get("VERIFY_ATTESTATIONS") == "1"
 
 for overlay, api_file in [
     ("server", "api-production.yaml"),
-    ("native-staging", "api-native-staging.yaml"),
+    ("native-production", "api-native-production.yaml"),
 ]:
     room_template = root / f"k8s/overlays/{overlay}/room-template.yaml"
     text = room_template.read_text()

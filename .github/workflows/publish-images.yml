@@ -16,7 +16,7 @@ on:
       - 'static/**'
       - 'gateway/**'
       - 'k8s/overlays/server/**'
-      - 'k8s/overlays/native-staging/**'
+      - 'k8s/overlays/native-production/**'
       - '.github/workflows/publish-images.yml'
   workflow_dispatch:
 

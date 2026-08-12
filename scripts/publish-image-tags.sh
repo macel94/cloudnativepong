@@ -55,7 +55,7 @@ git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
 
 path_requires_publication() {
   case "$1" in
-    Dockerfile.*|.dockerignore|gateway/Caddyfile|static/Caddyfile|go.mod|go.sum|*.go|static/*|gateway/*|k8s/overlays/server/*|k8s/overlays/native-staging/*|.github/workflows/publish-images.yml|scripts/publish-image-tags.sh|scripts/update-image-tag.sh|scripts/validate-release.py)
+    Dockerfile.*|.dockerignore|gateway/Caddyfile|static/Caddyfile|go.mod|go.sum|*.go|static/*|gateway/*|k8s/overlays/server/*|k8s/overlays/native-production/*|.github/workflows/publish-images.yml|scripts/publish-image-tags.sh|scripts/update-image-tag.sh|scripts/validate-release.py)
       return 0
       ;;
     *)
@@ -78,9 +78,9 @@ is_generated_publication_commit() {
       k8s/overlays/server/kustomization.yaml|\
       k8s/overlays/server/api-production.yaml|\
       k8s/overlays/server/room-template.yaml|\
-      k8s/overlays/native-staging/kustomization.yaml|\
-      k8s/overlays/native-staging/api-native-staging.yaml|\
-      k8s/overlays/native-staging/room-template.yaml)
+      k8s/overlays/native-production/kustomization.yaml|\
+      k8s/overlays/native-production/api-native-production.yaml|\
+      k8s/overlays/native-production/room-template.yaml)
         paths=$((paths + 1))
         ;;
       *)
@@ -97,9 +97,9 @@ is_generated_publication_commit() {
     k8s/overlays/server/kustomization.yaml \
     k8s/overlays/server/api-production.yaml \
     k8s/overlays/server/room-template.yaml \
-    k8s/overlays/native-staging/kustomization.yaml \
-    k8s/overlays/native-staging/api-native-staging.yaml \
-    k8s/overlays/native-staging/room-template.yaml; do
+    k8s/overlays/native-production/kustomization.yaml \
+    k8s/overlays/native-production/api-native-production.yaml \
+    k8s/overlays/native-production/room-template.yaml; do
     content=$(git show "$commit:$changed_path") || return 1
     [[ "$content" == *"$generated_tag"* ]] || return 1
   done
@@ -157,7 +157,7 @@ for ((attempt = 1; attempt <= max_attempts; attempt++)); do
   # are always strict even when source-push CI is in pending-publication mode.
   python3 scripts/validate-release.py
   git diff --check
-  git add k8s/overlays/server k8s/overlays/native-staging
+  git add k8s/overlays/server k8s/overlays/native-production
   if git diff --cached --quiet; then
     echo "deployment references already point at ${tag}"
     exit 0

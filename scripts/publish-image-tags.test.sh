@@ -58,7 +58,7 @@ deploy:\ publish\ images\ sha-"$basic_sha" ]] || {
   echo 'basic publisher test did not record the source SHA' >&2
   exit 1
 }
-for overlay in server native-staging; do
+for overlay in server native-production; do
   git --git-dir "$basic/origin.git" show "main:k8s/overlays/$overlay/kustomization.yaml" \
     | grep -q "sha-$basic_sha"
 done

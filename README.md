@@ -226,12 +226,12 @@ repository is one independently reconciled application source.
 2. Merge the reviewed change into `main`.
 3. `.github/workflows/publish-images.yml` builds and publishes immutable
    `sha-<commit>` images to GHCR for `api`, `room`, `static`, and `gateway`.
-4. The workflow updates both `k8s/overlays/native-staging/` (the live native
+4. The workflow updates both `k8s/overlays/native-production/` (the live native
    production target) and the retained `k8s/overlays/server/` compatibility
    overlay with those image tags, then commits the generated deployment update.
 5. Flux watches `main` at one-minute source intervals. The platform
    repository's native production Kustomization reconciles this repository's
-   `./k8s/overlays/native-staging` source every ten minutes. Force an
+   `./k8s/overlays/native-production` source every ten minutes. Force an
    immediate sync when needed:
 
    ```bash
@@ -243,8 +243,10 @@ repository is one independently reconciled application source.
 
 The Flux source and kustomization should both report `Ready=True` after a
 successful deployment. The platform repository owns the generated Flux
-bootstrap manifests and old-production root; application manifests and
-environment patches for Pong are under `k8s/overlays/server/`.
+bootstrap manifests and native-production root; the live application manifests
+and environment patches for Pong are under `k8s/overlays/native-production/`.
+The `server` overlay remains a compatibility/audit target and is not the live
+production path.
 
 ### Kubernetes dashboards and administrative access
 

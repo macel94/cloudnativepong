@@ -33,27 +33,27 @@ old_tag=$(sed -n 's/.*newTag: //p' "$tmp/k8s/overlays/server/kustomization.yaml"
 }
 new_tag='sha-1111111111111111111111111111111111111111'
 (cd "$tmp" && sed -i "s/$old_tag/$new_tag/g" \
-  k8s/overlays/native-staging/kustomization.yaml \
-  k8s/overlays/native-staging/api-native-staging.yaml \
-  k8s/overlays/native-staging/room-template.yaml)
+  k8s/overlays/native-production/kustomization.yaml \
+  k8s/overlays/native-production/api-native-production.yaml \
+  k8s/overlays/native-production/room-template.yaml)
 expect_failure run_validator
 run_validator --allow-pending-publication
 
 # A tag mismatch inside one overlay is never a valid pending state.
 (cd "$tmp" && OLD="$old_tag" NEW="$new_tag" perl -0pi -e 's/\Q$ENV{NEW}\E/$ENV{OLD}/' \
-  k8s/overlays/native-staging/kustomization.yaml)
+  k8s/overlays/native-production/kustomization.yaml)
 expect_failure run_validator --allow-pending-publication
 (cd "$tmp" && sed -i "s/$old_tag/$new_tag/" \
-  k8s/overlays/native-staging/kustomization.yaml)
+  k8s/overlays/native-production/kustomization.yaml)
 
 # Mutable references are rejected even with the narrow pending exception.
 (cd "$tmp" && OLD="$old_tag" NEW="$new_tag" perl -0pi -e 's/\Q$ENV{NEW}\E/$ENV{OLD}/' \
-  k8s/overlays/native-staging/kustomization.yaml && \
+  k8s/overlays/native-production/kustomization.yaml && \
   sed -i "s/newTag: ${old_tag}/newTag: latest/" \
-  k8s/overlays/native-staging/kustomization.yaml)
+  k8s/overlays/native-production/kustomization.yaml)
 expect_failure run_validator --allow-pending-publication
 (cd "$tmp" && sed -i 's/newTag: latest/newTag: sha-1111111111111111111111111111111111111111/' \
-  k8s/overlays/native-staging/kustomization.yaml)
+  k8s/overlays/native-production/kustomization.yaml)
 
 # Digest promotion updates both overlays, API room arguments, embedded JSON,
 # and release metadata as one consistent immutable state.
@@ -70,9 +70,9 @@ run_validator
 (cd "$tmp" && OLD='sha256:0000000000000000000000000000000000000000000000000000000000000002' \
   NEW='sha256:9999999999999999999999999999999999999999999999999999999999999999' \
   perl -0pi -e 's/\Q$ENV{OLD}\E/$ENV{NEW}/g' \
-  k8s/overlays/native-staging/kustomization.yaml \
-  k8s/overlays/native-staging/api-native-staging.yaml \
-  k8s/overlays/native-staging/room-template.yaml)
+  k8s/overlays/native-production/kustomization.yaml \
+  k8s/overlays/native-production/api-native-production.yaml \
+  k8s/overlays/native-production/room-template.yaml)
 expect_failure run_validator
 run_validator --allow-pending-publication
 

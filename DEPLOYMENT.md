@@ -59,14 +59,14 @@ repository as an independent child source:
 - Platform repository: `https://github.com/macel94/belacca-gitops.git`
 - Application repository: `https://github.com/macel94/cloudnativepong.git`
 - Branch: `main`
-- Flux application path: `./k8s/overlays/native-staging` (native production;
+- Flux application path: `./k8s/overlays/native-production` (native production;
   the historical `./k8s/overlays/server` path is retained for compatibility/audit)
 - Source refresh interval: 1 minute
 - Application reconciliation interval: 10 minutes (force it for immediate validation with `flux reconcile kustomization pong -n flux-system --with-source`)
 
 The Flux controllers are `source-controller`, `kustomize-controller`,
 `helm-controller`, and `notification-controller`. The platform repository owns
-the generated Flux bootstrap manifests and old-production root; change them
+the generated Flux bootstrap manifests and native-production root; change them
 only through the documented Flux upgrade/bootstrap process.
 
 Native Traefik is the current public ingress on `.73`, `.41`, and `.42`. The
@@ -106,7 +106,7 @@ WebTransport requires a separate UDP-capable public service, matching TLS
 certificate, and `PONG_WEBTRANSPORT_PUBLIC_URL`; it remains disabled until
 those platform prerequisites are reviewed.
 
-The image-publish workflow updates both `k8s/overlays/native-staging/` (the
+The image-publish workflow updates both `k8s/overlays/native-production/` (the
 live native Flux target) and the retained server overlay. A source push may
 briefly leave those two overlays on different immutable releases until the
 publisher's generated `deploy: publish images ...` commit lands; CI validates
@@ -243,7 +243,7 @@ ghcr.io/macel94/cloudnativepong-static
 ghcr.io/macel94/cloudnativepong-gateway
 ```
 
-The packages are configured for anonymous pulls. The workflow updates both the live native-staging overlay and the retained
+The packages are configured for anonymous pulls. The workflow updates both the live native-production overlay and the retained
 server overlay with `sha-<40-hex-commit>` tags and commits the deployment change
 back to the feature branch. A future merge to `main` should use the same
 workflow after the production branch policy is chosen.

@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-OVERLAY_NAMES = ("server", "native-staging")
+OVERLAY_NAMES = ("server", "native-production")
 COMPONENTS = ("api", "room", "static", "gateway")
 OVERLAYS = [
     ROOT / "k8s" / "overlays" / name / "kustomization.yaml"
@@ -24,7 +24,7 @@ API_PATCHES = [
     ROOT / "k8s" / "overlays" / name / api_file
     for name, api_file in (
         ("server", "api-production.yaml"),
-        ("native-staging", "api-native-staging.yaml"),
+        ("native-production", "api-native-production.yaml"),
     )
 ]
 RELEASE = ROOT / "release-metadata.json"
