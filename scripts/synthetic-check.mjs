@@ -9,6 +9,7 @@
  * production.
  */
 import process from 'node:process';
+import { writeFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 import WebSocket from 'ws';
@@ -38,6 +39,19 @@ export class SyntheticError extends Error {
 
 function usage() {
   console.log('usage: SYNTHETIC_BASE_URL=https://... node scripts/synthetic-check.mjs [--dry-run]');
+}
+
+async function writeEvidence(path, status, startedAt, completedAt) {
+  if (typeof path !== 'string' || path.trim() === '') return;
+  // This artifact is intentionally aggregate-only. Never include the target,
+  // room identifiers, names, response bodies, tokens, or error text.
+  const evidence = {
+    status,
+    started_at: new Date(startedAt).toISOString().replace('.000Z', 'Z'),
+    completed_at: new Date(completedAt).toISOString().replace('.000Z', 'Z'),
+    duration_ms: Math.max(0, completedAt - startedAt),
+  };
+  await writeFile(path, `${JSON.stringify(evidence, null, 2)}\n`, { mode: 0o600 });
 }
 
 function positiveInteger(raw, name, fallback, maximum) {
@@ -733,10 +747,19 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
     return 0;
   }
   const dryRun = args.has('--dry-run');
+  const startedAt = Date.now();
   try {
     await runSynthetic({ env, dryRun });
+    await writeEvidence(env.SYNTHETIC_EVIDENCE_FILE, 'passed', startedAt, Date.now());
     return 0;
   } catch (error) {
+    const completedAt = Date.now();
+    try {
+      await writeEvidence(env.SYNTHETIC_EVIDENCE_FILE, 'failed', startedAt, completedAt);
+    } catch {
+      // Preserve the primary failed-check result. The promotion workflow must
+      // fail closed when its required evidence file is absent.
+    }
     const message = error instanceof SyntheticError ? error.message : 'synthetic check failed';
     console.error(`synthetic failed: ${message}`);
     return 1;
