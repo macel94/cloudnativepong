@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { createServer } from 'node:http';
 import { once } from 'node:events';
 import test from 'node:test';
@@ -185,13 +187,13 @@ test('the complete fixture journey validates HTTP, two players, and cleanup', as
 });
 
 test('recovers a room when create is accepted before its response times out', async (t) => {
-  const fixture = await startFixture({ createResponseDelayMs: 150 });
+  const fixture = await startFixture({ createResponseDelayMs: 500 });
   t.after(() => fixture.close());
 
   const result = await runSynthetic({
     baseURL: fixture.baseURL,
     timeoutMs: 5_000,
-    requestTimeoutMs: 50,
+    requestTimeoutMs: 250,
     cleanupTimeoutMs: 2_000,
     cleanupPollMs: 10,
   });
@@ -236,6 +238,26 @@ test('cleanup verification is a hard failure when a room remains', async (t) => 
 test('dry-run remains useful without a target, but execution does not', async () => {
   assert.deepEqual(await runSynthetic({ baseURL: '', dryRun: true }), { dryRun: true });
   assert.equal(await main([], { SYNTHETIC_BASE_URL: '' }), 1);
+});
+
+test('synthetic evidence is aggregate-only and records a failed execution', async () => {
+  const directory = mkdtempSync(`${tmpdir()}/pong-synthetic-`);
+  const evidencePath = `${directory}/evidence.json`;
+  try {
+    const status = await main([], {
+      SYNTHETIC_BASE_URL: '',
+      SYNTHETIC_EVIDENCE_FILE: evidencePath,
+    });
+    assert.equal(status, 1);
+    const evidence = JSON.parse(readFileSync(evidencePath, 'utf8'));
+    assert.equal(evidence.status, 'failed');
+    assert.match(evidence.started_at, /^20[0-9]{2}-/u);
+    assert.match(evidence.completed_at, /^20[0-9]{2}-/u);
+    assert.equal(typeof evidence.duration_ms, 'number');
+    assert.deepEqual(Object.keys(evidence).sort(), ['completed_at', 'duration_ms', 'started_at', 'status']);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test('the shell wrapper fails closed when no target is configured', () => {

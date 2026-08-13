@@ -1,0 +1,99 @@
+name: Disposable negative rollout
+
+on:
+  workflow_dispatch:
+
+# This is the intentionally failed canary path required by issue #19. It is
+# manual-only, loopback-only, and cannot select a production kube context.
+permissions:
+  contents: read
+
+concurrency:
+  group: disposable-negative-rollout
+  cancel-in-progress: false
+
+jobs:
+  negative-rollout:
+    name: Fail and recover one disposable rollout
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      CLUSTER_NAME: negative-rollout-${{ github.run_id }}
+      KUBE_CONTEXT: k3d-negative-rollout-${{ github.run_id }}
+      ARTIFACT_DIR: negative-rollout-artifacts
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install k3d
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
+          k3d version
+
+      - name: Create exact disposable cluster
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$ARTIFACT_DIR"
+          if k3d cluster list --no-headers 2>/dev/null | awk '{print $1}' | grep -Fxq "$CLUSTER_NAME"; then
+            echo 'refusing to attach to an existing cluster' >&2
+            exit 1
+          fi
+          k3d cluster create "$CLUSTER_NAME" --agents 1 --wait \
+            --port "127.0.0.1:18080:30080@agent:0"
+          : > "$ARTIFACT_DIR/cluster-created"
+
+      - name: Build and import disposable images
+        run: |
+          docker build -t cloudnativepong-api:latest -f Dockerfile.api .
+          docker build -t cloudnativepong-room:latest -f Dockerfile.room .
+          docker build --build-arg BUILD_SHA="$GITHUB_SHA" \
+            --build-arg BUILD_REPOSITORY="$GITHUB_REPOSITORY" \
+            -t cloudnativepong-static:latest -f Dockerfile.static .
+          docker build -t cloudnativepong-gateway:latest -f Dockerfile.gateway .
+          k3d image import cloudnativepong-api:latest cloudnativepong-room:latest \
+            cloudnativepong-static:latest cloudnativepong-gateway:latest \
+            --cluster "$CLUSTER_NAME"
+
+      - name: Deploy disposable baseline
+        run: |
+          kubectl --context "$KUBE_CONTEXT" apply -k k8s/overlays/test
+          for deployment in pong-api pong-static pong-gateway; do
+            kubectl --context "$KUBE_CONTEXT" -n pong rollout status \
+              "deployment/$deployment" --timeout=180s
+          done
+
+      - name: Assert failed rollout and timed recovery
+        run: |
+          DISPOSABLE_ROLLOUT_APPROVED=1 ./scripts/negative-rollout.sh \
+            --context "$KUBE_CONTEXT" \
+            --output "$ARTIFACT_DIR/negative-rollout.json"
+          python3 - "$ARTIFACT_DIR/negative-rollout.json" <<'PY'
+          import json, sys
+          record = json.load(open(sys.argv[1]))
+          assert record['status'] == 'passed'
+          assert record['fault'] == 'missing_image'
+          assert record['detection_time_seconds'] >= 0
+          assert record['recovery_time_seconds'] >= 0
+          assert record['contains_secrets'] is False
+          assert record['contains_user_data'] is False
+          PY
+
+      - name: Upload negative-path evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: negative-rollout-${{ github.run_id }}
+          path: negative-rollout-artifacts/
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Delete only the exact disposable cluster
+        if: always()
+        continue-on-error: true
+        run: |
+          if [[ -f "$ARTIFACT_DIR/cluster-created" ]]; then
+            k3d cluster delete "$CLUSTER_NAME"
+          else
+            echo 'no owned disposable cluster was created'
+          fi
