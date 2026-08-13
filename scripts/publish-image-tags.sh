@@ -92,7 +92,9 @@ is_generated_publication_commit() {
 
   # Do not trust the subject alone: a source commit could imitate the
   # publisher's conventional message and otherwise hide a publishable change.
-  # Every expected file must contain the exact tag recorded by the subject.
+  # Every expected file must contain the exact generated tag or an immutable
+  # digest from the same publication.
+  local has_tag=0 has_digest=0
   for changed_path in \
     k8s/overlays/server/kustomization.yaml \
     k8s/overlays/server/api-production.yaml \
@@ -101,8 +103,10 @@ is_generated_publication_commit() {
     k8s/overlays/native-staging/api-native-staging.yaml \
     k8s/overlays/native-staging/room-template.yaml; do
     content=$(git show "$commit:$changed_path") || return 1
-    [[ "$content" == *"$generated_tag"* ]] || return 1
+    [[ "$content" == *"$generated_tag"* ]] && has_tag=1
+    [[ "$content" =~ @sha256:[0-9a-f]{64} || "$content" =~ digest:[[:space:]]sha256:[0-9a-f]{64} ]] && has_digest=1
   done
+  (( has_tag == 1 || has_digest == 1 )) || return 1
   return 0
 }
 
@@ -153,6 +157,14 @@ for ((attempt = 1; attempt <= max_attempts; attempt++)); do
   fi
 
   ./scripts/update-image-tag.sh "$tag"
+  if [[ -n "${PUBLISH_IMAGE_DIGESTS:-}" ]]; then
+    read -r -a digest_values <<< "$PUBLISH_IMAGE_DIGESTS"
+    if (( ${#digest_values[@]} != 4 )); then
+      echo 'PUBLISH_IMAGE_DIGESTS must contain four space-separated sha256 digests' >&2
+      exit 2
+    fi
+    ./scripts/update-image-digests.sh "${digest_values[@]}"
+  fi
   # Verify the exact tree that will be committed. Generated deployment commits
   # are always strict even when source-push CI is in pending-publication mode.
   python3 scripts/validate-release.py

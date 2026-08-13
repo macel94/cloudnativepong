@@ -186,7 +186,6 @@ jobs:
           IMAGE_TAG: sha-${{ github.sha }}
         run: |
           set -euo pipefail
-          ./scripts/publish-image-tags.sh
           digests=()
           for component in api room static gateway; do
             image="macel94/cloudnativepong-${component}"
@@ -200,14 +199,11 @@ jobs:
               -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json' \
               "https://ghcr.io/v2/${image}/manifests/${IMAGE_TAG}" \
               | awk 'BEGIN { IGNORECASE=1 } /^docker-content-digest:/ { print $2; exit }' \
-              | tr -d '\\r')
+              | tr -d '\r')
             if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
               echo "could not resolve immutable digest for ${image}:${IMAGE_TAG}" >&2
               exit 1
             fi
             digests+=("$digest")
           done
-          ./scripts/update-image-digests.sh "${digests[@]}"
-          git add k8s/overlays/server k8s/overlays/native-staging
-          git commit --amend --no-edit
-          git push --force-with-lease
+          PUBLISH_IMAGE_DIGESTS="${digests[*]}" ./scripts/publish-image-tags.sh
