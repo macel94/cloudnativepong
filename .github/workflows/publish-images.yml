@@ -171,6 +171,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      packages: read
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -181,4 +182,32 @@ jobs:
         shell: bash
         env:
           GIT_TERMINAL_PROMPT: '0'
-        run: ./scripts/publish-image-tags.sh
+          GH_TOKEN: ${{ github.token }}
+          IMAGE_TAG: sha-${{ github.sha }}
+        run: |
+          set -euo pipefail
+          ./scripts/publish-image-tags.sh
+          digests=()
+          for component in api room static gateway; do
+            image="macel94/cloudnativepong-${component}"
+            token=$(curl --fail --silent --show-error --location \
+              --user "${GITHUB_ACTOR}:${GH_TOKEN}" \
+              "https://ghcr.io/token?service=ghcr.io&scope=repository:${image}:pull" \
+              | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])')
+            digest=$(curl --fail --silent --show-error --location \
+              --dump-header - --output /dev/null \
+              -H "Authorization: Bearer ${token}" \
+              -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json' \
+              "https://ghcr.io/v2/${image}/manifests/${IMAGE_TAG}" \
+              | awk 'BEGIN { IGNORECASE=1 } /^docker-content-digest:/ { print $2; exit }' \
+              | tr -d '\\r')
+            if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "could not resolve immutable digest for ${image}:${IMAGE_TAG}" >&2
+              exit 1
+            fi
+            digests+=("$digest")
+          done
+          ./scripts/update-image-digests.sh "${digests[@]}"
+          git add k8s/overlays/server k8s/overlays/native-staging
+          git commit --amend --no-edit
+          git push --force-with-lease
