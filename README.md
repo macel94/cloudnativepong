@@ -123,8 +123,7 @@ listener is advertised; otherwise WebSockets remain the default.
 Native `belacca-production` is the public production cluster. Native Traefik
 serves `pong.belacca.com` on `.73`, `.41`, and `.42`; Cloudflare DNS-only records use
 direct round-robin rather than health-aware failover. Native cert-manager uses
-Cloudflare DNS-01 and namespace-local TLS Secrets. The retired old `k3d-pong`
-ACME/PVC state was not mounted into native Traefik.
+Cloudflare DNS-01 and namespace-local TLS Secrets. Native Traefik uses namespace-local ACME/PVC state managed by the native TLS contract.
 
 Host-based routing is owned by the public
 [`macel94/belacca-gitops`](https://github.com/macel94/belacca-gitops) repository;
@@ -172,7 +171,6 @@ flowchart TB
 | Role | kubeconfig context | Target | Access | Status |
 |------|--------------------|--------|--------|--------|
 | Native production | `belacca-production` | Native k3s; Traefik on `.73`, `.41`, and `.42` | Public Pong URL and Flux-managed workloads | Running; public traffic is native |
-| Retired old production | historical `k3d-pong` | Former k3d cluster on `.73` | Audit/reference only | Retired after state handoff |
 | CI integration test | generated/ephemeral | Disposable k3d cluster | Job-local gateway on `localhost:8080` | Created, tested, and deleted by CI |
 
 The native `pong` namespace is reconciled by the platform
@@ -210,7 +208,7 @@ Native production is live. The following ongoing controls remain important:
   checks, restore only to an approved isolated/native target, and verify the
   application after restart.
 - **Reconciliation:** change routing, images, and workload configuration only
-  through reviewed platform GitOps; do not recreate the retired `.73` runtime.
+  through reviewed platform GitOps; do not recreate non-native runtime.
 
 ### GitOps workflow
 
@@ -243,7 +241,7 @@ repository is one independently reconciled application source.
 
 The Flux source and kustomization should both report `Ready=True` after a
 successful deployment. The platform repository owns the generated Flux
-bootstrap manifests and old-production root; application manifests and
+bootstrap manifests and native-production root; application manifests and
 environment patches for Pong are under `k8s/overlays/server/`.
 
 ### Kubernetes dashboards and administrative access
@@ -393,7 +391,7 @@ creates a local operator artifact and verifies it in a temporary directory;
 it does not upload data or modify the live PVC. The opt-in
 `scripts/restore-rehearsal.sh` can seed a copied, verified artifact into a newly
 created `pong-restore-*` k3d cluster and check the restored API through its
-isolated gateway. It refuses `k3d-pong`/`pong` and requires an explicit
+isolated gateway. It refuses `belacca-native`/`pong` and requires an explicit
 acknowledgement before creating anything.
 
 ```bash
@@ -423,7 +421,7 @@ PVC requires an operator-controlled maintenance window (see `DEPLOYMENT.md`).
 Do not delete/recreate the cluster or PVC, and do not run restore against
 `/data/pong.db` in place. A stronger rehearsal uses a separate disposable k3d
 cluster and only a copied database/PVC; these helpers never destroy the existing
-`k3d-pong` cluster.
+`belacca-native` cluster.
 
 ## 🧪 Testing
 

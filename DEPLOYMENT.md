@@ -9,7 +9,7 @@ root. The current operational state is:
   Traefik on `.73`, `.41`, and `.42`, with Flux-managed Pong and a Longhorn-backed
   single-writer SQLite PVC. Cloudflare DNS is direct round-robin, not
   health-aware failover.
-- **Retired old production:** the former `k3d-pong` runtime on `.73` was
+- **Native production:** the former `belacca-native` runtime on `.73` was
   stopped and removed after Pong, GoatCounter, and Dex state handoff. Its
   manifests remain historical reference only.
 - **CI and restore:** GitHub Actions and the guarded restore rehearsal use
@@ -60,13 +60,13 @@ repository as an independent child source:
 - Application repository: `https://github.com/macel94/cloudnativepong.git`
 - Branch: `main`
 - Flux application path: `./k8s/overlays/native-staging` (native production;
-  the historical `./k8s/overlays/server` path is retained for compatibility/audit)
+  the native `./k8s/overlays/server` path remains available for disposable validation)
 - Source refresh interval: 1 minute
 - Application reconciliation interval: 10 minutes (force it for immediate validation with `flux reconcile kustomization pong -n flux-system --with-source`)
 
 The Flux controllers are `source-controller`, `kustomize-controller`,
 `helm-controller`, and `notification-controller`. The platform repository owns
-the generated Flux bootstrap manifests and old-production root; change them
+the generated Flux bootstrap manifests and native-production root; change them
 only through the documented Flux upgrade/bootstrap process.
 
 Native Traefik is the current public ingress on `.73`, `.41`, and `.42`. The
@@ -100,14 +100,13 @@ redirect to that personal site.
 Cloudflare DNS-only records for supported application hosts and
 `k3s-api.belacca.com` contain `.41` and `.42`. Native cert-manager uses the
 out-of-band Cloudflare credential for DNS-01 and stores issued certificates in
-namespace-local Kubernetes Secrets. The retired old ACME PVC was not copied or
-mounted into native Traefik. Native
+namespace-local Kubernetes Secrets. Native
 WebTransport requires a separate UDP-capable public service, matching TLS
 certificate, and `PONG_WEBTRANSPORT_PUBLIC_URL`; it remains disabled until
 those platform prerequisites are reviewed.
 
 The image-publish workflow updates both `k8s/overlays/native-staging/` (the
-live native Flux target) and the retained server overlay. A source push may
+live native Flux target) and the native server validation overlay. A source push may
 briefly leave those two overlays on different immutable releases until the
 publisher's generated `deploy: publish images ...` commit lands; CI validates
 each overlay strictly during that short publication window, but generated
@@ -123,15 +122,14 @@ does not prove that production has rolled out.
 | Context | Cluster/target | Topology or access | Purpose | Status |
 |---|---|---|---|---|
 | `belacca-production` | Native k3s cluster | Traefik on `.73`, `.41`, and `.42` | Public production and Flux target | Running; serves players |
-| retired `k3d-pong` | historical k3d `pong` on `.73` | Removed containers | Audit/reference only | Retired after state handoff |
+| retired `belacca-native` | historical k3d `pong` on `.73` | Removed containers | Audit/reference only | Retired after state handoff |
 | generated CI context | disposable k3d | Job-local gateway | Kubernetes integration tests | Created and deleted per workflow run |
 | capacity experiment context | `cnp-capacity-*` k3d | Loopback-only gateway | Bounded capacity baseline | Manual, serialized, redacted evidence, disposable |
 | generated restore context | `pong-restore-*` k3d | Explicit isolated context | Restore rehearsal only | Opt-in and disposable |
 
-The retired `k3d-pong` cluster no longer owns public traffic. Native
-`belacca-production` is the live Flux target; the platform repository consumes
-this repository through its native application Kustomization. The historical
-`./k8s/overlays/server` path remains retained for audit/compatibility, while
+Native `belacca-production` is the live Flux target; the platform repository
+consumes this repository through its native application Kustomization. The
+`./k8s/overlays/server` path remains available for validation, while
 `k8s/overlays/test` and the `cnp-capacity-*` workflow are disposable-only. Do
 not create or delete clusters during routine debugging, and do not
 delete/recreate native production or its SQLite PVC.
@@ -146,8 +144,8 @@ following controls are required for state operations:
 2. Create and test a native Longhorn-backed claim with the same single-writer
    expectation as `pong-api-data`. The API must remain one replica; never mount
    the live SQLite database read/write from both clusters.
-3. Take and verify an offline/online SQLite backup from the legacy PVC during a
-   maintenance window. Stop the legacy API before any file-level copy so the
+3. Take and verify an offline/online SQLite backup from the native production PVC during a
+   maintenance window. Stop the native API before any file-level copy so the
    `local-path` RWO claim has one writer and no concurrent mount.
 4. Restore the verified copy into an isolated target or approved native
    maintenance window, run integrity and application checks, and preserve the
@@ -162,7 +160,7 @@ The default inner loop is local process mode. See the workspace [fast
 development-loop guide](https://github.com/macel94/belacca-platform/blob/main/docs/development-loop.md)
 for the separation between local development, an isolated Kubernetes
 development plane, and reviewed production GitOps promotion. Do not use the
-public `k3d-pong` cluster as a repeated experiment sandbox.
+native production as a repeated experiment sandbox.
 
 1. **Inventory and baseline without changing anything.**
    ```bash
@@ -188,7 +186,7 @@ public `k3d-pong` cluster as a repeated experiment sandbox.
    the separate `pong-dev` interception/container workflow is provisioned, use
    an explicitly disposable development cluster or another operator-approved
    isolated environment. Build only the changed images, export/import them,
-   and patch only that environment. Never patch the public `k3d-pong` cluster
+   and patch only that environment. Never patch native production
    for routine experiments. Wait for the affected rollout, run the focused
    Kubernetes Playwright test, and capture logs, events, resource usage,
    real-time frame cadence, and room cleanup.
@@ -226,7 +224,7 @@ velocity and the opponent from recent velocity on `requestAnimationFrame`, and
 smoothly decays bounded corrections when snapshots arrive. The server remains
 authoritative; presentation extrapolation does not alter gameplay decisions.
 
-Validation on the local `k3d-pong` cluster passed all 12 Kubernetes Playwright
+Validation on the disposable validation cluster passed all 12 Kubernetes Playwright
 checks after the change. Frame-cadence measurements remain intentionally
 network-dependent, so visual smoothness and gameplay correctness are validated
 in a real browser rather than by requiring exactly 60 packets per second.
@@ -366,8 +364,8 @@ The runner requires a new `pong-restore-*` cluster name, verifies the source
 before creating it, compares the copied PVC file hash, and checks the restored
 API through a localhost-only gateway. It never uses a current kubeconfig
 context for Kubernetes operations, never uploads data, and refuses
-`k3d-pong`/`pong`. `--keep-cluster` is available for inspection; otherwise it
-cleans only the exact disposable cluster it created. The existing `k3d-pong`
+`belacca-native`/`pong`. `--keep-cluster` is available for inspection; otherwise it
+cleans only the exact disposable cluster it created. The existing `belacca-native`
 cluster, `pong-api-data` PVC, and production `/data/pong.db` must not be
 destroyed or overwritten for this rehearsal.
 
