@@ -12,16 +12,16 @@ resources:
 images:
   - name: cloudnativepong-api
     newName: ghcr.io/macel94/cloudnativepong-api
-    newTag: sha-d0896f74cba4c81297b12e60cb933e820766b5f0
+    newTag: sha-1d0b8069f3fc4da73a5143a6718d47d67e5af789
   - name: cloudnativepong-room
     newName: ghcr.io/macel94/cloudnativepong-room
-    newTag: sha-d0896f74cba4c81297b12e60cb933e820766b5f0
+    newTag: sha-1d0b8069f3fc4da73a5143a6718d47d67e5af789
   - name: cloudnativepong-static
     newName: ghcr.io/macel94/cloudnativepong-static
-    newTag: sha-d0896f74cba4c81297b12e60cb933e820766b5f0
+    newTag: sha-1d0b8069f3fc4da73a5143a6718d47d67e5af789
   - name: cloudnativepong-gateway
     newName: ghcr.io/macel94/cloudnativepong-gateway
-    newTag: sha-d0896f74cba4c81297b12e60cb933e820766b5f0
+    newTag: sha-1d0b8069f3fc4da73a5143a6718d47d67e5af789
 
 patches:
   - path: api-native-staging.yaml
