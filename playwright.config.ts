@@ -27,10 +27,15 @@ export default defineConfig({
   // opt into the isolated target guard above, but remain one worker/no retry.
   retries: 0,
   workers: 1,
-  reporter: isCI ? 'list' : 'html',
+  reporter: isCI ? [
+    ['list'],
+    ['html', { outputFolder: 'playwright-report', open: 'never' }],
+  ] : 'html',
   use: {
     baseURL,
-    trace: 'on-first-retry',
+    screenshot: 'only-on-failure',
+    video: 'retain-on-failure',
+    trace: 'retain-on-failure',
   },
   projects: [
     {
