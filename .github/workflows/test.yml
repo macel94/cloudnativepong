@@ -39,6 +39,7 @@ jobs:
             python3 scripts/validate-release.py
           fi
           bash -n scripts/update-image-tag.sh scripts/update-image-tag.test.sh scripts/validate-release.test.sh scripts/promote-digests.sh scripts/release-record.test.sh scripts/negative-rollout.sh scripts/negative-rollout.test.sh
+          node --test scripts/vulnerability-decision.test.mjs
           scripts/update-image-tag.test.sh
           scripts/validate-release.test.sh
           scripts/release-record.test.sh

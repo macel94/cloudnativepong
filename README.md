@@ -318,9 +318,12 @@ The repository provides reusable helpers under `scripts/` and GitHub workflows:
   `strict=true` input for a reviewed security run that fails on those findings.
 - `.github/workflows/publish-images.yml` pushes the four immutable
   `sha-<commit>` tags with a registry SBOM and GitHub Artifact Attestations.
-  `actions/attest@v4` creates signed SLSA provenance and pushes it to GHCR;
-  `scripts/verify-attestation.sh` verifies the repository and publish workflow
-  identity with `gh attestation verify`.
+  It scans every pushed digest, creates and signs the
+  `native-production-v1` vulnerability decision, and signs the CycloneDX SBOM
+  before the deployment tag is recorded. `actions/attest@v4` creates signed
+  SLSA provenance and pushes all three attestations to GHCR;
+  `scripts/verify-attestation.sh` verifies the provenance identity with
+  `gh attestation verify`.
 - `scripts/promote-digests.sh` accepts only exact GHCR digest references. Use
   `--verify-attestations` to verify all four GitHub provenance attestations
   before the release metadata becomes `verified`; without it the metadata is

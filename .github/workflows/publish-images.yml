@@ -82,11 +82,85 @@ jobs:
           provenance: false
           sbom: true
 
+      - name: Set immutable image identity
+        id: image
+        env:
+          IMAGE_NAME: ${{ env.IMAGE_PREFIX }}-${{ matrix.component }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          echo "reference=${IMAGE_NAME}@${IMAGE_DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "digest=${IMAGE_DIGEST}" >> "$GITHUB_OUTPUT"
+
+      - name: Scan pushed image
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ steps.image.outputs.reference }}
+          format: json
+          output: cloudnativepong-${{ matrix.component }}.trivy.json
+          severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+          ignore-unfixed: false
+          scanners: vuln
+          exit-code: '0'
+
+      - name: Create native production vulnerability decision
+        env:
+          IMAGE_NAME: ${{ env.IMAGE_PREFIX }}-${{ matrix.component }}
+          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+        run: |
+          node scripts/create-vulnerability-decision.mjs \
+            --input "cloudnativepong-${{ matrix.component }}.trivy.json" \
+            --output "cloudnativepong-${{ matrix.component }}.vulnerability-decision.json" \
+            --image "$IMAGE_NAME" \
+            --digest "$IMAGE_DIGEST"
+          node --input-type=module -e '
+            import { readFile } from "node:fs/promises";
+            const decision = JSON.parse(await readFile(process.argv[1], "utf8"));
+            if (["HIGH", "CRITICAL"].includes(decision.maxSeverity) || decision.knownUnfixed) {
+              throw new Error(`native-production-v1 promotion blocked: maxUnfixedSeverity=${decision.maxSeverity}, maxObservedSeverity=${decision.maxObservedSeverity}, knownUnfixed=${decision.knownUnfixed}`);
+            }
+          ' "cloudnativepong-${{ matrix.component }}.vulnerability-decision.json"
+
+      - name: Generate registry SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          image: ${{ steps.image.outputs.reference }}
+          format: cyclonedx-json
+          output-file: cloudnativepong-${{ matrix.component }}.sbom.cdx.json
+          upload-artifact: false
+
+      - name: Upload security evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: cloudnativepong-${{ matrix.component }}-security-${{ github.sha }}
+          path: |
+            cloudnativepong-${{ matrix.component }}.trivy.json
+            cloudnativepong-${{ matrix.component }}.vulnerability-decision.json
+          if-no-files-found: warn
+
       - name: Attest image provenance with GitHub
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-name: ${{ env.IMAGE_PREFIX }}-${{ matrix.component }}
           subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      - name: Attest image SBOM with GitHub
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE_PREFIX }}-${{ matrix.component }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          sbom-path: cloudnativepong-${{ matrix.component }}.sbom.cdx.json
+          push-to-registry: true
+
+      - name: Attest native production vulnerability decision
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE_PREFIX }}-${{ matrix.component }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          predicate-type: https://belacca.com/attestations/vulnerability/v1
+          predicate-path: cloudnativepong-${{ matrix.component }}.vulnerability-decision.json
           push-to-registry: true
 
   record-deployment:

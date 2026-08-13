@@ -252,9 +252,13 @@ workflow after the production branch policy is chosen.
 
 The published `sha-<40-hex-commit>` image tags are immutable references to a
 commit build, but operators should record the registry `sha256` digest for the
-exact deployment. `.github/workflows/publish-images.yml` adds a registry SBOM
-and GitHub Artifact Attestation SLSA provenance while pushing to GHCR. Local
-`docker build` or `--load` cannot retain registry attestations.
+exact deployment. `.github/workflows/publish-images.yml` adds a registry SBOM and GitHub Artifact
+Attestation SLSA provenance while pushing to GHCR. It also scans each pushed
+image, creates a signed `native-production-v1` vulnerability decision, and
+signs the CycloneDX SBOM and vulnerability decision for the exact digest. A
+native production deployment is not promotable until all three attestations
+(provenance, SBOM, vulnerability decision) exist. Local `docker build` or
+`--load` cannot retain registry attestations.
 
 `.github/workflows/supply-chain.yml` creates local images, uploads CycloneDX
 SBOMs, stores Trivy HIGH/CRITICAL reports, and validates the immutable
