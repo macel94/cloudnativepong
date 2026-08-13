@@ -64,13 +64,17 @@ for overlay, api_file in [
 ]:
     room_template = root / f"k8s/overlays/{overlay}/room-template.yaml"
     text = room_template.read_text()
-    text = re.sub(r'ghcr\.io/macel94/cloudnativepong-room:[^"\s]+', refs["room"], text)
+    text = re.sub(
+        r'ghcr\.io/macel94/cloudnativepong-room(?:@sha256:[0-9a-f]{64}|:sha-[0-9a-f]{40})',
+        refs["room"],
+        text,
+    )
     room_template.write_text(text)
 
     api = root / f"k8s/overlays/{overlay}/{api_file}"
     text = api.read_text()
     text = re.sub(
-        r'--room-image=ghcr\.io/macel94/cloudnativepong-room:[^\s]+',
+        r'--room-image=ghcr\.io/macel94/cloudnativepong-room(?:@sha256:[0-9a-f]{64}|:sha-[0-9a-f]{40})',
         '--room-image=' + refs["room"],
         text,
     )

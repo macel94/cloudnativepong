@@ -14,5 +14,9 @@ for file in \
   k8s/overlays/native-staging/kustomization.yaml \
   k8s/overlays/native-staging/api-native-staging.yaml \
   k8s/overlays/native-staging/room-template.yaml; do
-  sed -i -E "s/(sha-)?REPLACE_ME|sha-[0-9a-f]{40}/$tag/g" "$file"
+  sed -i -E \
+    -e "s/digest: sha256:[0-9a-f]{64}/newTag: $tag/g" \
+    -e "s/@sha256:[0-9a-f]{64}/:$tag/g" \
+    -e "s/(sha-)?REPLACE_ME|sha-[0-9a-f]{40}/$tag/g" \
+    "$file"
 done

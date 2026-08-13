@@ -21,39 +21,99 @@ expect_failure() {
   fi
 }
 
-# The checked-in release is a synchronized, tag-based release.
+# The checked-in release is a synchronized immutable release. Support both
+# the historical SHA-tag form and the current digest-pinned form so this test
+# remains valid across the publication transition.
 run_validator
 
 # Pending publication allows two complete immutable overlays to differ, but it
 # does not allow one overlay to be internally split or malformed.
-old_tag=$(sed -n 's/.*newTag: //p' "$tmp/k8s/overlays/server/kustomization.yaml" | head -n 1)
-[[ "$old_tag" =~ ^sha-[0-9a-f]{40}$ ]] || {
-  echo "could not find checked-in immutable tag: $old_tag" >&2
-  exit 1
-}
-new_tag='sha-1111111111111111111111111111111111111111'
-(cd "$tmp" && sed -i "s/$old_tag/$new_tag/g" \
-  k8s/overlays/native-staging/kustomization.yaml \
-  k8s/overlays/native-staging/api-native-staging.yaml \
-  k8s/overlays/native-staging/room-template.yaml)
+reference_kind=$(sed -n -E 's/.*(newTag|digest): .*/\1/p' "$tmp/k8s/overlays/server/kustomization.yaml" | head -n 1)
+case "$reference_kind" in
+  newTag)
+    old_reference=$(sed -n 's/.*newTag: //p' "$tmp/k8s/overlays/server/kustomization.yaml" | head -n 1)
+    [[ "$old_reference" =~ ^sha-[0-9a-f]{40}$ ]] || {
+      echo "could not find checked-in immutable tag: $old_reference" >&2
+      exit 1
+    }
+    new_reference='sha-1111111111111111111111111111111111111111'
+    ;;
+  digest)
+    old_api=$(sed -n 's/.*newName: ghcr.io\/macel94\/cloudnativepong-api$/x/p; s/.*digest: //p' "$tmp/k8s/overlays/server/kustomization.yaml" | tail -n 4 | head -n 1)
+    old_room=$(sed -n 's/.*digest: //p' "$tmp/k8s/overlays/server/kustomization.yaml" | tail -n 3 | head -n 1)
+    old_static=$(sed -n 's/.*digest: //p' "$tmp/k8s/overlays/server/kustomization.yaml" | tail -n 2 | head -n 1)
+    old_gateway=$(sed -n 's/.*digest: //p' "$tmp/k8s/overlays/server/kustomization.yaml" | tail -n 1)
+    for old_digest in "$old_api" "$old_room" "$old_static" "$old_gateway"; do
+      [[ "$old_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+        echo "could not find checked-in immutable digest: $old_digest" >&2
+        exit 1
+      }
+    done
+    new_api='sha256:1111111111111111111111111111111111111111111111111111111111111111'
+    new_room='sha256:2222222222222222222222222222222222222222222222222222222222222222'
+    new_static='sha256:3333333333333333333333333333333333333333333333333333333333333333'
+    new_gateway='sha256:4444444444444444444444444444444444444444444444444444444444444444'
+    old_reference="$old_api"
+    new_reference="$new_api"
+    ;;
+  *)
+    echo "unknown checked-in reference kind: $reference_kind" >&2
+    exit 1
+    ;;
+esac
+if [[ "$reference_kind" == newTag ]]; then
+  (cd "$tmp" && OLD="$old_reference" NEW="$new_reference" perl -0pi -e 's/\Q$ENV{OLD}\E/$ENV{NEW}/g' \
+    k8s/overlays/native-staging/kustomization.yaml \
+    k8s/overlays/native-staging/api-native-staging.yaml \
+    k8s/overlays/native-staging/room-template.yaml)
+else
+  (cd "$tmp" && sed -i \
+    -e "s/$old_api/$new_api/g" \
+    -e "s/$old_room/$new_room/g" \
+    -e "s/$old_static/$new_static/g" \
+    -e "s/$old_gateway/$new_gateway/g" \
+    k8s/overlays/native-staging/kustomization.yaml && \
+    sed -i "s/$old_room/$new_room/g" \
+    k8s/overlays/native-staging/api-native-staging.yaml \
+    k8s/overlays/native-staging/room-template.yaml)
+fi
 expect_failure run_validator
 run_validator --allow-pending-publication
 
-# A tag mismatch inside one overlay is never a valid pending state.
-(cd "$tmp" && OLD="$old_tag" NEW="$new_tag" perl -0pi -e 's/\Q$ENV{NEW}\E/$ENV{OLD}/' \
+# A mismatch inside one overlay is never a valid pending state. For digest
+# references, alter the room entry because the validator cross-checks it
+# against the embedded room template and API argument.
+if [[ "$reference_kind" == newTag ]]; then
+  mismatch_old="$old_reference"
+  mismatch_new="$new_reference"
+else
+  mismatch_old="$old_room"
+  mismatch_new="$new_room"
+fi
+(cd "$tmp" && OLD="$mismatch_old" NEW="$mismatch_new" perl -0pi -e 's/\Q$ENV{NEW}\E/$ENV{OLD}/' \
   k8s/overlays/native-staging/kustomization.yaml)
 expect_failure run_validator --allow-pending-publication
-(cd "$tmp" && sed -i "s/$old_tag/$new_tag/" \
+(cd "$tmp" && sed -i "s/$mismatch_old/$mismatch_new/" \
   k8s/overlays/native-staging/kustomization.yaml)
 
 # Mutable references are rejected even with the narrow pending exception.
-(cd "$tmp" && OLD="$old_tag" NEW="$new_tag" perl -0pi -e 's/\Q$ENV{NEW}\E/$ENV{OLD}/' \
-  k8s/overlays/native-staging/kustomization.yaml && \
-  sed -i "s/newTag: ${old_tag}/newTag: latest/" \
+(cd "$tmp" && OLD="$old_reference" NEW="$new_reference" perl -0pi -e 's/\Q$ENV{NEW}\E/$ENV{OLD}/' \
   k8s/overlays/native-staging/kustomization.yaml)
+if [[ "$reference_kind" == newTag ]]; then
+  (cd "$tmp" && sed -i "s/newTag: ${old_reference}/newTag: latest/" \
+    k8s/overlays/native-staging/kustomization.yaml)
+else
+  (cd "$tmp" && sed -i "s/digest: ${old_reference}/newTag: latest/" \
+    k8s/overlays/native-staging/kustomization.yaml)
+fi
 expect_failure run_validator --allow-pending-publication
-(cd "$tmp" && sed -i 's/newTag: latest/newTag: sha-1111111111111111111111111111111111111111/' \
-  k8s/overlays/native-staging/kustomization.yaml)
+if [[ "$reference_kind" == newTag ]]; then
+  (cd "$tmp" && sed -i "s/newTag: latest/newTag: $new_reference/" \
+    k8s/overlays/native-staging/kustomization.yaml)
+else
+  (cd "$tmp" && sed -i "s/newTag: latest/digest: $new_reference/" \
+    k8s/overlays/native-staging/kustomization.yaml)
+fi
 
 # Digest promotion updates both overlays, API room arguments, embedded JSON,
 # and release metadata as one consistent immutable state.
