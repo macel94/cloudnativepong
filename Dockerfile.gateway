@@ -13,6 +13,10 @@ LABEL org.opencontainers.image.title="Cloud Native Pong — Gateway" \
 
 COPY gateway/Caddyfile /etc/caddy/Caddyfile
 
+# Refresh Alpine packages at build time so fixed OS vulnerabilities in the
+# vendor layer cannot be carried into the published immutable image.
+RUN apk upgrade --no-cache
+
 # The upstream image grants cap_net_bind_service to Caddy. This workload
 # listens on 8080 and runs with allowPrivilegeEscalation=false, so retaining
 # that file capability makes hardened Kubernetes runtimes reject execve.

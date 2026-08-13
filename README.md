@@ -320,8 +320,10 @@ The repository provides reusable helpers under `scripts/` and GitHub workflows:
   `sha-<commit>` tags with a registry SBOM and GitHub Artifact Attestations.
   It scans every pushed digest, creates and signs the
   `native-production-v1` vulnerability decision, and signs the CycloneDX SBOM
-  before the deployment tag is recorded. `actions/attest@v4` creates signed
-  SLSA provenance and pushes all three attestations to GHCR;
+  before the deployment tag is recorded. The Caddy-derived images refresh
+  Alpine packages during the build, and `security/pong.openvex.json` records
+  only the exact reviewed non-affected OpenPGP package scopes. `actions/attest@v4`
+  creates signed SLSA provenance and pushes all three attestations to GHCR;
   `scripts/verify-attestation.sh` verifies the provenance identity with
   `gh attestation verify`.
 - `scripts/promote-digests.sh` accepts only exact GHCR digest references. Use

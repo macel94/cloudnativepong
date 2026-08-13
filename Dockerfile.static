@@ -15,6 +15,10 @@ LABEL org.opencontainers.image.title="Cloud Native Pong — Static Server" \
 COPY static/ /srv/
 COPY static/Caddyfile /etc/caddy/Caddyfile
 
+# Refresh Alpine packages at build time so fixed OS vulnerabilities in the
+# vendor layer cannot be carried into the published immutable image.
+RUN apk upgrade --no-cache
+
 # Replace the local development marker with the exact source commit used for
 # this image. A production image must carry a full Git SHA.
 RUN set -eux; \

@@ -257,8 +257,11 @@ Attestation SLSA provenance while pushing to GHCR. It also scans each pushed
 image, creates a signed `native-production-v1` vulnerability decision, and
 signs the CycloneDX SBOM and vulnerability decision for the exact digest. A
 native production deployment is not promotable until all three attestations
-(provenance, SBOM, vulnerability decision) exist. Local `docker build` or
-`--load` cannot retain registry attestations.
+(provenance, SBOM, vulnerability decision) exist. The publisher also refreshes
+Alpine packages in the Caddy-derived images and applies only the exact reviewed
+OpenVEX scopes in `security/pong.openvex.json`; all other fixed or unfixed
+findings block promotion. Local `docker build` or `--load` cannot retain
+registry attestations.
 
 `.github/workflows/supply-chain.yml` creates local images, uploads CycloneDX
 SBOMs, stores Trivy HIGH/CRITICAL reports, and validates the immutable

@@ -137,6 +137,7 @@ jobs:
           path: |
             cloudnativepong-${{ matrix.component }}.trivy.json
             cloudnativepong-${{ matrix.component }}.vulnerability-decision.json
+            security/pong.openvex.json
           if-no-files-found: warn
 
       - name: Attest image provenance with GitHub
