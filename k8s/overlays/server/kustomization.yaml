@@ -7,6 +7,7 @@ resources:
   - ../../base
   - resource-quota.yaml
   - hpa.yaml
+  - capacity-alerts.yaml
 
 images:
   - name: cloudnativepong-api

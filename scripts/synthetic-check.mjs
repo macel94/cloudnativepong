@@ -256,10 +256,13 @@ async function requestBody({ fetchImpl, url, init, label, deadline, requestTimeo
   }
 }
 
-function requireStatus(response, label, expected = 200) {
+export function requireStatus(response, label, expected = 200) {
   if (response.status !== expected) {
+    // 429 is an explicit overload decision. Retrying it from this layer would
+    // amplify load against the same single-writer API; callers must honor the
+    // server's Retry-After policy or surface the failure.
     const retryable = response.status === 408 || response.status === 425 ||
-      response.status === 429 || response.status >= 500;
+      response.status >= 500;
     throw new SyntheticError(`${label} returned HTTP ${response.status}; expected HTTP ${expected}`, {
       retryable,
       status: response.status,

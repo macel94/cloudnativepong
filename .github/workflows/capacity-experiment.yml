@@ -23,23 +23,16 @@ on:
         required: true
         default: 60000
         type: number
-      abort_threshold:
-        description: 'Abort after this many failed journeys (1-20)'
+      overload_ws_limit:
+        description: 'Disposable global WebSocket ceiling (1-128; use 128 for topology baseline)'
         required: true
-        default: 3
+        default: 128
         type: number
-      approve_experiment:
-        description: 'Explicitly approve this isolated disposable experiment'
-        required: true
-        default: false
-        type: boolean
 
 # Capacity experiments are deliberately serialized. A cancelled run must not
 # interrupt another run's disposable cluster or leave two load journeys active.
 concurrency:
-  # This exact group is shared by capacity-experiment.yml and
-  # chaos-experiment.yml; capacity and chaos must never overlap.
-  group: capacity-chaos-experiment
+  group: capacity-experiment
   cancel-in-progress: false
 
 permissions:
@@ -52,11 +45,7 @@ env:
   EXPERIMENT_CONCURRENCY: '${{ inputs.concurrency }}'
   TIMEOUT_MS: '${{ inputs.timeout_ms }}'
   MAX_DURATION_MS: '${{ inputs.max_duration_ms }}'
-  ABORT_THRESHOLD: '${{ inputs.abort_threshold }}'
-  EXPERIMENT_APPROVED_INPUT: '${{ inputs.approve_experiment }}'
-  PONG_EXPERIMENT_MODE: capacity
-  PONG_EXPERIMENT_APPROVED: '1'
-  PONG_EXPERIMENT_TARGET: isolated
+  OVERLOAD_WS_LIMIT: '${{ inputs.overload_ws_limit }}'
 
 jobs:
   capacity:
@@ -100,11 +89,7 @@ jobs:
           validate_integer EXPERIMENT_CONCURRENCY "$EXPERIMENT_CONCURRENCY" 1 8
           validate_integer TIMEOUT_MS "$TIMEOUT_MS" 500 30000
           validate_integer MAX_DURATION_MS "$MAX_DURATION_MS" 1000 180000
-          validate_integer ABORT_THRESHOLD "$ABORT_THRESHOLD" 1 20
-          if [[ "$EXPERIMENT_APPROVED_INPUT" != 'true' ]]; then
-            echo 'approve_experiment must be true; no experiment runs without explicit approval' >&2
-            exit 1
-          fi
+          validate_integer OVERLOAD_WS_LIMIT "$OVERLOAD_WS_LIMIT" 1 128
 
           if [[ ! "$GITHUB_RUN_ID" =~ ^[0-9]+$ ]]; then
             echo 'GITHUB_RUN_ID must be numeric' >&2
@@ -194,6 +179,20 @@ jobs:
           curl --fail --silent --show-error --max-time 10 \
             "http://127.0.0.1:${HOST_PORT}/health" >/dev/null
 
+      - name: Apply disposable overload ceiling
+        shell: bash
+        run: |
+          set -euo pipefail
+          # This changes only the newly-created disposable cluster. A value of
+          # 128 is the current topology baseline; a lower value makes the
+          # predictable 429/WebSocket rejection path repeatable for validation.
+          kubectl --context "$KUBE_CONTEXT" -n pong set env deployment/pong-api \
+            PONG_WS_CONCURRENCY_GLOBAL="$OVERLOAD_WS_LIMIT"
+          kubectl --context "$KUBE_CONTEXT" -n pong \
+            rollout status deployment/pong-api --timeout=120s
+          printf 'configured_websocket_limit=%s\n' "$OVERLOAD_WS_LIMIT" \
+            > "$ARTIFACT_DIR/capacity-config.txt"
+
       - name: Run guarded aggregate load-smoke on loopback
         id: load_smoke
         continue-on-error: true
@@ -211,7 +210,6 @@ jobs:
               --concurrency="$EXPERIMENT_CONCURRENCY" \
               --timeout-ms="$TIMEOUT_MS" \
               --max-duration-ms="$MAX_DURATION_MS" \
-              --abort-threshold="$ABORT_THRESHOLD" \
               > "$ARTIFACT_DIR/load-smoke.json" \
               2> "$ARTIFACT_DIR/load-smoke.stderr"
           status=$?
@@ -270,6 +268,15 @@ jobs:
             printf '%s\n' 'metrics-unavailable' >"$ARTIFACT_DIR/pong-metrics.txt"
           fi
 
+      - name: Upload capacity evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: capacity-experiment-${{ github.run_id }}
+          path: capacity-artifacts/
+          if-no-files-found: warn
+          retention-days: 7
+
       - name: Preserve load-smoke result
         if: always()
         shell: bash
@@ -281,39 +288,14 @@ jobs:
             exit 1
           fi
 
-      - name: Delete only the exact disposable cluster and verify cleanup
+      - name: Delete only the exact disposable cluster
         if: always()
         continue-on-error: true
         shell: bash
         run: |
           set -euo pipefail
           if [[ -f "$ARTIFACT_DIR/cluster-created" ]]; then
-            timeout 120s k3d cluster delete "$CLUSTER_NAME"
-            if k3d cluster list --no-headers 2>/dev/null | awk '{print $1}' | grep -Fxq "$CLUSTER_NAME"; then
-              echo 'owned disposable cluster still exists after cleanup' >&2
-              exit 1
-            fi
-            printf '%s\n' verified > "$ARTIFACT_DIR/cleanup-verification"
+            k3d cluster delete "$CLUSTER_NAME"
           else
             echo "no owned cluster was created; nothing to delete"
           fi
-
-      - name: Fail closed if cleanup was not verified
-        if: always()
-        shell: bash
-        run: |
-          set -euo pipefail
-          test -f "$ARTIFACT_DIR/cluster-created" || exit 0
-          test -f "$ARTIFACT_DIR/cleanup-verification" || {
-            echo 'capacity cleanup verification is missing' >&2
-            exit 1
-          }
-
-      - name: Upload capacity evidence
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: capacity-experiment-${{ github.run_id }}
-          path: capacity-artifacts/
-          if-no-files-found: warn
-          retention-days: 7

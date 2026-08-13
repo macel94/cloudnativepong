@@ -128,6 +128,57 @@ func (f *fakeOrchestrator) DeleteService(string) error {
 func (f *fakeOrchestrator) ListPods() ([]RoomResource, error)     { return f.pods, nil }
 func (f *fakeOrchestrator) ListServices() ([]RoomResource, error) { return f.services, nil }
 
+func TestRoomEndpointSliceHasReadyAddress(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want bool
+	}{
+		{
+			name: "ready address",
+			body: `{"items":[{"endpoints":[{"addresses":["10.0.0.4"],"conditions":{"ready":true}}]}]}`,
+			want: true,
+		},
+		{
+			name: "not ready",
+			body: `{"items":[{"endpoints":[{"addresses":["10.0.0.4"],"conditions":{"ready":false}}]}]}`,
+			want: false,
+		},
+		{
+			name: "missing ready condition",
+			body: `{"items":[{"endpoints":[{"addresses":["10.0.0.4"]}]}]}`,
+			want: true,
+		},
+		{
+			name: "ready address in a later slice",
+			body: `{"items":[{"endpoints":[{"addresses":["10.0.0.4"],"conditions":{"ready":false}}]},{"endpoints":[{"addresses":["10.0.0.5"],"conditions":{"ready":true}}]}]}`,
+			want: true,
+		},
+		{
+			name: "empty address",
+			body: `{"items":[{"endpoints":[{"addresses":[],"conditions":{"ready":true}}]}]}`,
+			want: false,
+		},
+		{
+			name: "empty",
+			body: `{"items":[]}`,
+			want: false,
+		},
+		{
+			name: "malformed",
+			body: `{`,
+			want: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := roomEndpointSliceHasReadyAddress([]byte(tt.body)); got != tt.want {
+				t.Fatalf("roomEndpointSliceHasReadyAddress() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestK8sClientReusesTransport(t *testing.T) {
 	first := k8sClient()
 	second := k8sClient()

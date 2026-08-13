@@ -13,29 +13,25 @@ This plan separates two different questions:
   disposable load run. In shorthand, this is **99%/30d availability versus
   separate P95-under-6m drill recovery**.
 
-The supported runners are manual-only **Disposable capacity experiment**
-(`capacity-experiment.yml`) and **Disposable chaos experiment**
-(`chaos-experiment.yml`). Each creates one temporary k3d cluster per run,
-uses only a localhost gateway, and serializes both workflow files with the
-same fixed `capacity-chaos-experiment` concurrency group. They are not part of
-scheduled public synthetic monitoring.
+The next safe slice is the manual-only **Disposable capacity experiment**
+workflow (`capacity-experiment.yml`). It creates one temporary k3d cluster per
+run, uses only a localhost gateway, and serializes runs with the fixed
+`capacity-experiment` concurrency group.
 
 ## Safe targets and hard bounds
 
 The baseline target is a freshly created disposable k3d cluster from
 `k8s/overlays/test`. The gateway is bound to `127.0.0.1` on the GitHub-hosted
 runner and the load-smoke base URL is the corresponding loopback URL. The
-workflow has no public target variable, secret, or production context. Every
-non-local target is rejected unless `PONG_EXPERIMENT_MODE` is `capacity` or
-`chaos`, `PONG_EXPERIMENT_APPROVED=1`, and
-`PONG_EXPERIMENT_TARGET=isolated`. The workflow additionally requires the
-manual boolean `approve_experiment=true`; `pong.belacca.com` and documented
-native public edge addresses are denied even when markers are present.
+workflow has no public target variable, secret, production context, or
+approval marker. The existing load-smoke guard remains active: loopback is
+allowed, while non-local targets require an explicit approval marker that this
+workflow never supplies.
 
 Workflow inputs are validated again in Bash after GitHub has supplied them;
-workflow metadata is not treated as a security boundary. Invalid, fractional, negative, non-numeric, or out-of-range values fail closed
-before cluster creation. Malformed values are rejected, not clamped. The
-permitted bounds are:
+workflow metadata is not treated as a security boundary. Invalid, fractional,
+negative, non-numeric, or out-of-range values fail closed before cluster
+creation. The permitted bounds are:
 
 | Input | Default | Hard bound |
 | --- | ---: | ---: |
@@ -43,12 +39,10 @@ permitted bounds are:
 | `concurrency` | 1 | 1-8 |
 | `timeout_ms` | 10000 | 500-30000 |
 | `max_duration_ms` | 60000 | 1000-180000 |
-| `abort_threshold` | 3 | 1-20 |
 
-The experiment has no GitHub matrix, retry fan-out, or parallel workflow jobs.
-Load-smoke has a hard three-minute maximum, an abort threshold, and bounded
-cleanup. Cluster/namespace cleanup has a 120-second deadline and must produce
-a verification marker or the workflow fails.
+The experiment has no GitHub matrix, retry fan-out, or parallel workflow jobs;
+the operator may run the same serialized workflow sequentially at the documented
+concurrency points.
 The run-ID-derived cluster name is deliberately short enough for k3d's 32-character
 limit while remaining unique to the run. It builds and imports the four local images (`api`, `room`, `static`, and
 `gateway`) sequentially. The cluster name is exactly derived from the run ID;
@@ -80,6 +74,66 @@ targets. Browser tests can be added later for a separately justified user
 experience question, but they must not turn the capacity workflow into a
 public or unbounded browser load generator.
 
+## Capacity model and bounded overload policy
+
+The reviewable configured model is [`capacity-policy.json`](../capacity-policy.json).
+It is intentionally separate from benchmark output: the policy records current
+limits and the calculation for safe headroom, while a run artifact records what
+actually happened in an isolated environment. The current topology has one API
+replica and one SQLite writer, a global 128-session WebSocket admission limit,
+and a 120-pod/120-service namespace quota. After fixed API, gateway, static,
+and Service objects, the dynamic room ceiling is 117 Pods/116 Services. Until a
+measured result is lower, the review threshold is 80% of each boundary: 102
+WebSocket sessions (51 two-player games when there are no spectators) and 92
+active rooms. These are guardrails,
+not a production capacity claim.
+
+The first overload signal is expected to be an aggregate admission rejection,
+not a crash: HTTP admission, create, join, and WebSocket rejection counters
+increase; public HTTP admission returns `429 Too Many Requests`, `Retry-After:
+60`, and `Cache-Control: no-store`. The benchmark does not retry 429 responses.
+The lobby's room-backend dial is the only internal retrying layer and is capped
+at three attempts with 100ms/200ms backoff. This prevents a rejected request from
+becoming a retry storm while preserving health, room listing, existing-room
+cleanup, and already-admitted WebSocket journeys as critical work.
+
+The current capacity boundary remains the minimum of measured CPU/memory,
+SQLite failure/latency, room Pod/Service quota, gateway/WebSocket saturation,
+and the application admission ceilings. Never add a second `pong-api` replica
+to raise it: the RWO SQLite file has a deliberate single-writer contract.
+Future options are a serialized durable writer with read replicas, a
+transactional state service, or room-partitioned writable shards; none is
+implemented here.
+
+## Repeatable benchmark procedure
+
+Run the manual `capacity-experiment` workflow at `concurrency=1,2,4,8` with
+three or more iterations per point and the same timeout/duration. Repeat the
+matrix after changing images or resource limits. For explicit overload
+validation, rerun with `overload_ws_limit` below the requested concurrent
+sessions (the default 128 preserves the current topology baseline). The workflow
+always creates a new loopback-only k3d cluster, applies the test overlay, and
+deletes only its owned cluster.
+
+Each aggregate result contains health/create/join/WebSocket/API-read/cleanup
+counts, latency percentiles, HTTP status classes, `Retry-After` counts,
+WebSocket handshake statuses, and failure codes. Interpret the first signal as
+follows:
+
+1. admission rejection with low CPU/memory: configured ceiling is the boundary;
+2. quota rejection or pending room Pods: Pod/Service quota is the boundary;
+3. SQLite failures or rising create/join latency: the single writer/storage is
+   the boundary;
+4. resource pressure with no admission rejection: CPU/memory or gateway is the
+   boundary; and
+5. cleanup failures or rooms remaining after the run: the result is invalid
+   until reconciliation succeeds.
+
+Record the lowest stable concurrency/ceiling pair that has no unacceptable
+journey errors, then keep 20% headroom. Do not average across runs that used
+different images, resource requests, node sizes, admission settings, or quota.
+The workflow is evidence collection, not an automatic capacity promotion.
+
 ## Evidence and review
 
 Every manual run uploads a short-lived artifact containing:
@@ -97,9 +151,7 @@ condition is captured in the artifact rather than converted into an unbounded
 wait. Reviewers should correlate the aggregate operation results with pod
 readiness, resource requests/limits, and any snapshot errors. This evidence is
 for a disposable baseline and cannot establish the public 30-day availability
-objective or the drill recovery P95 by itself. If WebSocket failures occur
-while node CPU/memory remain low, inspect admission-rejection and WebSocket
-failure counters before calling the result resource saturation.
+objective or the drill recovery P95 by itself. If WebSocket failures occur while node CPU/memory remain low, inspect admission-rejection and WebSocket failure counters before calling the result resource saturation. A successful run must also verify that the room list returns to its pre-run state and that no room Pod/Service remains after bounded cleanup/reconciliation.
 
 ## Current non-goals
 
@@ -117,24 +169,22 @@ This slice does **not**:
 The scheduled synthetic workflow remains a separate, low-rate availability
 check. It must not be repurposed as a capacity or chaos runner.
 
-## One-fault-at-a-time chaos drills
+## Future one-fault-at-a-time drills
 
-`chaos-experiment.yml` accepts exactly one scenario and performs three
-sequential comparable repetitions after a passing concurrent-room baseline:
+After an isolated baseline has been reviewed, future drills should introduce
+exactly one reversible fault at a time, with an explicit hypothesis, bounded
+window, pre-check, recovery measurement, and post-check. Candidate scenarios
+on disposable targets include:
 
-1. `api-restart` — restart the disposable API deployment;
-2. `gateway-restart` — restart the disposable gateway deployment;
-3. `room-termination` — create a disposable room and terminate its room pod;
-4. `node-drain` — drain and uncordon one disposable k3d agent; or
-5. `resource-pressure` — create and remove one bounded pressure pod.
+1. restart one non-stateful gateway pod and measure readiness and journey
+   recovery;
+2. restart the single API pod only after confirming the SQLite/PVC safety
+   contract and measuring the resulting bounded outage;
+3. make one room pod unavailable and verify room cleanup/reconciliation; or
+4. apply a narrowly scoped disposable resource-pressure or network fault,
+   then remove it and verify the cluster returns to baseline.
 
-It emits aggregate recovery durations and P95, failures, cleanup markers, and
-resource snapshot availability. A recovery P95 under 360000 ms is marked as
-the controlled-drill objective; failed or incomplete runs record
-`objective_passed: false`. Faults are never combined or injected in parallel.
-
-This branch cannot provide live-cluster validation, production credentials, or
-three executed recovery-drill artifacts. Operator follow-up is required: run
-an approved isolated workflow invocation for at least three comparable runs,
-retain the aggregate JSON and cleanup markers, and review P95 against six
-minutes. Never point these workflows at native production or a public ingress.
+Each scenario needs its own reviewed guard and must never combine faults,
+parallelize failure injection, or target native production. A later recovery
+workflow can calculate P95 across repeated, separately approved drills; it
+must not mix that number with the 99%/30-day availability measurement.

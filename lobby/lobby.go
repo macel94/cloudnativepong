@@ -62,6 +62,15 @@ type Orchestrator interface {
 // Server handles HTTP requests for the lobby.
 const defaultRoomIdleTimeout = 10 * time.Minute
 
+// Room Pods are created asynchronously. Wait for the Service to publish a
+// ready endpoint before returning the room to callers so the lobby's bounded
+// WebSocket dial retry budget is reserved for transient routing failures, not
+// normal image startup.
+const (
+	roomEndpointReadyTimeout = 15 * time.Second
+	roomEndpointPollInterval = 100 * time.Millisecond
+)
+
 const maxJSONBodyBytes int64 = 4 << 10
 const maxRoomNameBytes = 80
 
@@ -889,7 +898,97 @@ func (s *Server) createK8sPod(roomID string) (string, error) {
 	if err := json.Unmarshal(respBody, &result); err != nil {
 		return "", errors.New("invalid kubernetes pod response")
 	}
+	if err := s.waitForRoomEndpoint(roomID, apiHost, apiPort, ns, token); err != nil {
+		s.metric("pong_room_ready_wait_failure")
+		return "", err
+	}
+	s.metric("pong_room_ready_wait_success")
 	return result.Status.PodIP, nil
+}
+
+// waitForRoomEndpoint waits for the room Service to have at least one ready
+// endpoint. A successful Pod POST only means that Kubernetes accepted the
+// object; it does not mean that DNS/service routing can reach the container.
+// The bounded wait keeps startup failure explicit without multiplying public
+// retries or leaving an unusable room reservation behind.
+func (s *Server) waitForRoomEndpoint(roomID, apiHost, apiPort, ns string, token []byte) error {
+	// Service routing is populated from EndpointSlices. Waiting on the
+	// deprecated Endpoints object can report an address before the data plane
+	// has the current Service slice, which consumes the proxy's bounded dial
+	// budget during normal room startup.
+	url := fmt.Sprintf("https://%s:%s/apis/discovery.k8s.io/v1/namespaces/%s/endpointslices?labelSelector=kubernetes.io/service-name%%3Dpong-room-%s", apiHost, apiPort, ns, roomID)
+	deadline := time.Now().Add(roomEndpointReadyTimeout)
+	var lastErr error
+	for {
+		req, err := http.NewRequest(http.MethodGet, url, nil)
+		if err != nil {
+			return fmt.Errorf("create room endpoint slice request: %w", err)
+		}
+		req.Header.Set("Authorization", "Bearer "+string(token))
+		resp, requestErr := k8sClient().Do(req)
+		if requestErr == nil {
+			body, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+			resp.Body.Close()
+			switch {
+			case readErr != nil:
+				lastErr = errors.New("kubernetes endpoint slice response unreadable")
+			case resp.StatusCode == http.StatusOK:
+				if roomEndpointSliceHasReadyAddress(body) {
+					return nil
+				}
+				lastErr = errors.New("room endpoint slice has no ready address")
+			case resp.StatusCode == http.StatusNotFound || resp.StatusCode >= 500:
+				lastErr = fmt.Errorf("kubernetes endpoint slice returned HTTP %d", resp.StatusCode)
+			default:
+				return fmt.Errorf("kubernetes endpoint slice returned HTTP %d", resp.StatusCode)
+			}
+		} else {
+			lastErr = requestErr
+		}
+
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			if lastErr == nil {
+				lastErr = errors.New("room endpoint slice did not become ready")
+			}
+			return fmt.Errorf("room endpoint slice did not become ready: %w", lastErr)
+		}
+		wait := roomEndpointPollInterval
+		if remaining < wait {
+			wait = remaining
+		}
+		time.Sleep(wait)
+	}
+}
+
+func roomEndpointSliceHasReadyAddress(body []byte) bool {
+	var endpointSlices struct {
+		Items []struct {
+			Endpoints []struct {
+				Addresses  []string `json:"addresses"`
+				Conditions struct {
+					Ready *bool `json:"ready"`
+				} `json:"conditions"`
+			} `json:"endpoints"`
+		} `json:"items"`
+	}
+	if json.Unmarshal(body, &endpointSlices) != nil {
+		return false
+	}
+	for _, slice := range endpointSlices.Items {
+		for _, endpoint := range slice.Endpoints {
+			// Kubernetes defines an omitted ready condition as true.
+			if endpoint.Conditions.Ready != nil && !*endpoint.Conditions.Ready {
+				continue
+			}
+			for _, address := range endpoint.Addresses {
+				if strings.TrimSpace(address) != "" {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 // createK8sService creates a ClusterIP Service for a room pod so it has a
