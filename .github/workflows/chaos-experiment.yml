@@ -1,0 +1,237 @@
+name: Disposable chaos experiment
+
+on:
+  workflow_dispatch:
+    inputs:
+      scenario:
+        description: 'Run exactly one reversible disposable fault scenario'
+        required: true
+        type: choice
+        options:
+          - api-restart
+          - gateway-restart
+          - room-termination
+          - node-drain
+          - resource-pressure
+      approve_experiment:
+        description: 'Explicitly approve this isolated disposable experiment'
+        required: true
+        default: false
+        type: boolean
+
+# Capacity and chaos are one global experiment class. Never permit two runs,
+# including different workflow files, to share the runner or public target.
+concurrency:
+  group: capacity-chaos-experiment
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CLUSTER_NAME: cnp-chaos-${{ github.run_id }}
+  KUBE_CONTEXT: k3d-cnp-chaos-${{ github.run_id }}
+  NAMESPACE: cnp-chaos-${{ github.run_id }}
+  SCENARIO: '${{ inputs.scenario }}'
+  PONG_EXPERIMENT_MODE: chaos
+  PONG_EXPERIMENT_APPROVED: '1'
+  PONG_EXPERIMENT_TARGET: isolated
+  RUNS: '3'
+  RECOVERY_TARGET_MS: '360000'
+  DRILL_TIMEOUT_SECONDS: '600'
+  CLEANUP_TIMEOUT_SECONDS: '120'
+  EXPERIMENT_DEADLINE_SECONDS: '1200'
+  ABORT_THRESHOLD: '2'
+
+jobs:
+  chaos:
+    name: Isolated one-fault recovery drill
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install existing load-smoke dependency
+        run: npm ci --ignore-scripts
+
+      - name: Require explicit approval and validate scenario
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ '${{ inputs.approve_experiment }}' != 'true' ]]; then
+            echo 'approve_experiment must be true; refusing an unapproved chaos drill' >&2
+            exit 1
+          fi
+          case "$SCENARIO" in
+            api-restart|gateway-restart|room-termination|node-drain|resource-pressure) ;;
+            *) echo 'invalid scenario' >&2; exit 1 ;;
+          esac
+          if [[ ! "$GITHUB_RUN_ID" =~ ^[0-9]+$ ]]; then
+            echo 'GITHUB_RUN_ID must be numeric' >&2
+            exit 1
+          fi
+          printf '%s\n' 'aggregate-only chaos evidence' > chaos-artifacts-contract.txt
+
+      - name: Install k3d
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
+          k3d version
+
+      - name: Allocate loopback port and create artifact directory
+        shell: bash
+        run: |
+          set -euo pipefail
+          HOST_PORT=$(python3 - <<'PY'
+          import socket
+          sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+          try:
+              sock.bind(('127.0.0.1', 0))
+              print(sock.getsockname()[1])
+          finally:
+              sock.close()
+          PY
+          )
+          [[ "$HOST_PORT" =~ ^[0-9]+$ && "$HOST_PORT" -ge 1024 && "$HOST_PORT" -le 65535 ]]
+          printf 'HOST_PORT=%s\nARTIFACT_DIR=chaos-artifacts\n' "$HOST_PORT" >> "$GITHUB_ENV"
+          mkdir -p chaos-artifacts
+
+      - name: Create exact disposable k3d cluster
+        shell: bash
+        run: |
+          set -euo pipefail
+          if k3d cluster list --no-headers 2>/dev/null | awk '{print $1}' | grep -Fxq "$CLUSTER_NAME"; then
+            echo 'refusing to attach to an existing cluster' >&2
+            exit 1
+          fi
+          k3d cluster create "$CLUSTER_NAME" --agents 2 --wait \
+            --port "127.0.0.1:${HOST_PORT}:30080@agent:0"
+          : > chaos-artifacts/cluster-created
+          kubectl --context "$KUBE_CONTEXT" wait --for=condition=Ready node --all --timeout=120s
+
+      - name: Build and import disposable images
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build -t cloudnativepong-api:latest -f Dockerfile.api .
+          docker build -t cloudnativepong-room:latest -f Dockerfile.room .
+          docker build --build-arg BUILD_SHA="$GITHUB_SHA" --build-arg BUILD_REPOSITORY="$GITHUB_REPOSITORY" \
+            -t cloudnativepong-static:latest -f Dockerfile.static .
+          docker build -t cloudnativepong-gateway:latest -f Dockerfile.gateway .
+          k3d image import cloudnativepong-api:latest cloudnativepong-room:latest \
+            cloudnativepong-static:latest cloudnativepong-gateway:latest --cluster "$CLUSTER_NAME"
+
+      - name: Deploy isolated namespace and wait for readiness
+        shell: bash
+        run: |
+          set -euo pipefail
+          # k8s/overlays/test is rendered into this run-owned namespace. The
+          # namespace creates its own PVC; no production context/credential is used.
+          kubectl kustomize k8s/overlays/test \
+            | sed -E -e "s/^  name: pong$/  name: ${NAMESPACE}/g" \
+                 -e "s/namespace: pong/namespace: ${NAMESPACE}/g" \
+                 -e "s/--namespace=pong/--namespace=${NAMESPACE}/g" \
+            > chaos-artifacts/rendered-isolated-manifest.yaml
+          kubectl --context "$KUBE_CONTEXT" apply -f chaos-artifacts/rendered-isolated-manifest.yaml
+          for deployment in pong-api pong-static pong-gateway; do
+            kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" rollout status \
+              "deployment/$deployment" --timeout=180s
+          done
+          kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" \
+            wait --for=condition=ready pod -l app=cloudnativepong --timeout=180s
+          curl --fail --silent --show-error --max-time 10 \
+            "http://127.0.0.1:${HOST_PORT}/health" >/dev/null
+
+      - name: Execute one-at-a-time recovery scenario
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE_URL="http://127.0.0.1:${HOST_PORT}" \
+            KUBE_CONTEXT="$KUBE_CONTEXT" NAMESPACE="$NAMESPACE" SCENARIO="$SCENARIO" \
+            ARTIFACT_DIR="$ARTIFACT_DIR" RUNS="$RUNS" \
+            RECOVERY_TARGET_MS="$RECOVERY_TARGET_MS" \
+            DRILL_TIMEOUT_SECONDS="$DRILL_TIMEOUT_SECONDS" \
+            CLEANUP_TIMEOUT_SECONDS="$CLEANUP_TIMEOUT_SECONDS" \
+            EXPERIMENT_DEADLINE_SECONDS="$EXPERIMENT_DEADLINE_SECONDS" \
+            ABORT_THRESHOLD="$ABORT_THRESHOLD" \
+            timeout "${EXPERIMENT_DEADLINE_SECONDS}s" ./scripts/chaos-experiment.sh
+
+      - name: Capture aggregate resource ceilings and drill evidence
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -u
+          snapshot() {
+            local name=$1; shift
+            timeout 30s "$@" 2>&1 | awk '
+              BEGIN { lines=0 }
+              /^[^[:space:]]/ { lines++ }
+              END { printf "observed_rows=%d\\n", lines }
+            ' > "$ARTIFACT_DIR/$name" || true
+          }
+          snapshot resource-ceiling-pods.txt kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" top pods --no-headers
+          snapshot resource-ceiling-nodes.txt kubectl --context "$KUBE_CONTEXT" top nodes --no-headers
+          printf '%s\n' "$SCENARIO" > "$ARTIFACT_DIR/scenario"
+
+      - name: Delete namespace and verify cleanup
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -f chaos-artifacts/cluster-created ]]; then
+            kubectl --context "$KUBE_CONTEXT" delete namespace "$NAMESPACE" --ignore-not-found \
+              --wait=true --timeout=120s
+            if kubectl --context "$KUBE_CONTEXT" get namespace "$NAMESPACE" >/dev/null 2>&1; then
+              echo 'run-owned chaos namespace still exists' >&2
+              exit 1
+            fi
+            printf '%s\n' verified > chaos-artifacts/namespace-cleanup
+          fi
+
+      - name: Delete only the exact disposable cluster and verify cleanup
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -f chaos-artifacts/cluster-created ]]; then
+            timeout 120s k3d cluster delete "$CLUSTER_NAME"
+            if k3d cluster list --no-headers 2>/dev/null | awk '{print $1}' | grep -Fxq "$CLUSTER_NAME"; then
+              echo 'run-owned chaos cluster still exists' >&2
+              exit 1
+            fi
+            printf '%s\n' verified > chaos-artifacts/cluster-cleanup
+          fi
+
+      - name: Fail closed if cleanup was not verified
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f chaos-artifacts/cluster-created || exit 0
+          test -f chaos-artifacts/namespace-cleanup || {
+            echo 'chaos namespace cleanup verification is missing' >&2
+            exit 1
+          }
+          test -f chaos-artifacts/cluster-cleanup || {
+            echo 'chaos cluster cleanup verification is missing' >&2
+            exit 1
+          }
+
+      - name: Upload aggregate chaos evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: chaos-experiment-${{ github.run_id }}
+          path: chaos-artifacts/
+          if-no-files-found: warn
+          retention-days: 7

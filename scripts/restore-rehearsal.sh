@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Non-destructive, opt-in SQLite restore rehearsal for an isolated k3d cluster.
+# Non-destructive, opt-in SQLite restore rehearsal for an isolated disposable cluster.
 #
-# This script intentionally refuses the production k3d-pong cluster and never
+# This script intentionally refuses native production and never
 # deletes a cluster or PVC except the exact disposable cluster it created.
 set -euo pipefail
 
@@ -34,7 +34,7 @@ Options:
 The source backup is never modified. The copied database is seeded into a new
 PVC in the disposable cluster, and the API is checked through its gateway.
 This script does not upload to object storage and never restores /data/pong.db
-in the existing k3d-pong cluster.
+in native production.
 USAGE
 }
 
@@ -53,7 +53,7 @@ require_command() {
 
 is_forbidden_cluster() {
   local name=$1
-  [[ "$name" == "pong" || "$name" == "k3d-pong" ]]
+  [[ "$name" == "pong" || "$name" == "native-production" || "$name" == "belacca-native" ]]
 }
 
 quote_cmd() {
@@ -66,13 +66,13 @@ self_test() {
   [[ -x "$BACKUP_HELPER" ]] || { echo "backup helper is not executable: $BACKUP_HELPER" >&2; status=1; }
   grep -q -- '--i-understand-this-creates-an-isolated-cluster' "$0" || { echo 'missing explicit opt-in guard' >&2; status=1; }
   grep -q -- 'pong-restore-' "$0" || { echo 'missing dedicated cluster prefix guard' >&2; status=1; }
-  grep -q -- 'k3d-pong' "$0" || { echo 'missing production cluster guard' >&2; status=1; }
-  is_forbidden_cluster k3d-pong || { echo 'production cluster predicate is not refusing k3d-pong' >&2; status=1; }
+  grep -q -- 'belacca-native' "$0" || { echo 'missing native production guard' >&2; status=1; }
+  is_forbidden_cluster belacca-native || { echo 'native production predicate is not refusing belacca-native' >&2; status=1; }
   is_forbidden_cluster pong || { echo 'production cluster predicate is not refusing pong' >&2; status=1; }
   is_forbidden_cluster pong-restore-self-test && { echo 'restore cluster predicate rejects its own dedicated prefix' >&2; status=1; }
   grep -q -- '../../base' "$REPO_ROOT/k8s/overlays/test/kustomization.yaml" || { echo 'test overlay no longer references the application base' >&2; status=1; }
   grep -q -- 'pong-api-data' "$REPO_ROOT/k8s/base/all.yaml" || { echo 'application base no longer names the expected PVC' >&2; status=1; }
-  if grep -nE 'k3d cluster delete (pong|k3d-pong)|kubectl .*delete (pvc|namespace)' "$0"; then
+  if grep -nE 'k3d cluster delete (pong|native-production|belacca-native)|kubectl .*delete (pvc|namespace)' "$0"; then
     echo 'destructive production/PVC command found in rehearsal script' >&2
     status=1
   fi
@@ -157,7 +157,7 @@ done
 [[ "$helper_image" != *[[:space:]]* ]] || fail 'helper image must not contain whitespace'
 ! is_forbidden_cluster "$cluster_name" || fail "refusing cluster name that could target production: $cluster_name"
 [[ "$backup_file" != /data/pong.db ]] || fail 'refusing the live database path /data/pong.db'
-[[ "$backup_file" != *k3d-pong* ]] || fail 'refusing a backup path that names the production cluster; copy it to a neutral protected path first'
+[[ "$backup_file" != *belacca-native* ]] || fail 'refusing a backup path that names native production; copy it to a neutral protected path first'
 
 if (( dry_run == 0 && acknowledged == 0 )); then
   fail 'real runs require --i-understand-this-creates-an-isolated-cluster'
@@ -197,7 +197,7 @@ if (( dry_run )); then
   quote_cmd kubectl --context "k3d-${cluster_name}" -n "$namespace" scale deployment/pong-api --replicas=0
   quote_cmd kubectl --context "k3d-${cluster_name}" -n "$namespace" cp "$backup_file" pong-restore-seed:/data/pong.db
   quote_cmd kubectl --context "k3d-${cluster_name}" -n "$namespace" scale deployment/pong-api --replicas=1
-  log "dry-run complete for disposable cluster $cluster_name; production k3d-pong is not addressed"
+  log "dry-run complete for disposable cluster $cluster_name; native production is not addressed"
   exit 0
 fi
 

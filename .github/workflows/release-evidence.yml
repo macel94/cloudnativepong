@@ -1,0 +1,294 @@
+name: Production promotion evidence
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_commit:
+        description: 'Full lowercase source commit SHA that was promoted'
+        required: true
+        type: string
+      api_digest:
+        description: 'Immutable api IMAGE@sha256 digest'
+        required: true
+        type: string
+      room_digest:
+        description: 'Immutable room IMAGE@sha256 digest'
+        required: true
+        type: string
+      static_digest:
+        description: 'Immutable static IMAGE@sha256 digest'
+        required: true
+        type: string
+      gateway_digest:
+        description: 'Immutable gateway IMAGE@sha256 digest'
+        required: true
+        type: string
+      promotion_started_at:
+        description: 'Observed production promotion start (RFC3339)'
+        required: true
+        type: string
+      deployment_revision:
+        description: 'Deployment revision observed after Flux reconciliation'
+        required: true
+        type: string
+      flux_source_revision:
+        description: 'Flux Git source revision observed in production'
+        required: true
+        type: string
+      flux_kustomization_revision:
+        description: 'Flux Kustomization last-applied revision observed in production'
+        required: true
+        type: string
+      window_start:
+        description: 'DORA measurement window start (RFC3339)'
+        required: true
+        type: string
+      window_end:
+        description: 'DORA measurement window end (RFC3339)'
+        required: true
+        type: string
+      deployment_count:
+        description: 'Successful and failed production deployments in the window'
+        required: true
+        type: number
+      failed_deployment_count:
+        description: 'Deployments in the window that halted or rolled back'
+        required: true
+        type: number
+      rollback_status:
+        description: 'Rollback evidence state; a failed journey defaults to pending review'
+        required: true
+        default: not_required
+        type: choice
+        options:
+          - not_required
+          - pending_review
+          - completed
+      rollback_detected_at:
+        description: 'Rollback detection time (RFC3339), if applicable'
+        required: false
+        type: string
+      rollback_recovered_at:
+        description: 'Rollback recovery time (RFC3339), only after reviewed Git/Flux revert'
+        required: false
+        type: string
+
+# This workflow records evidence only after an operator has reviewed the
+# promotion. It never changes a cluster and never performs a production
+# rollback. Production rollback remains a reviewed Git/Flux commit.
+permissions:
+  contents: read
+  attestations: read
+
+concurrency:
+  group: production-release-evidence
+  cancel-in-progress: false
+
+env:
+  SYNTHETIC_BASE_URL: ${{ vars.SYNTHETIC_PONG_URL || 'https://pong.belacca.com' }}
+  SYNTHETIC_AUTH_TOKEN: ${{ secrets.SYNTHETIC_AUTH_TOKEN }}
+  SYNTHETIC_TIMEOUT_MS: '60000'
+  SYNTHETIC_REQUEST_TIMEOUT_MS: '20000'
+
+jobs:
+  record:
+    name: Verify, exercise, and record production promotion
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout source history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Install synthetic dependency
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install npm dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Validate source and immutable image inputs
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          API_DIGEST: ${{ inputs.api_digest }}
+          ROOM_DIGEST: ${{ inputs.room_digest }}
+          STATIC_DIGEST: ${{ inputs.static_digest }}
+          GATEWAY_DIGEST: ${{ inputs.gateway_digest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]] || {
+            echo 'source_commit must be a full lowercase Git SHA' >&2
+            exit 1
+          }
+          git cat-file -e "$SOURCE_COMMIT^{commit}" || {
+            echo 'source_commit is not present in the checked-out repository history' >&2
+            exit 1
+          }
+          for reference in "$API_DIGEST" "$ROOM_DIGEST" "$STATIC_DIGEST" "$GATEWAY_DIGEST"; do
+            [[ "$reference" =~ ^ghcr\.io/macel94/cloudnativepong-(api|room|static|gateway)@sha256:[0-9a-f]{64}$ ]] || {
+              echo 'every image must be an exact GHCR IMAGE@sha256:<64-hex-digest>' >&2
+              exit 1
+            }
+          done
+
+      - name: Verify GitHub Artifact Attestations
+        env:
+          GH_TOKEN: ${{ github.token }}
+          API_DIGEST: ${{ inputs.api_digest }}
+          ROOM_DIGEST: ${{ inputs.room_digest }}
+          STATIC_DIGEST: ${{ inputs.static_digest }}
+          GATEWAY_DIGEST: ${{ inputs.gateway_digest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for reference in "$API_DIGEST" "$ROOM_DIGEST" "$STATIC_DIGEST" "$GATEWAY_DIGEST"; do
+            ./scripts/verify-attestation.sh "$reference"
+          done
+
+      - name: Run post-deploy synthetic journey
+        id: synthetic
+        continue-on-error: true
+        env:
+          SYNTHETIC_EVIDENCE_FILE: synthetic-evidence.json
+        shell: bash
+        run: |
+          set +e
+          ./scripts/synthetic-check.sh
+          status=$?
+          set -e
+          printf '%s\n' "$status" > synthetic-exit-code
+          if [[ ! -s synthetic-evidence.json ]]; then
+            echo 'synthetic runner did not produce required aggregate evidence' >&2
+            exit 1
+          fi
+          # Preserve the failed outcome for the final promotion gate while
+          # allowing the next step to record halted/pending-review evidence.
+          exit "$status"
+
+      - name: Generate and validate release record
+        id: record
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          API_DIGEST: ${{ inputs.api_digest }}
+          ROOM_DIGEST: ${{ inputs.room_digest }}
+          STATIC_DIGEST: ${{ inputs.static_digest }}
+          GATEWAY_DIGEST: ${{ inputs.gateway_digest }}
+          PROMOTION_STARTED_AT: ${{ inputs.promotion_started_at }}
+          DEPLOYMENT_REVISION: ${{ inputs.deployment_revision }}
+          FLUX_SOURCE_REVISION: ${{ inputs.flux_source_revision }}
+          FLUX_KUSTOMIZATION_REVISION: ${{ inputs.flux_kustomization_revision }}
+          WINDOW_START: ${{ inputs.window_start }}
+          WINDOW_END: ${{ inputs.window_end }}
+          DEPLOYMENT_COUNT: ${{ inputs.deployment_count }}
+          FAILED_DEPLOYMENT_COUNT: ${{ inputs.failed_deployment_count }}
+          ROLLBACK_STATUS: ${{ inputs.rollback_status }}
+          ROLLBACK_DETECTED_AT: ${{ inputs.rollback_detected_at }}
+          ROLLBACK_RECOVERED_AT: ${{ inputs.rollback_recovered_at }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          synthetic_status=$(python3 -c 'import json; print(json.load(open("synthetic-evidence.json"))["status"])')
+          synthetic_completed=$(python3 -c 'import json; print(json.load(open("synthetic-evidence.json"))["completed_at"])')
+          synthetic_started=$(python3 -c 'import json; print(json.load(open("synthetic-evidence.json"))["started_at"])')
+
+          rollback_status="$ROLLBACK_STATUS"
+          rollback_action=''
+          rollback_detected="$ROLLBACK_DETECTED_AT"
+          rollback_recovered="$ROLLBACK_RECOVERED_AT"
+          if [[ "$synthetic_status" != passed && "$rollback_status" == not_required ]]; then
+            # A failed journey halts the promotion and leaves a precise,
+            # reviewable follow-up. No production kubectl action is performed.
+            rollback_status=pending_review
+            rollback_action='reviewed_git_flux_revert'
+            rollback_detected="$synthetic_completed"
+          elif [[ "$rollback_status" != not_required ]]; then
+            rollback_action='reviewed_git_flux_revert'
+            [[ -n "$rollback_detected" ]] || rollback_detected="$synthetic_completed"
+          fi
+
+          if [[ "$synthetic_status" == passed ]]; then
+            promotion_status=succeeded
+          elif [[ "$rollback_status" == completed ]]; then
+            promotion_status=rolled_back
+          else
+            promotion_status=halted
+          fi
+
+          source_commit_at=$(git show -s --format=%cI "$SOURCE_COMMIT")
+          started_at="$PROMOTION_STARTED_AT"
+          completed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          # The record input contains no target URL, generated room name, body,
+          # token, or error text. release-record.py derives its record ID and
+          # DORA rates and rejects any accidental extra/private fields.
+          python3 - "$SOURCE_COMMIT" "$source_commit_at" "$started_at" "$completed_at" "$synthetic_status" "$synthetic_started" "$synthetic_completed" "$rollback_status" "$rollback_action" "$rollback_detected" "$rollback_recovered" <<'PY'
+          import json, os, sys
+          source, source_at, started, completed, synthetic_status, synthetic_started, synthetic_completed, rollback_status, rollback_action, rollback_detected, rollback_recovered = sys.argv[1:]
+          def optional(value):
+              return value if value else None
+          payload = {
+              "source_commit": source,
+              "images": [
+                  {"reference": os.environ["API_DIGEST"], "attestation": "verified"},
+                  {"reference": os.environ["ROOM_DIGEST"], "attestation": "verified"},
+                  {"reference": os.environ["STATIC_DIGEST"], "attestation": "verified"},
+                  {"reference": os.environ["GATEWAY_DIGEST"], "attestation": "verified"},
+              ],
+              "promotion": {
+                  "environment": "production",
+                  "status": "rolled_back" if rollback_status == "completed" else ("succeeded" if synthetic_status == "passed" else "halted"),
+                  "source_commit_at": source_at,
+                  "started_at": started,
+                  "completed_at": completed,
+                  "deployment_revision": os.environ["DEPLOYMENT_REVISION"],
+                  "flux_source_revision": os.environ["FLUX_SOURCE_REVISION"],
+                  "flux_kustomization_revision": os.environ["FLUX_KUSTOMIZATION_REVISION"],
+                  "synthetic": json.load(open("synthetic-evidence.json")),
+              },
+              "rollback": {
+                  "status": rollback_status,
+                  "action": optional(rollback_action),
+                  "detected_at": optional(rollback_detected),
+                  "recovered_at": optional(rollback_recovered),
+                  "detection_time_seconds": None,
+                  "recovery_time_seconds": None,
+              },
+              "dora": {
+                  "window_start": os.environ["WINDOW_START"],
+                  "window_end": os.environ["WINDOW_END"],
+                  "deployment_count": int(os.environ["DEPLOYMENT_COUNT"]),
+                  "failed_deployment_count": int(os.environ["FAILED_DEPLOYMENT_COUNT"]),
+              },
+              "privacy": {"contains_secrets": False, "contains_user_data": False},
+          }
+          if rollback_status != "not_required":
+              from datetime import datetime
+              def parse(value): return datetime.fromisoformat(value.replace("Z", "+00:00"))
+              payload["rollback"]["detection_time_seconds"] = max(0, int((parse(rollback_detected) - parse(synthetic_started)).total_seconds()))
+          if rollback_status == "completed":
+              payload["rollback"]["recovery_time_seconds"] = int((parse(rollback_recovered) - parse(rollback_detected)).total_seconds())
+          with open("record-input.json", "w", encoding="utf-8") as handle:
+              json.dump(payload, handle, indent=2)
+              handle.write("\n")
+          PY
+          ./scripts/release-record.py generate --input record-input.json --output release-record.json
+
+      - name: Upload release record
+        if: always() && steps.record.outcome == 'success'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pong-release-record-${{ inputs.source_commit }}
+          path: release-record.json
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Fail the promotion when the journey failed
+        if: steps.synthetic.outcome != 'success'
+        shell: bash
+        run: |
+          echo 'post-deploy synthetic failed: promotion is halted; use the reviewed Git/Flux rollback procedure and rerun evidence after recovery' >&2
+          exit 1
