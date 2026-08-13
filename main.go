@@ -208,12 +208,12 @@ func startWebTransportServer(addr, certFile, keyFile string, mux http.Handler) (
 
 const maxWebTransportMessageSize = 1 << 20
 
-// Room dial retries are deliberately short and bounded. The lobby is the
-// only retrying layer for room startup; callers must not multiply this work
-// when the room or cluster is already overloaded.
+// Service readiness and service routing are eventually consistent. Keep the
+// proxy retry bounded, but allow the Kubernetes data plane a few seconds to
+// converge after the room endpoint becomes ready.
 const (
-	maxRoomDialAttempts = 3
-	roomDialBackoff     = 100 * time.Millisecond
+	roomDialTimeout       = 5 * time.Second
+	roomDialRetryInterval = 500 * time.Millisecond
 )
 
 func readWebTransportJSON(stream io.Reader, value interface{}) error {
@@ -842,6 +842,41 @@ func roomWebSocketURL(addr string, spectator bool) string {
 	return "ws://" + addr + "/ws"
 }
 
+// dialRoomWithRetry tolerates the short interval between a ready EndpointSlice
+// and usable Service routing. The deadline is intentionally finite so a broken
+// room cannot hold a client connection indefinitely.
+func dialRoomWithRetry(parent context.Context, addr string, spectator bool, header http.Header, retryMetric string) (*websocket.Conn, error) {
+	ctx, cancel := context.WithTimeout(parent, roomDialTimeout)
+	defer cancel()
+
+	dialer := websocket.Dialer{
+		HandshakeTimeout: 2 * time.Second,
+		NetDialContext:   (&net.Dialer{Timeout: 2 * time.Second}).DialContext,
+	}
+	url := roomWebSocketURL(addr, spectator)
+	for {
+		target, response, err := dialer.DialContext(ctx, url, header)
+		if err == nil {
+			return target, nil
+		}
+		if response != nil && response.Body != nil {
+			response.Body.Close()
+		}
+		if ctx.Err() != nil {
+			return nil, err
+		}
+		appMetrics.Inc(retryMetric)
+
+		timer := time.NewTimer(roomDialRetryInterval)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, err
+		}
+	}
+}
+
 func runGameLoop(room *localRoom) {
 	ticker := time.NewTicker(game.TickDuration)
 	defer ticker.Stop()
@@ -1263,10 +1298,6 @@ func proxyRoomWebTransport(session *webtransport.Session, r *http.Request, roomI
 		return
 	}
 
-	dialer := websocket.Dialer{
-		HandshakeTimeout: 2 * time.Second,
-		NetDialContext:   (&net.Dialer{Timeout: 2 * time.Second}).DialContext,
-	}
 	targetHeader := http.Header{}
 	if origin := websocketOrigins.first(); origin != "" {
 		targetHeader.Set("Origin", origin)
@@ -1274,17 +1305,7 @@ func proxyRoomWebTransport(session *webtransport.Session, r *http.Request, roomI
 	targetHeader.Set(requestIDHeader, requestID(r))
 	targetHeader.Set(correlationIDHeader, requestID(r))
 	telemetry.Inject(r.Context(), targetHeader)
-	var target *websocket.Conn
-	for attempt := 0; attempt < maxRoomDialAttempts; attempt++ {
-		target, _, err = dialer.Dial(roomWebSocketURL(addr, isSpectatorRequest(r)), targetHeader)
-		if err == nil {
-			break
-		}
-		if attempt+1 < maxRoomDialAttempts {
-			appMetrics.Inc("pong_webtransport_proxy_dial_retry")
-			time.Sleep(roomDialBackoff * time.Duration(1<<attempt))
-		}
-	}
+	target, err := dialRoomWithRetry(r.Context(), addr, isSpectatorRequest(r), targetHeader, "pong_webtransport_proxy_dial_retry")
 	if err != nil {
 		appMetrics.Inc("pong_webtransport_proxy_dial_failure")
 		_ = session.CloseWithError(0, "room unavailable")
@@ -1422,11 +1443,6 @@ func proxyRoomWS(w http.ResponseWriter, r *http.Request, lobbySrv *lobby.Server,
 	// browser. This closes the gateway tunnel race: the room's immediate
 	// "joined" frame is held in memory instead of arriving while the proxy
 	// is still switching the client connection into tunnel mode.
-	dialer := websocket.Dialer{
-		HandshakeTimeout: 2 * time.Second,
-		NetDialContext:   (&net.Dialer{Timeout: 2 * time.Second}).DialContext,
-	}
-	var target *websocket.Conn
 	targetHeader := http.Header{}
 	if origin := websocketOrigins.first(); origin != "" {
 		targetHeader.Set("Origin", origin)
@@ -1434,16 +1450,7 @@ func proxyRoomWS(w http.ResponseWriter, r *http.Request, lobbySrv *lobby.Server,
 	targetHeader.Set(requestIDHeader, requestID(r))
 	targetHeader.Set(correlationIDHeader, requestID(r))
 	telemetry.Inject(r.Context(), targetHeader)
-	for attempt := 0; attempt < maxRoomDialAttempts; attempt++ {
-		target, _, err = dialer.Dial(roomWebSocketURL(addr, isSpectatorRequest(r)), targetHeader)
-		if err == nil {
-			break
-		}
-		if attempt+1 < maxRoomDialAttempts {
-			appMetrics.Inc("pong_websocket_proxy_dial_retry")
-			time.Sleep(roomDialBackoff * time.Duration(1<<attempt))
-		}
-	}
+	target, err := dialRoomWithRetry(r.Context(), addr, isSpectatorRequest(r), targetHeader, "pong_websocket_proxy_dial_retry")
 	if err != nil {
 		appMetrics.Inc("pong_websocket_proxy_dial_failure")
 		return

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -569,53 +570,46 @@ func TestRoomWebSocketStartCallbackFailureDoesNotMarkPlaying(t *testing.T) {
 	_ = second.Close()
 }
 
-func TestProxyRoomWSDialRetryBudgetIsBounded(t *testing.T) {
-	oldAdmission := publicAdmission
-	publicAdmission = admission.NewController(admission.Config{
-		Window:              time.Minute,
-		CreatePerWindow:     10,
-		JoinPerWindow:       10,
-		HTTPPerClient:       4,
-		WebSocketsPerClient: 4,
-		MaxWebSockets:       4,
-		MaxClients:          4,
-	})
-	t.Cleanup(func() { publicAdmission = oldAdmission })
-
-	store, err := db.New(":memory:")
-	if err != nil {
-		t.Fatalf("db.New() error = %v", err)
-	}
-	defer store.Close()
-	lobbySrv := lobby.NewServer(store, "local", "", "")
-	room, err := lobbySrv.CreateRoom("retry-budget")
-	if err != nil {
-		t.Fatalf("CreateRoom() error = %v", err)
-	}
-	lobbySrv.RegisterLocalRoom(room.ID, &lobby.RoomHandler{ID: room.ID, Addr: "127.0.0.1:1"})
-	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		proxyRoomWS(w, r, lobbySrv, store)
-	}))
-	defer proxy.Close()
+func TestDialRoomWithRetryRespectsParentCancellation(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
 
 	started := time.Now()
-	client, response, dialErr := websocket.DefaultDialer.Dial(
-		"ws"+strings.TrimPrefix(proxy.URL, "http")+"/rooms/"+room.ID+"/ws",
-		http.Header{"Origin": []string{"http://localhost:8080"}},
-	)
-	if client != nil {
-		client.Close()
+	_, err := dialRoomWithRetry(ctx, "127.0.0.1:1", false, nil, "pong_test_room_dial_retry")
+	if err == nil {
+		t.Fatal("dialRoomWithRetry() unexpectedly succeeded")
 	}
-	if response != nil {
-		response.Body.Close()
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("dialRoomWithRetry() took %s after parent cancellation", elapsed)
 	}
-	if dialErr == nil {
-		t.Fatal("proxy dial unexpectedly succeeded")
+}
+
+func TestDialRoomWithRetrySurvivesTransientRoutingFailure(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	attempts := 0
+	roomServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		if attempts < 3 {
+			http.Error(w, "service routing not converged", http.StatusBadGateway)
+			return
+		}
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		conn.Close()
+	}))
+	defer roomServer.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	target, err := dialRoomWithRetry(ctx, strings.TrimPrefix(roomServer.URL, "http://"), false, nil, "pong_test_room_dial_retry")
+	if err != nil {
+		t.Fatalf("dialRoomWithRetry() error = %v", err)
 	}
-	// Three attempts against a refused room address take only the two bounded
-	// backoffs. The old ten-attempt loop would take several seconds longer.
-	if time.Since(started) > 2*time.Second {
-		t.Fatal("proxy retry budget exceeded bounded failure window")
+	target.Close()
+	if attempts != 3 {
+		t.Fatalf("room dial attempts = %d, want 3", attempts)
 	}
 }
 
