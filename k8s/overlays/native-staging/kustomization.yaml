@@ -3,9 +3,11 @@ kind: Kustomization
 
 namespace: pong
 
+# The native cluster runs standalone Prometheus with file-based rules in the
+# GitOps observability bundle. It does not install Prometheus Operator CRDs, so
+# the PrometheusRule used by the server overlay must not be emitted here.
 resources:
   - ../../base
-  - capacity-alerts.yaml
 
 images:
   - name: cloudnativepong-api
