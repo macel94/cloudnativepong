@@ -912,13 +912,17 @@ func (s *Server) createK8sPod(roomID string) (string, error) {
 // The bounded wait keeps startup failure explicit without multiplying public
 // retries or leaving an unusable room reservation behind.
 func (s *Server) waitForRoomEndpoint(roomID, apiHost, apiPort, ns string, token []byte) error {
-	url := fmt.Sprintf("https://%s:%s/api/v1/namespaces/%s/endpoints/pong-room-%s", apiHost, apiPort, ns, roomID)
+	// Service routing is populated from EndpointSlices. Waiting on the
+	// deprecated Endpoints object can report an address before the data plane
+	// has the current Service slice, which consumes the proxy's bounded dial
+	// budget during normal room startup.
+	url := fmt.Sprintf("https://%s:%s/apis/discovery.k8s.io/v1/namespaces/%s/endpointslices?labelSelector=kubernetes.io/service-name%%3Dpong-room-%s", apiHost, apiPort, ns, roomID)
 	deadline := time.Now().Add(roomEndpointReadyTimeout)
 	var lastErr error
 	for {
 		req, err := http.NewRequest(http.MethodGet, url, nil)
 		if err != nil {
-			return fmt.Errorf("create room endpoint request: %w", err)
+			return fmt.Errorf("create room endpoint slice request: %w", err)
 		}
 		req.Header.Set("Authorization", "Bearer "+string(token))
 		resp, requestErr := k8sClient().Do(req)
@@ -927,16 +931,16 @@ func (s *Server) waitForRoomEndpoint(roomID, apiHost, apiPort, ns string, token 
 			resp.Body.Close()
 			switch {
 			case readErr != nil:
-				lastErr = errors.New("kubernetes endpoint response unreadable")
+				lastErr = errors.New("kubernetes endpoint slice response unreadable")
 			case resp.StatusCode == http.StatusOK:
-				if roomEndpointHasReadyAddress(body) {
+				if roomEndpointSliceHasReadyAddress(body) {
 					return nil
 				}
-				lastErr = errors.New("room endpoint has no ready address")
+				lastErr = errors.New("room endpoint slice has no ready address")
 			case resp.StatusCode == http.StatusNotFound || resp.StatusCode >= 500:
-				lastErr = fmt.Errorf("kubernetes endpoint returned HTTP %d", resp.StatusCode)
+				lastErr = fmt.Errorf("kubernetes endpoint slice returned HTTP %d", resp.StatusCode)
 			default:
-				return fmt.Errorf("kubernetes endpoint returned HTTP %d", resp.StatusCode)
+				return fmt.Errorf("kubernetes endpoint slice returned HTTP %d", resp.StatusCode)
 			}
 		} else {
 			lastErr = requestErr
@@ -945,9 +949,9 @@ func (s *Server) waitForRoomEndpoint(roomID, apiHost, apiPort, ns string, token 
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
 			if lastErr == nil {
-				lastErr = errors.New("room endpoint did not become ready")
+				lastErr = errors.New("room endpoint slice did not become ready")
 			}
-			return fmt.Errorf("room endpoint did not become ready: %w", lastErr)
+			return fmt.Errorf("room endpoint slice did not become ready: %w", lastErr)
 		}
 		wait := roomEndpointPollInterval
 		if remaining < wait {
@@ -957,21 +961,30 @@ func (s *Server) waitForRoomEndpoint(roomID, apiHost, apiPort, ns string, token 
 	}
 }
 
-func roomEndpointHasReadyAddress(body []byte) bool {
-	var endpoint struct {
-		Subsets []struct {
-			Addresses []struct {
-				IP string `json:"ip"`
-			} `json:"addresses"`
-		} `json:"subsets"`
+func roomEndpointSliceHasReadyAddress(body []byte) bool {
+	var endpointSlices struct {
+		Items []struct {
+			Endpoints []struct {
+				Addresses  []string `json:"addresses"`
+				Conditions struct {
+					Ready *bool `json:"ready"`
+				} `json:"conditions"`
+			} `json:"endpoints"`
+		} `json:"items"`
 	}
-	if json.Unmarshal(body, &endpoint) != nil {
+	if json.Unmarshal(body, &endpointSlices) != nil {
 		return false
 	}
-	for _, subset := range endpoint.Subsets {
-		for _, address := range subset.Addresses {
-			if strings.TrimSpace(address.IP) != "" {
-				return true
+	for _, slice := range endpointSlices.Items {
+		for _, endpoint := range slice.Endpoints {
+			// Kubernetes defines an omitted ready condition as true.
+			if endpoint.Conditions.Ready != nil && !*endpoint.Conditions.Ready {
+				continue
+			}
+			for _, address := range endpoint.Addresses {
+				if strings.TrimSpace(address) != "" {
+					return true
+				}
 			}
 		}
 	}

@@ -128,7 +128,7 @@ func (f *fakeOrchestrator) DeleteService(string) error {
 func (f *fakeOrchestrator) ListPods() ([]RoomResource, error)     { return f.pods, nil }
 func (f *fakeOrchestrator) ListServices() ([]RoomResource, error) { return f.services, nil }
 
-func TestRoomEndpointHasReadyAddress(t *testing.T) {
+func TestRoomEndpointSliceHasReadyAddress(t *testing.T) {
 	tests := []struct {
 		name string
 		body string
@@ -136,17 +136,32 @@ func TestRoomEndpointHasReadyAddress(t *testing.T) {
 	}{
 		{
 			name: "ready address",
-			body: `{"subsets":[{"addresses":[{"ip":"10.0.0.4"}]}]}`,
+			body: `{"items":[{"endpoints":[{"addresses":["10.0.0.4"],"conditions":{"ready":true}}]}]}`,
 			want: true,
 		},
 		{
 			name: "not ready",
-			body: `{"subsets":[{"notReadyAddresses":[{"ip":"10.0.0.4"}]}]}`,
+			body: `{"items":[{"endpoints":[{"addresses":["10.0.0.4"],"conditions":{"ready":false}}]}]}`,
+			want: false,
+		},
+		{
+			name: "missing ready condition",
+			body: `{"items":[{"endpoints":[{"addresses":["10.0.0.4"]}]}]}`,
+			want: true,
+		},
+		{
+			name: "ready address in a later slice",
+			body: `{"items":[{"endpoints":[{"addresses":["10.0.0.4"],"conditions":{"ready":false}}]},{"endpoints":[{"addresses":["10.0.0.5"],"conditions":{"ready":true}}]}]}`,
+			want: true,
+		},
+		{
+			name: "empty address",
+			body: `{"items":[{"endpoints":[{"addresses":[],"conditions":{"ready":true}}]}]}`,
 			want: false,
 		},
 		{
 			name: "empty",
-			body: `{"subsets":[]}`,
+			body: `{"items":[]}`,
 			want: false,
 		},
 		{
@@ -157,8 +172,8 @@ func TestRoomEndpointHasReadyAddress(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := roomEndpointHasReadyAddress([]byte(tt.body)); got != tt.want {
-				t.Fatalf("roomEndpointHasReadyAddress() = %v, want %v", got, tt.want)
+			if got := roomEndpointSliceHasReadyAddress([]byte(tt.body)); got != tt.want {
+				t.Fatalf("roomEndpointSliceHasReadyAddress() = %v, want %v", got, tt.want)
 			}
 		})
 	}
