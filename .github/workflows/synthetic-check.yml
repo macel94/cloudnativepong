@@ -45,25 +45,50 @@ jobs:
           SYNTHETIC_BASE_URL: ''
         run: npm run test:synthetic
       - name: Check public Pong endpoint and two-player journey
+        id: synthetic
         shell: bash
+        continue-on-error: true
         run: |
           set -euo pipefail
+          mkdir -p synthetic-artifacts
           max_attempts=3
+          final_status=1
 
           for ((attempt = 1; attempt <= max_attempts; attempt++)); do
             echo "Synthetic check attempt ${attempt}/${max_attempts}"
-            if ./scripts/synthetic-check.sh; then
-              exit 0
+            if ./scripts/synthetic-check.sh > synthetic-artifacts/synthetic-result.log 2>&1; then
+              cat synthetic-artifacts/synthetic-result.log
+              final_status=0
+              break
             else
               status=$?
+              cat synthetic-artifacts/synthetic-result.log
             fi
 
             if (( attempt == max_attempts )); then
               echo "Synthetic check failed after ${max_attempts} attempts" >&2
-              exit "$status"
+              final_status="$status"
+              break
             fi
 
             delay=$((10 ** attempt))
             echo "Synthetic check failed (exit ${status}); retrying in ${delay}s" >&2
             sleep "$delay"
           done
+
+          printf '%s\n' "$final_status" > synthetic-artifacts/synthetic.exit-code
+          exit "$final_status"
+
+      - name: Retain canonical synthetic evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pong-synthetic-evidence-${{ github.run_id }}
+          path: synthetic-artifacts/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Enforce synthetic result
+        if: always()
+        shell: bash
+        run: test "$(cat synthetic-artifacts/synthetic.exit-code)" = 0

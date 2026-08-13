@@ -34,7 +34,62 @@ export class SyntheticError extends Error {
     this.retryable = options.retryable === true;
     this.ambiguous = options.ambiguous === true;
     this.status = options.status;
+    this.stage = options.stage;
+    this.code = options.code;
+    this.cleanup = options.cleanup === true;
   }
+}
+
+export const JOURNEY_CONTRACT_VERSION = 'belacca.pong-slo-journey-result.v1';
+export const JOURNEY_STAGES = Object.freeze([
+  'homepage',
+  'health',
+  'room-list',
+  'room-create',
+  'room-join',
+  'websocket-assignment',
+  'playing-state',
+  'cleanup',
+]);
+
+function boundedFailureCode(error, fallback = 'failed') {
+  if (error instanceof SyntheticError && /^[a-z0-9_]+$/u.test(error.code || '')) return error.code;
+  if (error instanceof SyntheticError && Number.isInteger(error.status)) return `http_${Math.floor(error.status / 100)}xx`;
+  return fallback;
+}
+
+function stageError(error, stage, fallbackCode = 'failed') {
+  if (error instanceof SyntheticError) {
+    if (!error.stage) error.stage = stage;
+    if (!error.code) error.code = boundedFailureCode(error, fallbackCode);
+    return error;
+  }
+  return new SyntheticError('synthetic journey failed', {
+    stage,
+    code: fallbackCode,
+    cause: error,
+  });
+}
+
+async function atStage(stage, operation) {
+  try {
+    return await operation();
+  } catch (error) {
+    throw stageError(error, stage);
+  }
+}
+
+function journeyResult({ good, durationMs, error = null, cleanupError = null }) {
+  return {
+    contract_version: JOURNEY_CONTRACT_VERSION,
+    total: 1,
+    good: good ? 1 : 0,
+    failed: good ? 0 : 1,
+    duration_ms: Math.max(0, durationMs),
+    failure_stage: error?.stage || null,
+    failure_code: error ? boundedFailureCode(error) : null,
+    cleanup_failure_code: cleanupError ? boundedFailureCode(cleanupError, 'failed') : null,
+  };
 }
 
 function usage() {
@@ -312,10 +367,13 @@ async function recoverCreatedRoom(client, name, rememberRoom, recoveryTimeoutMs)
 async function createRoom(client, name, rememberRoom) {
   let lastError;
   let retried = false;
+  const createClient = client.createRequestTimeoutMs === undefined
+    ? client
+    : { ...client, requestTimeoutMs: client.createRequestTimeoutMs };
 
   for (let attempt = 1; attempt <= CREATE_MAX_ATTEMPTS; attempt += 1) {
     try {
-      const room = await postJSON(client, '/api/rooms/create', { name }, 'room creation');
+      const room = await postJSON(createClient, '/api/rooms/create', { name }, 'room creation');
       rememberRoom(room);
       // If an earlier request timed out after the server accepted it, a second
       // room may become visible shortly after the successful retry. Track it
@@ -377,7 +435,10 @@ function waitForPlayer(socket, timeoutMs) {
     let joinedPlayer = null;
     let playing = false;
     let settled = false;
-    const timer = setTimeout(() => finishReject(new SyntheticError('WebSocket-compatible player journey timed out')), timeoutMs);
+    const timer = setTimeout(() => finishReject(new SyntheticError('WebSocket-compatible player journey timed out', {
+      stage: joinedPlayer === null ? 'websocket-assignment' : 'playing-state',
+      code: joinedPlayer === null ? 'assignment_timeout' : 'playing_timeout',
+    })), timeoutMs);
 
     function finishResolve(value) {
       if (settled) return;
@@ -412,20 +473,20 @@ function waitForPlayer(socket, timeoutMs) {
       try {
         message = JSON.parse(payload.toString());
       } catch {
-        finishReject(new SyntheticError('WebSocket returned invalid JSON'));
+        finishReject(new SyntheticError('WebSocket returned invalid JSON', { stage: 'playing-state', code: 'invalid_json' }));
         return;
       }
       if (!message || typeof message !== 'object') {
-        finishReject(new SyntheticError('WebSocket returned an invalid message'));
+        finishReject(new SyntheticError('WebSocket returned an invalid message', { stage: 'playing-state', code: 'invalid_message' }));
         return;
       }
       if (message.type === 'error') {
-        finishReject(new SyntheticError('WebSocket returned an application error'));
+        finishReject(new SyntheticError('WebSocket returned an application error', { stage: 'playing-state', code: 'application_error' }));
         return;
       }
       if (message.type === 'joined') {
         if (!Number.isInteger(message.player) || ![1, 2].includes(message.player)) {
-          finishReject(new SyntheticError('WebSocket returned an invalid player assignment'));
+          finishReject(new SyntheticError('WebSocket returned an invalid player assignment', { stage: 'websocket-assignment', code: 'invalid_assignment' }));
           return;
         }
         joinedPlayer = message.player;
@@ -433,7 +494,7 @@ function waitForPlayer(socket, timeoutMs) {
       if (message.type === 'state') {
         const state = message.state;
         if (!state || typeof state !== 'object' || !VALID_GAME_STATUSES.has(state.status)) {
-          finishReject(new SyntheticError('WebSocket returned an invalid game state'));
+          finishReject(new SyntheticError('WebSocket returned an invalid game state', { stage: 'playing-state', code: 'invalid_state' }));
           return;
         }
         if (state.status === 'playing') playing = true;
@@ -442,11 +503,14 @@ function waitForPlayer(socket, timeoutMs) {
     }
 
     function onError() {
-      finishReject(new SyntheticError('WebSocket connection failed'));
+      finishReject(new SyntheticError('WebSocket connection failed', { stage: 'websocket-assignment', code: 'connection_failed' }));
     }
 
     function onClose(code) {
-      if (!settled) finishReject(new SyntheticError(`WebSocket closed before the playing state (code ${code})`));
+      if (!settled) finishReject(new SyntheticError('WebSocket closed before the playing state', {
+        stage: joinedPlayer === null ? 'websocket-assignment' : 'playing-state',
+        code: 'closed_before_ready',
+      }));
     }
 
     // Keep the error listener installed after resolution. ws emits errors
@@ -601,8 +665,8 @@ async function waitForCleanup(client, roomID, timeoutMs, pollMs) {
   }
 }
 
-function makeClient({ base, env, fetchImpl, deadline, requestTimeoutMs }) {
-  return { base, env, fetchImpl, deadline, requestTimeoutMs };
+function makeClient({ base, env, fetchImpl, deadline, requestTimeoutMs, createRequestTimeoutMs }) {
+  return { base, env, fetchImpl, deadline, requestTimeoutMs, createRequestTimeoutMs };
 }
 
 /**
@@ -615,6 +679,7 @@ export async function runSynthetic({
   origin = env.SYNTHETIC_ORIGIN,
   timeoutMs = positiveInteger(env.SYNTHETIC_TIMEOUT_MS, 'SYNTHETIC_TIMEOUT_MS', DEFAULT_TIMEOUT_MS, 120_000),
   requestTimeoutMs = positiveInteger(env.SYNTHETIC_REQUEST_TIMEOUT_MS, 'SYNTHETIC_REQUEST_TIMEOUT_MS', DEFAULT_REQUEST_TIMEOUT_MS, 60_000),
+  createRequestTimeoutMs = requestTimeoutMs,
   fetchImpl = globalThis.fetch,
   WebSocketImpl = WebSocket,
   cleanupTimeoutMs = CLEANUP_TIMEOUT_MS,
@@ -630,6 +695,12 @@ export async function runSynthetic({
   const syntheticOrigin = parseOrigin(origin, base.origin);
   const cleanupTimeout = positiveInteger(cleanupTimeoutMs, 'cleanupTimeoutMs', CLEANUP_TIMEOUT_MS, 120_000);
   const cleanupPoll = positiveInteger(cleanupPollMs, 'cleanupPollMs', CLEANUP_POLL_MS, 60_000);
+  const createRequestTimeout = positiveInteger(
+    createRequestTimeoutMs,
+    'createRequestTimeoutMs',
+    requestTimeoutMs,
+    60_000,
+  );
   const deadline = Date.now() + timeoutMs;
 
   if (dryRun) {
@@ -640,7 +711,14 @@ export async function runSynthetic({
 
   if (typeof fetchImpl !== 'function') throw new SyntheticError('fetch is not available');
 
-  const client = makeClient({ base, env, fetchImpl, deadline, requestTimeoutMs });
+  const client = makeClient({
+    base,
+    env,
+    fetchImpl,
+    deadline,
+    requestTimeoutMs,
+    createRequestTimeoutMs: createRequestTimeout,
+  });
   const startedAt = Date.now();
   let roomID = null;
   const roomIDs = new Set();
@@ -655,24 +733,32 @@ export async function runSynthetic({
   };
 
   try {
-    const homepage = await getText(client, '/', 'homepage');
-    validateHomepage(homepage);
+    await atStage('homepage', async () => {
+      const homepage = await getText(client, '/', 'homepage');
+      validateHomepage(homepage);
+    });
 
-    const health = (await getText(client, '/health', 'health')).trim();
-    if (health !== 'ok') throw new SyntheticError('health returned an unexpected body');
+    await atStage('health', async () => {
+      const health = (await getText(client, '/health', 'health')).trim();
+      if (health !== 'ok') throw new SyntheticError('health returned an unexpected body', { code: 'unexpected_body' });
+    });
 
-    await getRooms(client);
+    await atStage('room-list', () => getRooms(client));
 
     roomName = `synthetic-${Date.now().toString(36)}-${randomUUID().slice(0, 8)}`;
-    const room = await createRoom(client, roomName, rememberRoom);
-    // Preserve a valid identifier before checking the rest of the response so
-    // a malformed status/players field cannot strand a successfully-created
-    // room.
-    rememberRoom(room);
-    validateRoom(room);
+    const room = await atStage('room-create', async () => {
+      const created = await createRoom(client, roomName, rememberRoom);
+      // Preserve a valid identifier before checking the rest of the response
+      // so a malformed response cannot strand a successfully-created room.
+      rememberRoom(created);
+      validateRoom(created);
+      return created;
+    });
 
-    const joined = await postJSON(client, '/api/rooms/join', { room_id: roomID }, 'room join');
-    validateJoin(joined, roomID);
+    await atStage('room-join', async () => {
+      const joined = await postJSON(client, '/api/rooms/join', { room_id: roomID }, 'room join');
+      validateJoin(joined, roomID);
+    });
 
     const wsURL = websocketURL(endpoint(base, `/rooms/${roomID}/ws`));
     const playerOptions = {
@@ -682,13 +768,17 @@ export async function runSynthetic({
       requestTimeoutMs,
       WebSocketImpl,
     };
-    sockets.push(openPlayer(wsURL, playerOptions));
-    sockets.push(openPlayer(wsURL, playerOptions));
-    const assignments = await Promise.all(sockets.map((player) => player.ready));
-    const players = new Set(assignments.map(({ player }) => player));
-    if (players.size !== 2 || !players.has(1) || !players.has(2)) {
-      throw new SyntheticError('WebSocket-compatible journey did not assign one Player 1 and one Player 2');
-    }
+    await atStage('websocket-assignment', async () => {
+      sockets.push(openPlayer(wsURL, playerOptions));
+      sockets.push(openPlayer(wsURL, playerOptions));
+      const assignments = await Promise.all(sockets.map((player) => player.ready));
+      const players = new Set(assignments.map(({ player }) => player));
+      if (players.size !== 2 || !players.has(1) || !players.has(2)) {
+        throw new SyntheticError('WebSocket-compatible journey did not assign one Player 1 and one Player 2', {
+          code: 'duplicate_assignment',
+        });
+      }
+    });
   } catch (error) {
     primaryError = safeError(error, 'synthetic journey failed');
   } finally {
@@ -719,22 +809,40 @@ export async function runSynthetic({
       try {
         await waitForCleanup(client, id, cleanupTimeout, cleanupPoll);
       } catch (error) {
+        const failure = stageError(error, 'cleanup', 'cleanup_failed');
         cleanupError = cleanupError
-          ? new SyntheticError(`${cleanupError.message}; ${safeError(error, 'room cleanup verification failed').message}`)
-          : safeError(error, 'room cleanup verification failed');
+          ? new SyntheticError('room cleanup verification failed', {
+            stage: 'cleanup',
+            code: 'cleanup_failed',
+            cause: failure,
+          })
+          : failure;
       }
     }
   }
 
-  if (primaryError && cleanupError) {
-    throw new SyntheticError(`${primaryError.message}; ${cleanupError.message}`);
-  }
-  if (primaryError) throw primaryError;
-  if (cleanupError) throw cleanupError;
-
   const durationMs = Date.now() - startedAt;
+  const result = journeyResult({
+    good: !primaryError && !cleanupError,
+    durationMs,
+    error: primaryError || cleanupError,
+    cleanupError,
+  });
+  if (primaryError && cleanupError) {
+    primaryError.message = `${primaryError.message}; cleanup verification failed`;
+  }
+  if (primaryError) {
+    primaryError.result = result;
+    throw primaryError;
+  }
+  if (cleanupError) {
+    cleanupError.result = result;
+    throw cleanupError;
+  }
+
   console.log(`synthetic passed: homepage, health, room CRUD, two-player WebSocket-compatible state, and cleanup (${durationMs}ms)`);
-  return { dryRun: false, durationMs };
+  console.log(`synthetic_result ${JSON.stringify(result)}`);
+  return { dryRun: false, durationMs: result.duration_ms, ...result };
 }
 
 export async function main(argv = process.argv.slice(2), env = process.env) {
@@ -758,7 +866,10 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
       // fail closed when its required evidence file is absent.
     }
     const message = error instanceof SyntheticError ? error.message : 'synthetic check failed';
-    console.error(`synthetic failed: ${message}`);
+    const stage = error instanceof SyntheticError && error.stage ? ` stage=${error.stage}` : '';
+    const code = error instanceof SyntheticError && error.code ? ` code=${boundedFailureCode(error)}` : '';
+    console.error(`synthetic failed${stage}${code}: ${message}`);
+    if (error?.result) console.log(`synthetic_result ${JSON.stringify(error.result)}`);
     return 1;
   }
 }

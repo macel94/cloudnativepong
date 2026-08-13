@@ -68,6 +68,51 @@ func NewRegistry() *Registry {
 	}
 }
 
+// RegisterCounter reserves a fixed-name counter without incrementing it. This
+// makes canonical zero-valued series visible to private scrapers at startup.
+func (r *Registry) RegisterCounter(name string) {
+	if !validName(name) {
+		return
+	}
+	r.mu.Lock()
+	if _, exists := r.counters[name]; exists {
+		r.mu.Unlock()
+		return
+	}
+	if _, exists := r.gauges[name]; exists {
+		r.mu.Unlock()
+		return
+	}
+	if _, exists := r.histograms[name]; exists || !r.ensureNameLocked(name) {
+		r.mu.Unlock()
+		return
+	}
+	r.counters[name] = 0
+	r.mu.Unlock()
+}
+
+// RegisterGauge reserves a fixed-name gauge without changing its value.
+func (r *Registry) RegisterGauge(name string) {
+	if !validName(name) {
+		return
+	}
+	r.mu.Lock()
+	if _, exists := r.gauges[name]; exists {
+		r.mu.Unlock()
+		return
+	}
+	if _, exists := r.counters[name]; exists {
+		r.mu.Unlock()
+		return
+	}
+	if _, exists := r.histograms[name]; exists || !r.ensureNameLocked(name) {
+		r.mu.Unlock()
+		return
+	}
+	r.gauges[name] = 0
+	r.mu.Unlock()
+}
+
 // Inc increments a fixed-name counter. Unknown names are accepted to keep the
 // contract extensible; callers must still use bounded, code-defined names.
 func (r *Registry) Inc(name string) {
@@ -75,7 +120,11 @@ func (r *Registry) Inc(name string) {
 		return
 	}
 	r.mu.Lock()
-	if !r.ensureNameLocked(name) {
+	if _, exists := r.gauges[name]; exists {
+		r.mu.Unlock()
+		return
+	}
+	if _, exists := r.histograms[name]; exists || !r.ensureNameLocked(name) {
 		r.mu.Unlock()
 		return
 	}
@@ -89,7 +138,11 @@ func (r *Registry) AddGauge(name string, delta int64) {
 		return
 	}
 	r.mu.Lock()
-	if !r.ensureNameLocked(name) {
+	if _, exists := r.counters[name]; exists {
+		r.mu.Unlock()
+		return
+	}
+	if _, exists := r.histograms[name]; exists || !r.ensureNameLocked(name) {
 		r.mu.Unlock()
 		return
 	}
@@ -103,11 +156,29 @@ func (r *Registry) SetGauge(name string, value int64) {
 		return
 	}
 	r.mu.Lock()
-	if !r.ensureNameLocked(name) {
+	if _, exists := r.counters[name]; exists {
+		r.mu.Unlock()
+		return
+	}
+	if _, exists := r.histograms[name]; exists || !r.ensureNameLocked(name) {
 		r.mu.Unlock()
 		return
 	}
 	r.gauges[name] = value
+	r.mu.Unlock()
+}
+
+// RegisterDuration reserves an aggregate duration family with zero values.
+// It is safe to call repeatedly and keeps canonical series visible before the
+// first observation.
+func (r *Registry) RegisterDuration(name string) {
+	if !validName(name) {
+		return
+	}
+	r.mu.Lock()
+	if _, ok := r.histograms[name]; !ok && r.reserveHistogramLocked(name) {
+		// reserveHistogramLocked creates the zero-valued family.
+	}
 	r.mu.Unlock()
 }
 

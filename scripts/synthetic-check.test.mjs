@@ -34,6 +34,7 @@ async function startFixture({
   retainRooms = false,
   createResponseDelayMs = 0,
   transientCreateFailures = 0,
+  malformedJoin = false,
 } = {}) {
   const prefix = '/pong/';
   const rooms = new Map();
@@ -83,6 +84,10 @@ async function startFixture({
     }
     if (request.method === 'POST' && path === '/api/rooms/join') {
       const body = await readJSON(request);
+      if (malformedJoin) {
+        json(response, 200, { room_id: 'wrong', ws_path: '/rooms/wrong/ws' });
+        return;
+      }
       if (!rooms.has(body.room_id)) {
         json(response, 404, { error: 'room not found' });
         return;
@@ -183,6 +188,31 @@ test('the complete fixture journey validates HTTP, two players, and cleanup', as
 
   assert.equal(result.dryRun, false);
   assert.ok(result.durationMs >= 0);
+  assert.equal(result.contract_version, 'belacca.pong-slo-journey-result.v1');
+  assert.deepEqual(
+    { total: result.total, good: result.good, failed: result.failed, failure_stage: result.failure_stage, failure_code: result.failure_code },
+    { total: 1, good: 1, failed: 0, failure_stage: null, failure_code: null },
+  );
+  assert.equal(fixture.rooms.size, 0);
+});
+
+test('classifies a primary journey failure with bounded stage evidence', async (t) => {
+  const fixture = await startFixture({ malformedJoin: true });
+  t.after(() => fixture.close());
+
+  await assert.rejects(
+    runSynthetic({
+      baseURL: fixture.baseURL,
+      timeoutMs: 5_000,
+      requestTimeoutMs: 1_000,
+      cleanupTimeoutMs: 2_000,
+      cleanupPollMs: 10,
+    }),
+    (error) => error instanceof SyntheticError &&
+      error.result?.failure_stage === 'room-join' &&
+      error.result.failure_code === 'failed' &&
+      error.result.total === 1 && error.result.good === 0 && error.result.failed === 1,
+  );
   assert.equal(fixture.rooms.size, 0);
 });
 
@@ -193,7 +223,8 @@ test('recovers a room when create is accepted before its response times out', as
   const result = await runSynthetic({
     baseURL: fixture.baseURL,
     timeoutMs: 5_000,
-    requestTimeoutMs: 250,
+    requestTimeoutMs: 1_000,
+    createRequestTimeoutMs: 100,
     cleanupTimeoutMs: 2_000,
     cleanupPollMs: 10,
   });
@@ -230,7 +261,10 @@ test('cleanup verification is a hard failure when a room remains', async (t) => 
       cleanupTimeoutMs: 100,
       cleanupPollMs: 10,
     }),
-    (error) => error instanceof SyntheticError && /synthetic check exceeded its overall timeout/u.test(error.message),
+    (error) => error instanceof SyntheticError &&
+      error.result?.total === 1 && error.result.good === 0 &&
+      error.result.failure_stage === 'cleanup' && error.result.failure_code === 'cleanup_failed' &&
+      /synthetic check exceeded its overall timeout/u.test(error.message),
   );
   assert.equal(fixture.rooms.size, 1);
 });
