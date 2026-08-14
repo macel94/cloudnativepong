@@ -302,12 +302,15 @@ skip. It is not a substitute for separately managed alerting or paging.
 
 ## SQLite backup and isolated restore rehearsal
 
-The only application state is `/data/pong.db` on PVC `pong-api-data`; no S3,
-GCS, bucket, snapshot controller, retention policy, encryption key, or
-off-cluster backup destination is configured here. The names-only future
-object-storage contract is maintained in
-`belacca-gitops/docs/BACKUP-CONTRACT.md`; it is an external prerequisite, not a
-provisioned service. `scripts/backup-restore.py` uses SQLite's online backup
+The only application state is `/data/pong.db` on PVC `pong-api-data`. This
+application repository does not create or configure object storage, but the
+platform has a reliable immutable AWS S3 backup destination provisioned out of
+band with Object Lock, SSE-KMS, scoped identities, and a monthly spend guard.
+The platform contract is maintained in
+`belacca-gitops/docs/BACKUP-CONTRACT.md`. Synthetic upload, restore-integrity,
+encryption, and permission checks have passed; production automation remains
+fail-closed until an approved quiesced source procedure, live upload/download,
+retention history, isolated restore rehearsal, and notification evidence exist. `scripts/backup-restore.py` uses SQLite's online backup
 API, verifies `PRAGMA integrity_check`, and restores only into a temporary
 directory. Run the self-test and verify a protected local artifact before
 relying on it:

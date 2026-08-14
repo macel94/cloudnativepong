@@ -374,11 +374,15 @@ failure, not as permission to fall back to a mutable tag.
 
 ### SQLite backup and restore verification
 
-`pong-api` owns `/data/pong.db` on the `pong-api-data` PVC. There is currently
-no configured object-storage bucket, off-cluster backup service, retention
-policy, encryption key, or scheduled backup Job. `scripts/backup-restore.py`
-creates a local operator artifact and verifies it in a temporary directory;
-it does not upload data or modify the live PVC. The opt-in
+`pong-api` owns `/data/pong.db` on the `pong-api-data` PVC. The platform has a
+reliable immutable AWS S3 backup destination provisioned out of band; this
+application repository deliberately does not upload data or modify the live
+PVC. Synthetic upload, restore-integrity, encryption, and permission checks
+have passed. The scheduled production backup Job remains fail-closed until an
+approved quiesced source procedure, live upload/download, retention history,
+isolated restore rehearsal, and notification evidence exist.
+`scripts/backup-restore.py` creates a local operator artifact and verifies it in
+a temporary directory. The opt-in
 `scripts/restore-rehearsal.sh` can seed a copied, verified artifact into a newly
 created `pong-restore-*` k3d cluster and check the restored API through its
 isolated gateway. It refuses `k3d-pong`/`pong` and requires an explicit
