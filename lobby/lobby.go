@@ -812,15 +812,18 @@ func (s *Server) createK8sPod(roomID string) (string, error) {
 					"ports": []map[string]interface{}{
 						{"containerPort": 8080},
 					},
+					"startupProbe": map[string]interface{}{
+						"httpGet":          map[string]interface{}{"path": "/health", "port": 8080},
+						"failureThreshold": 30,
+						"periodSeconds":    2,
+					},
 					"readinessProbe": map[string]interface{}{
-						"httpGet":             map[string]interface{}{"path": "/health", "port": 8080},
-						"initialDelaySeconds": 1,
-						"periodSeconds":       5,
+						"httpGet":       map[string]interface{}{"path": "/health", "port": 8080},
+						"periodSeconds": 5,
 					},
 					"livenessProbe": map[string]interface{}{
-						"httpGet":             map[string]interface{}{"path": "/health", "port": 8080},
-						"initialDelaySeconds": 5,
-						"periodSeconds":       10,
+						"httpGet":       map[string]interface{}{"path": "/health", "port": 8080},
+						"periodSeconds": 10,
 					},
 					"securityContext": map[string]interface{}{
 						"allowPrivilegeEscalation": false,

@@ -482,6 +482,19 @@ data:
             "ports": [
               { "containerPort": 8080 }
             ],
+            "startupProbe": {
+              "httpGet": { "path": "/health", "port": 8080 },
+              "failureThreshold": 30,
+              "periodSeconds": 2
+            },
+            "readinessProbe": {
+              "httpGet": { "path": "/health", "port": 8080 },
+              "periodSeconds": 5
+            },
+            "livenessProbe": {
+              "httpGet": { "path": "/health", "port": 8080 },
+              "periodSeconds": 10
+            },
             "resources": {
               "requests": {
                 "cpu": "50m",
