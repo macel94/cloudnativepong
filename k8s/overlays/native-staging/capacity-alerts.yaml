@@ -32,12 +32,12 @@ spec:
             summary: Pong room quota headroom is below 20 percent
             description: Active rooms exceed the review threshold derived from the pod/service quota.
         - alert: PongAPIResourcePressure
-          expr: (sum by (namespace, pod, container) (rate(container_cpu_usage_seconds_total{namespace="pong", pod=~"pong-api-.*", container="api"}[5m])) / on (namespace, pod, container) kube_pod_container_resource_limits{namespace="pong", pod=~"pong-api-.*", container="api", resource="cpu", unit="core"}) > 0.8 or (container_memory_working_set_bytes{namespace="pong", pod=~"pong-api-.*", container="api"} / on (namespace, pod, container) kube_pod_container_resource_limits{namespace="pong", pod=~"pong-api-.*", container="api", resource="memory", unit="byte"}) > 0.8
+          expr: (sum by (namespace, pod, container) (rate(container_cpu_usage_seconds_total{namespace="pong", pod=~"pong-api-.*", container="api"}[5m])) / on (namespace, pod, container) kube_pod_container_resource_requests{namespace="pong", pod=~"pong-api-.*", container="api", resource="cpu", unit="core"}) > 0.8 or (container_memory_working_set_bytes{namespace="pong", pod=~"pong-api-.*", container="api"} / on (namespace, pod, container) kube_pod_container_resource_limits{namespace="pong", pod=~"pong-api-.*", container="api", resource="memory", unit="byte"}) > 0.8
           for: 10m
           labels: { severity: warning }
           annotations:
             summary: Pong API resource headroom is below 20 percent
-            description: The single SQLite writer is near its configured CPU or memory limit; do not scale API replicas horizontally.
+            description: The single SQLite writer is above its configured CPU request or near its memory limit; do not scale API replicas horizontally.
         - alert: PongSQLiteFailures
           expr: increase(pong_sqlite_create_failure_total[5m]) + increase(pong_sqlite_get_failure_total[5m]) + increase(pong_sqlite_list_failure_total[5m]) + increase(pong_sqlite_increment_players_failure_total[5m]) + increase(pong_sqlite_delete_failure_total[5m]) > 0
           for: 5m

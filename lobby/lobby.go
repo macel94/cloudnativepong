@@ -839,7 +839,6 @@ func (s *Server) createK8sPod(roomID string) (string, error) {
 							"memory": "32Mi",
 						},
 						"limits": map[string]string{
-							"cpu":    "200m",
 							"memory": "64Mi",
 						},
 					},

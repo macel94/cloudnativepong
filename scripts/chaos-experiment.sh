@@ -145,7 +145,7 @@ for run in $(seq 1 "$RUNS"); do
     resource-pressure)
       PRESSURE_POD="chaos-pressure-$run"
       kubectl -n "$NAMESPACE" run "$PRESSURE_POD" --image=busybox:1.36 --restart=Never \
-        --limits='cpu=100m,memory=32Mi' --requests='cpu=50m,memory=16Mi' \
+        --limits='memory=32Mi' --requests='cpu=50m,memory=16Mi' \
         -- sh -c 'i=0; while [ "$i" -lt 600 ]; do i=$((i+1)); :; done; sleep 20' || scenario_status=1
       if [[ "$scenario_status" -eq 0 ]]; then
         sleep 2

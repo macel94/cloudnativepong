@@ -66,7 +66,6 @@ spec:
               cpu: 50m
               memory: 16Mi
             limits:
-              cpu: 200m
               memory: 32Mi
           startupProbe:
             httpGet:
@@ -160,7 +159,6 @@ spec:
               cpu: 10m
               memory: 8Mi
             limits:
-              cpu: 100m
               memory: 16Mi
           startupProbe:
             httpGet:
@@ -308,7 +306,6 @@ spec:
               cpu: 50m
               memory: 32Mi
             limits:
-              cpu: 200m
               memory: 64Mi
           startupProbe:
             httpGet:
@@ -501,7 +498,6 @@ data:
                 "memory": "32Mi"
               },
               "limits": {
-                "cpu": "200m",
                 "memory": "64Mi"
               }
             },

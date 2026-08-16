@@ -21,11 +21,11 @@
     },
     "api_resources": {
       "requests": { "cpu": "50m", "memory": "64Mi" },
-      "limits": { "cpu": "200m", "memory": "128Mi" }
+      "limits": { "memory": "128Mi" }
     },
     "room_resources": {
       "requests": { "cpu": "50m", "memory": "32Mi" },
-      "limits": { "cpu": "200m", "memory": "64Mi" }
+      "limits": { "memory": "64Mi" }
     }
   },
   "admission": {
@@ -52,12 +52,12 @@
   "signals": {
     "first_expected_overload_signal": "pong_admission_websocket_rejected or pong_admission_http_rejected",
     "resource_saturation_signals": [
-      "API CPU near its 200m limit with rising pong_http_request_duration_seconds",
+      "API CPU saturation with rising pong_http_request_duration_seconds",
       "API memory near its 128Mi limit",
       "SQLite operation failures or rising room create/join latency",
       "pod/service quota admission failures",
-      "room pod CPU or memory near its 200m/64Mi limit",
-      "gateway CPU near its 200m limit or WebSocket failures"
+      "room pod CPU usage or memory near its 64Mi limit",
+      "gateway CPU usage or WebSocket failures"
     ],
     "required_evidence": [
       "aggregate load-smoke operation latency and error counts",
