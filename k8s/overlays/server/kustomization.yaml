@@ -12,16 +12,16 @@ resources:
 images:
   - name: cloudnativepong-api
     newName: ghcr.io/macel94/cloudnativepong-api
-    digest: sha256:63f5b0233a9461098f89064941a2d084a48343abd159fc5e6753cc74a5483ed4
+    digest: sha256:613b748878292ccffb4abc0643dc5a9965806046e40d3c4ffa8c2134fde07bec
   - name: cloudnativepong-room
     newName: ghcr.io/macel94/cloudnativepong-room
-    digest: sha256:f4c1e604d606fac6a15849baa1c0b67f7355d50639f8081cdfd94d201cf570d0
+    digest: sha256:0a724a14d55d3a6cfa0be4b2981bdc4f2392828dff6d4fcc2c64a705591a8c3e
   - name: cloudnativepong-static
     newName: ghcr.io/macel94/cloudnativepong-static
-    digest: sha256:7d548a288bccc900f1b2c5ef4c95487689371f0381c1ca09b7ebfb671255d78c
+    digest: sha256:e3c15ff8965de72350755d12c9248a8ab100537585f7b90304fe4d3a5f019896
   - name: cloudnativepong-gateway
     newName: ghcr.io/macel94/cloudnativepong-gateway
-    digest: sha256:9c7e4b55c24476a2281f4c278486ed2116339cb00ecf870e6dddc1ac99821150
+    digest: sha256:d28b89a87275ea6e713e5aef5e114534fc17264a73e8037b329a6aa7d2166ba6
 
 patches:
   - path: deployment-pull-policy.yaml
