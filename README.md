@@ -585,6 +585,7 @@ isolated benchmark artifact.
 ├── db/                  # SQLite database layer
 ├── static/              # Frontend (HTML, CSS, vanilla JS)
 │   ├── build-info.js     # Compile-time source SHA marker
+│   ├── pong-favicon.png  # Opaque browser-tab favicon
 │   └── Caddyfile         # Caddy config for static pod
 ├── gateway/             # Gateway config
 │   └── Caddyfile         # Caddy routing and WebSocket upgrade rules

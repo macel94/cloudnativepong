@@ -19,22 +19,18 @@ test.describe('Lobby', () => {
   test('loads browser-compatible favicon assets', async ({ page, request }) => {
     for (const path of ['/', '/game.html?room=test&name=TestPlayer']) {
       await page.goto(path);
-      await expect(page.locator('link[rel="icon"][href="/favicon.svg"]')).toHaveAttribute('type', 'image/svg+xml');
-      await expect(page.locator('link[rel="icon"][href="/favicon.ico"]')).toHaveAttribute('type', 'image/x-icon');
+      await expect(page.locator('link[rel="icon"]')).toHaveCount(1);
+      await expect(page.locator('link[rel="icon"][href="/pong-favicon.png"]')).toHaveAttribute('type', 'image/png');
+      await expect(page.locator('link[rel="icon"][href="/pong-favicon.png"]')).toHaveAttribute('sizes', '32x32');
     }
 
-    const svgResponse = await request.get('/favicon.svg');
-    expect(svgResponse.ok()).toBeTruthy();
-    expect(svgResponse.headers()['content-type']).toMatch(/^image\/svg\+xml/u);
-    expect((await svgResponse.text()).trimStart()).toMatch(/^<svg[ >]/u);
-
-    const icoResponse = await request.get('/favicon.ico');
-    expect(icoResponse.ok()).toBeTruthy();
-    expect(icoResponse.headers()['content-type']).toMatch(/^image\//u);
-    const ico = await icoResponse.body();
-    expect(ico.readUInt16LE(0)).toBe(0);
-    expect(ico.readUInt16LE(2)).toBe(1);
-    expect(ico.readUInt16LE(4)).toBe(3);
+    const pngResponse = await request.get('/pong-favicon.png');
+    expect(pngResponse.ok()).toBeTruthy();
+    expect(pngResponse.headers()['content-type']).toMatch(/^image\/png/u);
+    const png = await pngResponse.body();
+    expect(png.subarray(0, 8)).toEqual(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+    expect(png.readUInt32BE(16)).toBe(32);
+    expect(png.readUInt32BE(20)).toBe(32);
   });
 
   test('shows the production build link', async ({ page }) => {
