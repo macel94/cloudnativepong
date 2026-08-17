@@ -1,5 +1,8 @@
 # 🏓 Cloud Native Pong
 
+The canonical cross-repository GitOps delivery and commit-routing guide is
+[`belacca-platform/docs/gitops-delivery.md`](https://github.com/macel94/belacca-platform/blob/main/docs/gitops-delivery.md).
+
 A minimalist, horizontally-scalable PONG game running on Kubernetes. Each game room is a dedicated pod — demonstrating the power of cloud-native architecture with near-zero overhead.
 
 ## ✨ Features
@@ -235,8 +238,8 @@ repository is one independently reconciled application source.
    immediate sync when needed:
 
    ```bash
-   flux reconcile source git flux-system -n flux-system
-   flux reconcile kustomization flux-system -n flux-system --with-source
+   flux reconcile source git cloudnativepong -n flux-system
+   flux reconcile kustomization pong -n flux-system
    flux get sources git -A
    flux get kustomizations -A
    ```
@@ -245,6 +248,17 @@ The Flux source and kustomization should both report `Ready=True` after a
 successful deployment. The platform repository owns the generated Flux
 bootstrap manifests and old-production root; application manifests and
 environment patches for Pong are under `k8s/overlays/server/`.
+
+There are deliberately two commits in a production release: the reviewed
+source commit, followed by the workflow-generated `deploy: publish images ...`
+commit that records immutable image tags/digests in both overlays. Flux normally
+reports the generated commit, while the running image tag identifies the source
+commit. Do not stop at a successful image publish; verify the generated commit,
+Flux revisions, all affected Deployment image digests, rollout health, and the
+external two-player journey. Only after the child remote has converged should
+the parent `belacca-platform` submodule pointer be updated for workspace
+bookkeeping. `Signature: none` on the child Flux source is expected until
+`spec.verify` and signed-commit key distribution are deliberately configured.
 
 ### Kubernetes dashboards and administrative access
 

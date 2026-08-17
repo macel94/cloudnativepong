@@ -62,7 +62,7 @@ repository as an independent child source:
 - Flux application path: `./k8s/overlays/native-staging` (native production;
   the historical `./k8s/overlays/server` path is retained for compatibility/audit)
 - Source refresh interval: 1 minute
-- Application reconciliation interval: 10 minutes (force it for immediate validation with `flux reconcile kustomization pong -n flux-system --with-source`)
+- Application reconciliation interval: 10 minutes (force an immediate validation with `flux reconcile source git cloudnativepong -n flux-system` followed by `flux reconcile kustomization pong -n flux-system`)
 
 The Flux controllers are `source-controller`, `kustomize-controller`,
 `helm-controller`, and `notification-controller`. The platform repository owns
@@ -200,8 +200,8 @@ public `k3d-pong` cluster as a repeated experiment sandbox.
    `main`; after the merge, wait for the image workflow's generated deployment
    commit, then force reconciliation if needed:
    ```bash
-   flux reconcile source git flux-system -n flux-system
-   flux reconcile kustomization flux-system -n flux-system --with-source
+   flux reconcile source git cloudnativepong -n flux-system
+   flux reconcile kustomization pong -n flux-system
    kubectl -n pong rollout status deployment/pong-api
    kubectl -n pong rollout status deployment/pong-gateway
    kubectl -n pong rollout status deployment/pong-static
