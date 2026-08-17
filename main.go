@@ -807,7 +807,9 @@ func handleSpectatorConnection(conn gameConnection, room *localRoom, transport s
 }
 
 func streamRoomStates(conn gameConnection, room *localRoom, transport string, finishRoom bool, roomID string) {
-	ticker := time.NewTicker(game.TickDuration)
+	// The engine still advances at 60 Hz, but a 30 Hz snapshot stream is enough
+	// for the browser's display-time extrapolation and halves JSON/proxy writes.
+	ticker := time.NewTicker(game.StateBroadcastInterval)
 	defer ticker.Stop()
 	for range ticker.C {
 		state := room.engine.State()

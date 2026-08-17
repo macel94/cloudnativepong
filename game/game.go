@@ -31,8 +31,16 @@ const (
 	MaxBallSpeed  = 0.025
 )
 
-// TickDuration is the game loop interval.
+// TickDuration is the authoritative simulation interval. Keep physics at 60 Hz
+// so collision and input timing stay deterministic even when network delivery
+// is slower or bursty.
 const TickDuration = 16 * time.Millisecond // ~60 FPS
+
+// StateBroadcastInterval is the browser snapshot cadence. It deliberately runs
+// below the simulation rate: clients render between authoritative snapshots,
+// while reducing JSON/proxy work leaves more room for multiple players and
+// spectators without changing the authoritative game speed.
+const StateBroadcastInterval = 33 * time.Millisecond // ~30 FPS
 
 // Ball holds the ball state.
 type Ball struct {

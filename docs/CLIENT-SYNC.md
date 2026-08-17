@@ -15,9 +15,14 @@ The room engine is the source of truth for:
 - ready, playing, and finished status; and
 - the winner.
 
-The engine advances on its fixed `game.TickDuration` (currently 16 ms). It
-accepts paddle **intent** (`up`/`down`), never a client-supplied position. A
-client cannot move a paddle, ball, or score by sending a fabricated coordinate.
+The engine advances on its fixed `game.TickDuration` (currently 16 ms, about
+60 Hz). Authoritative physics stays at this rate so collisions and input timing
+do not depend on network delivery. The browser snapshot stream is intentionally
+slower (`StateBroadcastInterval`, currently 33 ms/about 30 Hz), which halves
+JSON and proxy writes while the display loop fills in the motion between
+snapshots. It accepts paddle **intent** (`up`/`down`), never a client-supplied
+position. A client cannot move a paddle, ball, or score by sending a fabricated
+coordinate.
 
 The browser-facing room connection sends authoritative snapshots and accepts
 input over both WebSocket and the optional WebTransport stream. Both
@@ -55,8 +60,10 @@ to roll the input state backward.
 
 ## Browser presentation
 
-The browser does not render directly from the arrival of a server tick.
+The browser does not render directly from the arrival of a server snapshot.
 `requestAnimationFrame` owns drawing and continues at the display's cadence.
+Player input intent is sent at about 30 Hz; the server holds the newest intent
+and applies it on each 60 Hz simulation tick.
 
 - **Local paddle:** client-side predicted. The current held input is applied
   immediately on animation frames, independently of state delivery. When a
@@ -78,8 +85,10 @@ The browser does not render directly from the arrival of a server tick.
 
 The result is that all visible entities continue moving on the display frame
 clock, while authoritative snapshots periodically correct the presentation.
-This removes the deliberate tick/network delay without changing the
-authoritative outcome.
+Online extrapolation is capped at 100 ms, so a delayed connection cannot let a
+display-only ball run indefinitely beyond an authoritative collision. This
+removes the deliberate tick/network delay without changing the authoritative
+outcome.
 
 ## Reconciliation and boundaries
 
@@ -88,6 +97,7 @@ Prediction is intentionally conservative:
 - paddle positions are clamped to the same normalized bounds as the server;
 - pending input acknowledgements are bounded in memory;
 - correction is eased rather than allowed to accumulate indefinitely;
+- online extrapolation is capped at 100 ms;
 - the latest server snapshot can always correct a client prediction; and
 - prediction stops affecting authoritative state when the connection closes or
   the server reports a finished game.

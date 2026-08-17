@@ -1,6 +1,18 @@
 package game
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
+
+func TestStateBroadcastIsSlowerThanAuthoritativeSimulation(t *testing.T) {
+	if StateBroadcastInterval <= TickDuration {
+		t.Fatalf("state broadcast interval = %s, want slower than simulation tick %s", StateBroadcastInterval, TickDuration)
+	}
+	if StateBroadcastInterval > 50*time.Millisecond {
+		t.Fatalf("state broadcast interval = %s, want no more than 20 FPS latency", StateBroadcastInterval)
+	}
+}
 
 func TestApplyInputRejectsOutOfOrderSequences(t *testing.T) {
 	engine := NewEngine()

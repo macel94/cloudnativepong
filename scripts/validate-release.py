@@ -20,6 +20,7 @@ ROOM_TEMPLATES = [
     ROOT / "k8s" / "overlays" / name / "room-template.yaml"
     for name in OVERLAY_NAMES
 ]
+K8S_ROOT = ROOT / "k8s"
 API_PATCHES = [
     ROOT / "k8s" / "overlays" / name / api_file
     for name, api_file in (
@@ -130,6 +131,57 @@ def embedded_template_image(text: str, overlay_name: str) -> str:
 def expected_image_ref(component: str, mode: str, value: str) -> str:
     name = IMAGE_PREFIX + component
     return f"{name}:{value}" if mode == "tag" else f"{name}@{value}"
+
+
+def has_cpu_limit(text: str) -> bool:
+    """Detect YAML or embedded room-template JSON CPU limits.
+
+    CPU requests remain intentional: they affect scheduling and HPA
+    utilization. CPU limits are not allowed because they impose a hard cgroup
+    throttle even when node CPU is available. This small structural check is
+    dependency-free and covers the YAML and JSON shapes used by the manifests.
+    """
+
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        stripped = line.strip().lower()
+        if re.search(r"limits\.cpu\s*:", stripped):
+            return True
+        if re.search(r"['\"]?limits['\"]?\s*:\s*\{", stripped):
+            block = stripped
+            for following in lines[index + 1 : index + 8]:
+                block += " " + following.strip().lower()
+                if "}" in following:
+                    break
+            if re.search(r"['\"]?cpu['\"]?\s*:", block):
+                return True
+        if stripped == "limits:":
+            indent = len(line) - len(line.lstrip())
+            for following in lines[index + 1 :]:
+                if not following.strip():
+                    continue
+                following_indent = len(following) - len(following.lstrip())
+                if following_indent <= indent:
+                    break
+                if re.match(r"cpu\s*:", following.strip(), re.IGNORECASE):
+                    return True
+    return False
+
+
+def validate_cpu_limit_policy() -> None:
+    """Ensure every generated Pong manifest omits CPU limits permanently."""
+
+    try:
+        paths = sorted(K8S_ROOT.rglob("*.yaml")) + sorted(K8S_ROOT.rglob("*.yml"))
+    except OSError as error:
+        fail(f"could not enumerate Pong Kustomize manifests: {error}")
+    for path in paths:
+        try:
+            text = path.read_text()
+        except OSError as error:
+            fail(f"could not read {path}: {error}")
+        if has_cpu_limit(text):
+            fail(f"Pong Kustomize manifest {path.relative_to(ROOT)} sets a CPU limit")
 
 
 def validate_overlay(
@@ -249,6 +301,7 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
+        validate_cpu_limit_policy()
         release_refs = [
             validate_overlay(name, overlay, room, api)
             for name, overlay, room, api in zip(

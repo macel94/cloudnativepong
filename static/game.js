@@ -48,8 +48,11 @@
     // uses the newest snapshot immediately and dead-reckons between packets;
     // it never intentionally renders 50ms in the past.
     const stateBuffer = [];
-    const maxExtrapolationMs = 120;
-    const correctionDecayMs = 80;
+    // Keep extrapolation shorter than the server's collision horizon. If a
+    // browser or proxy stalls, the next authoritative snapshot wins instead
+    // of allowing a display-only ball to run far past a paddle collision.
+    const maxExtrapolationMs = 100;
+    const correctionDecayMs = 100;
     let presentationCorrection = {
         ball: { x: 0, y: 0 },
         p1: 0,
@@ -72,6 +75,7 @@
     const MAX_BALL_SPEED = 0.025;
     const WIN_SCORE = 7;
     const TICK_MS = 16;
+    const INPUT_SEND_MS = 33;
 
     function setControlHint() {
         if (!controlHint) return;
@@ -280,7 +284,17 @@
         if (message.type === 'state' && message.state && message.state.ball) {
             const state = message.state;
             const receivedAt = performance.now();
-            updatePresentationCorrection(lastRenderedState, state);
+            // Compare the new authoritative sample with where the previous
+            // sample predicted the entities would be at this arrival time.
+            // Comparing two raw positions treats normal motion as error and
+            // creates an artificial backward drift.
+            const previous = stateBuffer.length > 0
+                ? stateBuffer[stateBuffer.length - 1]
+                : null;
+            const previousOlder = stateBuffer.length > 1
+                ? stateBuffer[stateBuffer.length - 2]
+                : null;
+            updatePresentationCorrection(previousOlder, previous, state, receivedAt);
             gameState = state;
             if (!isSpectator) reconcileLocalPaddle(state, receivedAt);
             stateBuffer.push({ state, receivedAt });
@@ -419,9 +433,9 @@
         connectWebSocket();
     }
 
-    // Send input to the authoritative server at approximately 60Hz. The
-    // sequence is an acknowledgement marker, not a movement command: the
-    // server remains authoritative and echoes the latest sequence it applied.
+    // Send input intent at approximately 30Hz. The server holds the newest
+    // intent and applies it on every 60Hz authoritative tick; the sequence is
+    // an acknowledgement marker, not a movement command.
     setInterval(() => {
         if (isAI || isSpectator || !connection || !connection.isOpen() || !player) return;
         const input = readLocalInput();
@@ -429,7 +443,7 @@
         pendingInputs.push({ sequence, sentAt: performance.now() });
         while (pendingInputs.length > 128) pendingInputs.shift();
         connection.send({ player, up: input.up, down: input.down, sequence });
-    }, TICK_MS);
+    }, INPUT_SEND_MS);
 
     function clampPaddle(value) {
         const halfHeight = PADDLE_HEIGHT / 2;
@@ -715,12 +729,32 @@
         return state;
     }
 
-    function updatePresentationCorrection(previous, next) {
+    function predictedPaddleY(older, previous, key, elapsedMs) {
+        if (!older || !previous) return null;
+        const span = previous.receivedAt - older.receivedAt;
+        if (span <= 0) return previous.state[key].y;
+        const velocity = (previous.state[key].y - older.state[key].y) / span;
+        return clampPaddle(previous.state[key].y + velocity * elapsedMs);
+    }
+
+    function updatePresentationCorrection(older, previous, next, receivedAt) {
         if (!previous || !next) return;
-        presentationCorrection.ball.x += previous.ball.x - next.ball.x;
-        presentationCorrection.ball.y += previous.ball.y - next.ball.y;
-        presentationCorrection.p1 += previous.p1.y - next.p1.y;
-        presentationCorrection.p2 += previous.p2.y - next.p2.y;
+        const elapsedMs = Math.max(0, receivedAt - previous.receivedAt);
+        const previousBall = previous.state.ball;
+        const predictedBallX = previousBall.x + previousBall.dx / TICK_MS * elapsedMs;
+        const predictedBallY = reflectBallY(
+            previousBall.y + previousBall.dy / TICK_MS * elapsedMs,
+            previousBall.dy,
+        ).y;
+        presentationCorrection.ball.x += predictedBallX - next.ball.x;
+        presentationCorrection.ball.y += predictedBallY - next.ball.y;
+
+        for (const [key, correctionKey] of [['p1', 'p1'], ['p2', 'p2']]) {
+            const predicted = predictedPaddleY(older, previous, key, elapsedMs);
+            if (predicted !== null) {
+                presentationCorrection[correctionKey] += predicted - next[key].y;
+            }
+        }
         presentationCorrection.ball.x = Math.max(-0.2, Math.min(0.2, presentationCorrection.ball.x));
         presentationCorrection.ball.y = Math.max(-0.2, Math.min(0.2, presentationCorrection.ball.y));
         presentationCorrection.p1 = Math.max(-0.2, Math.min(0.2, presentationCorrection.p1));

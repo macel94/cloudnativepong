@@ -26,6 +26,22 @@ expect_failure() {
 # remains valid across the publication transition.
 run_validator
 
+# CPU limits are forbidden in every generated Pong manifest. This catches a
+# future Kustomize/base/room-template regression even when memory limits remain
+# present and the release references are otherwise valid.
+cat > "$tmp/k8s/overlays/test/cpu-limit-regression.yaml" <<'EOF'
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cpu-limit-regression
+  namespace: pong
+data:
+  pod.json: |-
+    {"spec":{"containers":[{"resources":{"limits":{"cpu":"200m"}}}]}}
+EOF
+expect_failure run_validator --allow-pending-publication
+rm "$tmp/k8s/overlays/test/cpu-limit-regression.yaml"
+
 # Pending publication allows two complete immutable overlays to differ, but it
 # does not allow one overlay to be internally split or malformed.
 reference_kind=$(sed -n -E 's/.*(newTag|digest): .*/\1/p' "$tmp/k8s/overlays/server/kustomization.yaml" | head -n 1)
