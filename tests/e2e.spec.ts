@@ -16,6 +16,27 @@ const LOBBY_URL = '/';
 const PLAYER_NAME = 'TestPlayer';
 
 test.describe('Lobby', () => {
+  test('loads browser-compatible favicon assets', async ({ page, request }) => {
+    for (const path of ['/', '/game.html?room=test&name=TestPlayer']) {
+      await page.goto(path);
+      await expect(page.locator('link[rel="icon"][href="/favicon.svg"]')).toHaveAttribute('type', 'image/svg+xml');
+      await expect(page.locator('link[rel="icon"][href="/favicon.ico"]')).toHaveAttribute('type', 'image/x-icon');
+    }
+
+    const svgResponse = await request.get('/favicon.svg');
+    expect(svgResponse.ok()).toBeTruthy();
+    expect(svgResponse.headers()['content-type']).toMatch(/^image\/svg\+xml/u);
+    expect((await svgResponse.text()).trimStart()).toMatch(/^<svg[ >]/u);
+
+    const icoResponse = await request.get('/favicon.ico');
+    expect(icoResponse.ok()).toBeTruthy();
+    expect(icoResponse.headers()['content-type']).toMatch(/^image\//u);
+    const ico = await icoResponse.body();
+    expect(ico.readUInt16LE(0)).toBe(0);
+    expect(ico.readUInt16LE(2)).toBe(1);
+    expect(ico.readUInt16LE(4)).toBe(3);
+  });
+
   test('shows the production build link', async ({ page }) => {
     await page.goto(LOBBY_URL);
     const build = page.locator('[data-build-version]');
