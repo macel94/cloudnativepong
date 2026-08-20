@@ -155,6 +155,12 @@ Frontend:
   reconnect-token path then reconnects the player. `pong_*_state_write_timeout`
   and `pong_proxy_client_write_timeout` distinguish this recovery path from
   browser rendering or simulation problems.
+- The API WebSocket proxy continuously drains room frames into a bounded
+  outbound queue. Pending `state` frames are coalesced to the newest state,
+  while control frames remain ordered. This prevents browser-side backpressure
+  from propagating into the room pod's authoritative writer; the
+  `pong_proxy_state_coalesced` counter shows when stale states were discarded
+  intentionally rather than delivered late.
 
 A healthy pipe has ~50 Hz state cadence, gap p95 near 25-30 ms, sub-millisecond
 write/relay costs, tiny display corrections (< 0.02 normalized units), and an

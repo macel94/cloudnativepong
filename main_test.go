@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -137,6 +138,54 @@ func TestWriteJSONWithDeadlineLeavesFailedConnectionArmed(t *testing.T) {
 	}
 	if len(conn.deadlines) != 1 || conn.deadlines[0].IsZero() {
 		t.Fatalf("write deadlines = %#v, want only the active deadline after failure", conn.deadlines)
+	}
+}
+
+func TestProxyClientQueueCoalescesStateFrames(t *testing.T) {
+	ready := make(chan struct{})
+	queue := newProxyClientQueue(nil, ready, nil)
+	state := func(x int) []byte {
+		return []byte(fmt.Sprintf(`{"type":"state","state":{"score1":%d}}`, x))
+	}
+	if err := queue.enqueue(websocket.TextMessage, state(1)); err != nil {
+		t.Fatalf("enqueue(state 1) error = %v", err)
+	}
+	if err := queue.enqueue(websocket.TextMessage, state(2)); err != nil {
+		t.Fatalf("enqueue(state 2) error = %v", err)
+	}
+	frame, ok := queue.next()
+	if !ok || string(frame.payload) != string(state(2)) || !frame.isState {
+		t.Fatalf("next frame = %#v, ok=%v; want newest state frame", frame, ok)
+	}
+	queue.close()
+	if _, ok := queue.next(); ok {
+		t.Fatal("queue retained an older coalesced state")
+	}
+}
+
+func TestProxyClientQueuePreservesControlOrdering(t *testing.T) {
+	ready := make(chan struct{})
+	queue := newProxyClientQueue(nil, ready, nil)
+	if err := queue.enqueue(websocket.TextMessage, []byte(`{"type":"state"}`)); err != nil {
+		t.Fatalf("enqueue(state) error = %v", err)
+	}
+	if err := queue.enqueue(websocket.PingMessage, []byte("ping")); err != nil {
+		t.Fatalf("enqueue(ping) error = %v", err)
+	}
+	if err := queue.enqueue(websocket.CloseMessage, []byte("close")); err != nil {
+		t.Fatalf("enqueue(close) error = %v", err)
+	}
+	first, ok := queue.next()
+	if !ok || first.messageType != websocket.PingMessage {
+		t.Fatalf("first frame = %#v, ok=%v; want ping", first, ok)
+	}
+	second, ok := queue.next()
+	if !ok || second.messageType != websocket.CloseMessage {
+		t.Fatalf("second frame = %#v, ok=%v; want close", second, ok)
+	}
+	third, ok := queue.next()
+	if !ok || !third.isState {
+		t.Fatalf("third frame = %#v, ok=%v; want state", third, ok)
 	}
 }
 

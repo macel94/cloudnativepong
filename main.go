@@ -74,6 +74,7 @@ func registerCanonicalMetrics(registry *metrics.Registry) {
 		"pong_room_stream_frame_over_25ms",
 		"pong_proxy_frame_over_25ms",
 		"pong_proxy_relay_over_25ms",
+		"pong_proxy_state_coalesced",
 		"pong_websocket_state_write_timeout",
 		"pong_webtransport_state_write_timeout",
 		"pong_proxy_client_write_timeout",
@@ -1741,64 +1742,57 @@ func proxyRoomWS(w http.ResponseWriter, r *http.Request, lobbySrv *lobby.Server,
 		readyOnce.Do(func() { close(clientReady) })
 	}
 
-	var clientWriteMu sync.Mutex
-	writeClientFrame := func(messageType int, payload []byte) error {
-		<-clientReady
-		clientWriteMu.Lock()
-		defer clientWriteMu.Unlock()
-		if err := clientConn.SetWriteDeadline(time.Now().Add(pongStateWriteTimeout)); err != nil {
-			return err
+	// Realpath diagnostics: this hop relays room-pod frames straight to the
+	// browser, so measure room arrival jitter separately from browser write
+	// cost. The queue callback runs on the single browser writer goroutine;
+	// target-read diagnostics use the same mutex for safe interval summaries.
+	var (
+		diagMu       sync.Mutex
+		lastArrival  time.Time
+		lastDiag     time.Time
+		gaps         diagSampleRing
+		relayTimes   diagSampleRing
+		perFrameDiag = diagPerFrame()
+	)
+	observeRelay := func(frame proxyClientFrame, _ time.Time, relayTime time.Duration) {
+		diagMu.Lock()
+		defer diagMu.Unlock()
+		appMetrics.ObserveDuration("pong_proxy_relay_ms", relayTime)
+		if relayTime > 25*time.Millisecond {
+			appMetrics.Inc("pong_proxy_relay_over_25ms")
 		}
-		err := writeWebSocketFrame(clientConn, messageType, payload)
-		if err != nil {
-			if writeTimedOut(err) {
-				appMetrics.Inc("pong_proxy_client_write_timeout")
-			}
-			return err
+		relayTimes.add(float64(relayTime) / float64(time.Millisecond))
+		if perFrameDiag {
+			log.Printf("[diag] proxy_relay room=%s state=%t queued=%.2fms relay=%.3fms", roomID, frame.isState, time.Since(frame.queuedAt).Seconds()*1000, relayTime.Seconds()*1000)
 		}
-		_ = clientConn.SetWriteDeadline(time.Time{})
-		return nil
 	}
+	clientQueue := newProxyClientQueue(clientConn, clientReady, observeRelay)
 
-	// Gorilla handles control frames from the room connection. Forwarding
-	// them through the same gated writer preserves ordering with data frames.
+	// Gorilla handles control frames from the room connection. Enqueueing them
+	// through the same writer preserves ordering with data frames without
+	// allowing a blocked browser write to stop target.ReadMessage.
 	target.SetPingHandler(func(appData string) error {
-		return writeClientFrame(websocket.PingMessage, []byte(appData))
+		return clientQueue.enqueue(websocket.PingMessage, []byte(appData))
 	})
 	target.SetPongHandler(func(appData string) error {
-		return writeClientFrame(websocket.PongMessage, []byte(appData))
+		return clientQueue.enqueue(websocket.PongMessage, []byte(appData))
 	})
 	target.SetCloseHandler(func(code int, text string) error {
 		closePayload := websocket.FormatCloseMessage(code, text)
 		if err := target.WriteControl(websocket.CloseMessage, closePayload, time.Now().Add(5*time.Second)); err != nil && err != websocket.ErrCloseSent {
 			return err
 		}
-		return writeClientFrame(websocket.CloseMessage, closePayload)
+		return clientQueue.enqueue(websocket.CloseMessage, closePayload)
 	})
 
-	errCh := make(chan error, 2)
+	errCh := make(chan error, 3)
 	go func() {
 		errCh <- relayBrowserToTargetReady(clientBuf, target, signalClientReady)
 	}()
 	go func() {
-		timer := time.NewTimer(500 * time.Millisecond)
-		defer timer.Stop()
-		select {
-		case <-clientReady:
-		case <-timer.C:
-			signalClientReady()
-		}
-
-		// Realpath diagnostics: this hop relays room-pod frames straight to the
-		// browser, so per-frame arrival jitter and copy cost reveal whether the
-		// proxy chain (rather than the engine or browser) is adding lag.
-		var (
-			lastArrival  time.Time
-			lastDiag     time.Time
-			gaps         diagSampleRing
-			relayTimes   diagSampleRing
-			perFrameDiag = diagPerFrame()
-		)
+		errCh <- clientQueue.run()
+	}()
+	go func() {
 		for {
 			messageType, payload, e := target.ReadMessage()
 			if e != nil {
@@ -1806,6 +1800,7 @@ func proxyRoomWS(w http.ResponseWriter, r *http.Request, lobbySrv *lobby.Server,
 				return
 			}
 			now := time.Now()
+			diagMu.Lock()
 			if lastArrival.IsZero() {
 				lastArrival = now
 			} else if gap := now.Sub(lastArrival); gap < 2*time.Second {
@@ -1820,22 +1815,6 @@ func proxyRoomWS(w http.ResponseWriter, r *http.Request, lobbySrv *lobby.Server,
 				}
 			}
 			lastArrival = now
-
-			relayStart := time.Now()
-			if e = writeClientFrame(messageType, payload); e != nil {
-				errCh <- e
-				return
-			}
-			relayTime := time.Since(relayStart)
-			appMetrics.ObserveDuration("pong_proxy_relay_ms", relayTime)
-			if relayTime > 25*time.Millisecond {
-				appMetrics.Inc("pong_proxy_relay_over_25ms")
-			}
-			relayTimes.add(float64(relayTime) / float64(time.Millisecond))
-			if perFrameDiag {
-				log.Printf("[diag] proxy_relay room=%s relay=%.3fms", roomID, relayTime.Seconds()*1000)
-			}
-
 			if now.Sub(lastDiag) >= diagSummaryInterval && gaps.count() > 0 {
 				lastDiag = now
 				g := statsOf(gaps.samples)
@@ -1845,15 +1824,145 @@ func proxyRoomWS(w http.ResponseWriter, r *http.Request, lobbySrv *lobby.Server,
 				gaps.reset()
 				relayTimes.reset()
 			}
+			diagMu.Unlock()
+			if e = clientQueue.enqueue(messageType, payload); e != nil {
+				errCh <- e
+				return
+			}
 		}
 	}()
 	<-errCh
+	clientQueue.close()
 	appMetrics.Inc("pong_websocket_proxy_closed")
 	appMetrics.Inc("pong_websocket_proxy_relay_ended")
 }
 
 const maxProxyMessageSize = 16 << 20
 const proxyReadyMessage = `{"type":"proxy-ready"}`
+
+var errProxyClientQueueClosed = errors.New("proxy client queue closed")
+
+type proxyClientFrame struct {
+	messageType int
+	payload     []byte
+	isState     bool
+	queuedAt    time.Time
+}
+
+// proxyClientQueue separates room reads from browser writes. A slow browser
+// must not stop the proxy reading the room socket: otherwise TCP backpressure
+// travels upstream and blocks the room's authoritative WriteJSON loop. State
+// frames are replaceable, while control/non-state frames remain ordered.
+type proxyClientQueue struct {
+	conn      net.Conn
+	ready     <-chan struct{}
+	observe   func(proxyClientFrame, time.Time, time.Duration)
+	mu        sync.Mutex
+	cond      *sync.Cond
+	pending   *proxyClientFrame
+	controls  []proxyClientFrame
+	closed    bool
+	done      chan struct{}
+	closeOnce sync.Once
+}
+
+func newProxyClientQueue(conn net.Conn, ready <-chan struct{}, observe func(proxyClientFrame, time.Time, time.Duration)) *proxyClientQueue {
+	queue := &proxyClientQueue{conn: conn, ready: ready, observe: observe, done: make(chan struct{})}
+	queue.cond = sync.NewCond(&queue.mu)
+	return queue
+}
+
+func isStateFrame(messageType int, payload []byte) bool {
+	if messageType != websocket.TextMessage {
+		return false
+	}
+	var envelope struct {
+		Type string `json:"type"`
+	}
+	return json.Unmarshal(payload, &envelope) == nil && envelope.Type == "state"
+}
+
+func (q *proxyClientQueue) enqueue(messageType int, payload []byte) error {
+	frame := proxyClientFrame{
+		messageType: messageType,
+		payload:     payload,
+		isState:     isStateFrame(messageType, payload),
+		queuedAt:    time.Now(),
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.closed {
+		return errProxyClientQueueClosed
+	}
+	if frame.isState {
+		if q.pending != nil {
+			appMetrics.Inc("pong_proxy_state_coalesced")
+		}
+		q.pending = &frame
+	} else {
+		q.controls = append(q.controls, frame)
+	}
+	q.cond.Signal()
+	return nil
+}
+
+func (q *proxyClientQueue) next() (proxyClientFrame, bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for !q.closed && len(q.controls) == 0 && q.pending == nil {
+		q.cond.Wait()
+	}
+	if len(q.controls) > 0 {
+		frame := q.controls[0]
+		q.controls = q.controls[1:]
+		return frame, true
+	}
+	if q.pending != nil {
+		frame := *q.pending
+		q.pending = nil
+		return frame, true
+	}
+	return proxyClientFrame{}, false
+}
+
+func (q *proxyClientQueue) close() {
+	q.closeOnce.Do(func() {
+		q.mu.Lock()
+		q.closed = true
+		close(q.done)
+		q.cond.Broadcast()
+		q.mu.Unlock()
+	})
+}
+
+func (q *proxyClientQueue) run() error {
+	select {
+	case <-q.ready:
+	case <-q.done:
+		return nil
+	}
+	for {
+		frame, ok := q.next()
+		if !ok {
+			return nil
+		}
+		if err := q.conn.SetWriteDeadline(time.Now().Add(pongStateWriteTimeout)); err != nil {
+			return err
+		}
+		started := time.Now()
+		err := writeWebSocketFrame(q.conn, frame.messageType, frame.payload)
+		if err != nil {
+			if writeTimedOut(err) {
+				appMetrics.Inc("pong_proxy_client_write_timeout")
+			}
+			return err
+		}
+		_ = q.conn.SetWriteDeadline(time.Time{})
+		if q.observe != nil {
+			q.observe(frame, started, time.Since(started))
+		}
+	}
+}
 
 // enableTCPNoDelay prevents the small, frequent game-state frames from being
 // coalesced by Nagle's algorithm. This matters for the Kubernetes path, where
