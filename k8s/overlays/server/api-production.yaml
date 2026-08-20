@@ -11,7 +11,7 @@ spec:
           args:
             - --mode=lobby
             - --namespace=pong
-            - --room-image=ghcr.io/macel94/cloudnativepong-room@sha256:492ec7f3bd6f371dd0980967b0f0e582d3704f2fbd268c299029bd9705dd34db
+            - --room-image=ghcr.io/macel94/cloudnativepong-room@sha256:1d59fb9a541cf55c7666e41133b11fe115141dd55481bf8d3b21fbc706fe4aca
             - --db-path=/data/pong.db
           env:
             - name: PONG_ALLOWED_ORIGINS
