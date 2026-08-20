@@ -21,7 +21,10 @@ const CREATE_RECOVERY_TIMEOUT_MS = 8_000;
 const CREATE_RECOVERY_REQUEST_TIMEOUT_MS = 2_000;
 const CREATE_RECOVERY_POLL_MS = 250;
 const CREATE_ERROR_RECOVERY_TIMEOUT_MS = 2_000;
-const CLEANUP_TIMEOUT_MS = 12_000;
+// Kubernetes room Pod termination and Service deletion can take several
+// seconds after an orderly player close. Keep cleanup verification independent
+// but longer than the application reconnect grace period.
+const CLEANUP_TIMEOUT_MS = 30_000;
 const CLEANUP_POLL_MS = 250;
 const MAX_RESPONSE_BYTES = 64 * 1024;
 const ROOM_ID_PATTERN = /^[0-9a-f]{6}$/u;
@@ -685,8 +688,8 @@ export async function runSynthetic({
   createRequestTimeoutMs = requestTimeoutMs,
   fetchImpl = globalThis.fetch,
   WebSocketImpl = WebSocket,
-  cleanupTimeoutMs = CLEANUP_TIMEOUT_MS,
-  cleanupPollMs = CLEANUP_POLL_MS,
+  cleanupTimeoutMs = positiveInteger(env.SYNTHETIC_CLEANUP_TIMEOUT_MS, 'SYNTHETIC_CLEANUP_TIMEOUT_MS', CLEANUP_TIMEOUT_MS, 120_000),
+  cleanupPollMs = positiveInteger(env.SYNTHETIC_CLEANUP_POLL_MS, 'SYNTHETIC_CLEANUP_POLL_MS', CLEANUP_POLL_MS, 60_000),
   dryRun = false,
 } = {}) {
   if (dryRun && (typeof baseURL !== 'string' || baseURL.trim() === '')) {
