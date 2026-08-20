@@ -108,6 +108,41 @@ This is not a rollback or client-authoritative physics system. Online
 extrapolation is display-only, bounded in time and position, and clients never
 decide whether a paddle collision or point happened.
 
+## Diagnostics
+
+The realtime path has two network hops in production (room pod stream -> API
+proxy -> Caddy -> browser), so lag is diagnosed at each hop instead of guessed
+at. Every hop records the same three numbers: frame cadence (Hz), inter-frame
+jitter (gap avg/p95/max), and the hop's own work inside that gap (write or
+relay time).
+
+Backend:
+
+- The room pod's `streamRoomStates` logs `[diag] room_state_stream summary`
+  every two seconds with broadcast Hz, gap statistics, and write cost; it also
+  records `pong_room_stream_frame_gap_ms` / `pong_room_stream_write_ms`
+  duration series and a `pong_room_stream_frame_over_25ms` counter.
+- The API proxy relay logs `[diag] proxy_relay summary` with arrival jitter
+  (room pod -> proxy cadence) and relay copy cost (proxy -> browser) and
+  records `pong_proxy_frame_gap_ms` / `pong_proxy_relay_ms` series.
+- `PONG_DIAG=1` turns on a per-frame verbose line for both hops so a short
+  reproduction can be timeline'd precisely.
+
+Frontend:
+
+- `window.__pongDiag` always collects bounded timing series: snapshot
+  inter-arrival gaps, render-frame deltas, the extrapolation window left
+  unfilled at draw time, the display-only corrections applied to the ball and
+  each paddle, input-send cadence, WebSocket buffered amount, and transport
+  choice. Call `window.__pongDiag.summary()` from a browser console, or pass
+  `?diag=1` (a lobby URL `/?diag=1` also propagates it) for a `[pong-diag]`
+  console summary every two seconds and on join/unload.
+
+A healthy pipe has ~50 Hz state cadence, gap p95 near 25-30 ms, sub-millisecond
+write/relay costs, tiny display corrections (< 0.02 normalized units), and an
+unfilled extrapolation window close to zero. Deviation points at the exact hop:
+backends ending into the room pod, the proxy, or the browser event loop.
+
 ## Tests
 
 The Go engine tests verify monotonic input handling and per-player

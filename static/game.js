@@ -74,6 +74,80 @@
     };
     let presentationCorrectionAt = performance.now();
 
+    // ── Realpath diagnostics ─────────────────────────────────────
+    // Collect bounded timing series in window.__pongDiag so a test harness
+    // (or ?diag=1 console summaries) can pinpoint where frontend lag comes
+    // from: snapshot inter-arrival jitter, render-frame cadence, the
+    // extrapolation window left unfilled between snapshots, and the size of
+    // the display-only corrections applied to the ball and paddles. The sink
+    // is always populated; console summaries only print when diag=1 or
+    // localStorage pong_diag=1 so normal play stays quiet.
+    let diagEnabled = params.get('diag') === '1';
+    try {
+        if (window.localStorage && window.localStorage.getItem('pong_diag') === '1') diagEnabled = true;
+    } catch {
+        // localStorage may be unavailable (some sandboxes); diag stays bound
+        // to the query flag.
+    }
+    const MAX_DIAG = 1024;
+    const pongDiag = {
+        startedAt: performance.now(),
+        transport: isAI ? 'local-ai' : (isSpectator ? 'spectator' : 'pending'),
+        stateGaps: [],
+        frameDeltas: [],
+        extrapolation: [],
+        ballCorrections: [],
+        p1Corrections: [],
+        p2Corrections: [],
+        inputGaps: [],
+        reconnects: 0,
+        snapshots: 0,
+        maxBuffered: 0,
+        lastStateAt: 0,
+        lastFrameAt: 0,
+        lastInputAt: 0,
+        connectedAt: 0,
+        joinedAt: 0,
+        push(slot, value) {
+            if (this[slot].length >= MAX_DIAG) this[slot].shift();
+            this[slot].push(value);
+        },
+        summarize(slot) {
+            const arr = this[slot];
+            if (!arr || arr.length === 0) return { n: 0, avg: 0, p95: 0, max: 0 };
+            const sorted = [...arr].sort((a, b) => a - b);
+            const avg = sorted.reduce((a, b) => a + b, 0) / sorted.length;
+            const p95 = sorted[Math.min(sorted.length - 1, Math.max(0, Math.ceil(sorted.length * 0.95) - 1))];
+            return { n: sorted.length, avg, p95, max: sorted[sorted.length - 1] };
+        },
+        summary() {
+            const gap = this.summarize('stateGaps');
+            const hertz = gap.avg > 0 ? 1000 / gap.avg : 0;
+            return {
+                transport: this.transport,
+                elapsedMs: Math.round(performance.now() - this.startedAt),
+                snapshots: this.snapshots,
+                reconnects: this.reconnects,
+                maxBuffered: this.maxBuffered,
+                stateHz: Number(hertz.toFixed(1)),
+                gap,
+                frame: this.summarize('frameDeltas'),
+                extrapolation: this.summarize('extrapolation'),
+                ballCorrections: this.summarize('ballCorrections'),
+                p1Corrections: this.summarize('p1Corrections'),
+                p2Corrections: this.summarize('p2Corrections'),
+                input: this.summarize('inputGaps'),
+            };
+        },
+        logSummary(tag) {
+            if (!diagEnabled) return;
+            try {
+                console.log('[pong-diag]', tag, JSON.stringify(this.summary()));
+            } catch { /* logging must never break gameplay */ }
+        },
+    };
+    window.__pongDiag = pongDiag;
+
     const keys = Object.create(null);
     const touchInput = { up: false, down: false };
     const movementKeys = new Set(['w', 'W', 's', 'S', 'ArrowUp', 'ArrowDown']);
@@ -277,6 +351,8 @@
 
         if (message.type === 'joined') {
             player = message.player;
+            pongDiag.joinedAt = performance.now();
+            pongDiag.logSummary('joined');
             if (message.reconnect_token && /^[0-9a-f]{32}$/u.test(message.reconnect_token)) {
                 const secure = window.location.protocol === 'https:' ? '; Secure' : '';
                 document.cookie = `pong_reconnect_${roomId}=${message.reconnect_token}; Max-Age=3600; Path=/; SameSite=Strict${secure}`;
@@ -307,6 +383,9 @@
         if (message.type === 'state' && message.state && message.state.ball) {
             const state = message.state;
             const receivedAt = performance.now();
+            if (pongDiag.lastStateAt) pongDiag.push('stateGaps', receivedAt - pongDiag.lastStateAt);
+            pongDiag.lastStateAt = receivedAt;
+            pongDiag.snapshots += 1;
             // Compare the new authoritative sample with where the previous
             // sample predicted the entities would be at this arrival time.
             // Comparing two raw positions treats normal motion as error and
@@ -359,6 +438,7 @@
     }
 
     function connectWebSocket(reconnecting = false) {
+        if (reconnecting) pongDiag.reconnects += 1;
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
         const wsURL = `${protocol}//${window.location.host}/rooms/${encodeURIComponent(roomId)}/ws`;
         const spectatorQuery = isSpectator ? '?spectator=1' : '';
@@ -373,6 +453,8 @@
 
         socket.onopen = function () {
             if (generation !== connectionGeneration) return;
+            pongDiag.transport = isSpectator ? 'spectator-ws' : 'websocket';
+            pongDiag.connectedAt = performance.now();
             reconnectAttempts = 0;
             if (!reconnecting) reconnectDeadline = 0;
             statusElement.textContent = reconnecting
@@ -413,6 +495,8 @@
     async function connectWebTransport(url) {
         const transport = new WebTransport(url);
         await transport.ready;
+        pongDiag.transport = isSpectator ? 'spectator-wt' : 'webtransport';
+        pongDiag.connectedAt = performance.now();
         const stream = await transport.createBidirectionalStream();
         const writer = stream.writable.getWriter();
         const reader = stream.readable.getReader();
@@ -492,6 +576,12 @@
     // an acknowledgement marker, not a movement command.
     setInterval(() => {
         if (isAI || isSpectator || !connection || !connection.isOpen() || !player) return;
+        const sendNow = performance.now();
+        if (pongDiag.lastInputAt) pongDiag.push('inputGaps', sendNow - pongDiag.lastInputAt);
+        pongDiag.lastInputAt = sendNow;
+        if (ws && typeof ws.bufferedAmount === 'number' && ws.bufferedAmount > pongDiag.maxBuffered) {
+            pongDiag.maxBuffered = ws.bufferedAmount;
+        }
         const input = readLocalInput();
         const sequence = ++nextInputSequence;
         pendingInputs.push({ sequence, sentAt: performance.now() });
@@ -764,6 +854,7 @@
             ? stateBuffer[stateBuffer.length - 2]
             : newest;
         const elapsedMs = Math.min(maxExtrapolationMs, Math.max(0, now - newest.receivedAt));
+        pongDiag.push('extrapolation', elapsedMs);
         // Ball velocity is part of the authoritative state, so it can be
         // rendered immediately even before a second snapshot arrives. The
         // snapshot-derived remote-paddle velocity is only used where the wire
@@ -818,11 +909,13 @@
         ).y;
         presentationCorrection.ball.x += predictedBallX - next.ball.x;
         presentationCorrection.ball.y += predictedBallY - next.ball.y;
+        pongDiag.push('ballCorrections', Math.hypot(predictedBallX - next.ball.x, predictedBallY - next.ball.y));
 
         for (const [key, correctionKey] of [['p1', 'p1'], ['p2', 'p2']]) {
             const predicted = predictedPaddleY(older, previous, key, elapsedMs);
             if (predicted !== null) {
                 presentationCorrection[correctionKey] += predicted - next[key].y;
+                pongDiag.push(key === 'p1' ? 'p1Corrections' : 'p2Corrections', Math.abs(predicted - next[key].y));
             }
         }
         presentationCorrection.ball.x = Math.max(-0.08, Math.min(0.08, presentationCorrection.ball.x));
@@ -836,6 +929,8 @@
 
     function renderLoop(now) {
         const elapsed = Math.min(100, Math.max(0, now - previousFrame));
+        if (pongDiag.lastFrameAt) pongDiag.push('frameDeltas', now - pongDiag.lastFrameAt);
+        pongDiag.lastFrameAt = now;
         previousFrame = now;
 
         if (isAI && gameState && gameState.status === 'playing') {
@@ -872,4 +967,10 @@
     if (isAI) startAI();
     else connect();
     window.requestAnimationFrame(renderLoop);
+
+    // Periodic realpath summaries when diagnostics are enabled.
+    if (diagEnabled) {
+        setInterval(() => pongDiag.logSummary(isAI ? 'ai' : 'online'), 2000);
+        window.addEventListener('beforeunload', () => pongDiag.logSummary('unload'));
+    }
 })();

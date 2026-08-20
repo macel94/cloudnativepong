@@ -70,6 +70,10 @@ func registerCanonicalMetrics(registry *metrics.Registry) {
 		"pong_websocket_disconnect",
 		"pong_room_cleanup_success",
 		"pong_room_cleanup_failure",
+		"pong_room_stream_frames",
+		"pong_room_stream_frame_over_25ms",
+		"pong_proxy_frame_over_25ms",
+		"pong_proxy_relay_over_25ms",
 	} {
 		registry.RegisterCounter(name)
 	}
@@ -90,6 +94,10 @@ func registerCanonicalMetrics(registry *metrics.Registry) {
 		"pong_room_start_duration_seconds",
 		"pong_room_cleanup_duration_seconds",
 		"pong_room_reconcile_duration_seconds",
+		"pong_room_stream_frame_gap_ms",
+		"pong_room_stream_write_ms",
+		"pong_proxy_frame_gap_ms",
+		"pong_proxy_relay_ms",
 	} {
 		registry.RegisterDuration(name)
 	}
@@ -825,8 +833,36 @@ func streamRoomStates(conn gameConnection, room *localRoom, transport string, fi
 	// network path closes that gap by pushing states near the engine rate.
 	ticker := time.NewTicker(game.StateBroadcastInterval)
 	defer ticker.Stop()
+
+	// Realpath diagnostics: the room stream is the first hop of the snapshot
+	// pipeline, so record inter-broadcast jitter and write cost locally. The
+	// summary prints every few seconds; PONG_DIAG=1 adds per-frame lines.
+	var (
+		lastSent     time.Time
+		lastDiag     time.Time
+		gaps         diagSampleRing
+		writeTimes   diagSampleRing
+		perFrameDiag = diagPerFrame()
+	)
+
 	for range ticker.C {
+		now := time.Now()
+		if !lastSent.IsZero() {
+			gap := now.Sub(lastSent)
+			appMetrics.Inc("pong_room_stream_frames")
+			appMetrics.ObserveDuration("pong_room_stream_frame_gap_ms", gap)
+			if gap > 25*time.Millisecond {
+				appMetrics.Inc("pong_room_stream_frame_over_25ms")
+			}
+			gaps.add(float64(gap) / float64(time.Millisecond))
+			if perFrameDiag {
+				log.Printf("[diag] room_state_stream frame id=%s player=%d transport=%s gap=%.2fms", roomID, player, transport, gap.Seconds()*1000)
+			}
+		}
+		lastSent = now
+
 		state := room.engine.State()
+		writeStart := time.Now()
 		if err := conn.WriteJSON(map[string]interface{}{"type": "state", "state": state}); err != nil {
 			appMetrics.Inc("pong_" + transport + "_state_write_failure")
 			if finishRoom {
@@ -834,7 +870,21 @@ func streamRoomStates(conn gameConnection, room *localRoom, transport string, fi
 			}
 			return
 		}
+		writeTime := time.Since(writeStart)
+		appMetrics.ObserveDuration("pong_room_stream_write_ms", writeTime)
+		writeTimes.add(float64(writeTime) / float64(time.Millisecond))
 		appMetrics.Inc("pong_" + transport + "_state_write_success")
+
+		if now.Sub(lastDiag) >= diagSummaryInterval && gaps.count() > 0 {
+			lastDiag = now
+			g := statsOf(gaps.samples)
+			w := statsOf(writeTimes.samples)
+			log.Printf("[diag] room_state_stream summary id=%s player=%d transport=%s frames=%d hz=%.1f gap_avg=%.2fms gap_p95=%.2fms gap_max=%.2fms write_avg=%.2fms write_p95=%.2fms write_max=%.2fms",
+				roomID, player, transport, g.Count, 1000/g.Avg, g.Avg, g.P95, g.Max, w.Avg, w.P95, w.Max)
+			gaps.reset()
+			writeTimes.reset()
+		}
+
 		if state.Status == game.StatusFinished {
 			if finishRoom {
 				appMetrics.Inc("pong_room_finished")
@@ -1669,15 +1719,62 @@ func proxyRoomWS(w http.ResponseWriter, r *http.Request, lobbySrv *lobby.Server,
 		case <-timer.C:
 			signalClientReady()
 		}
+
+		// Realpath diagnostics: this hop relays room-pod frames straight to the
+		// browser, so per-frame arrival jitter and copy cost reveal whether the
+		// proxy chain (rather than the engine or browser) is adding lag.
+		var (
+			lastArrival  time.Time
+			lastDiag     time.Time
+			gaps         diagSampleRing
+			relayTimes   diagSampleRing
+			perFrameDiag = diagPerFrame()
+		)
 		for {
 			messageType, payload, e := target.ReadMessage()
 			if e != nil {
 				errCh <- e
 				return
 			}
+			now := time.Now()
+			if lastArrival.IsZero() {
+				lastArrival = now
+			} else if gap := now.Sub(lastArrival); gap < 2*time.Second {
+				// Skip events around reconnects; only consecutive frames count.
+				appMetrics.ObserveDuration("pong_proxy_frame_gap_ms", gap)
+				if gap > 25*time.Millisecond {
+					appMetrics.Inc("pong_proxy_frame_over_25ms")
+				}
+				gaps.add(float64(gap) / float64(time.Millisecond))
+				if perFrameDiag {
+					log.Printf("[diag] proxy_frame room=%s gap=%.2fms", roomID, gap.Seconds()*1000)
+				}
+			}
+			lastArrival = now
+
+			relayStart := time.Now()
 			if e = writeClientFrame(messageType, payload); e != nil {
 				errCh <- e
 				return
+			}
+			relayTime := time.Since(relayStart)
+			appMetrics.ObserveDuration("pong_proxy_relay_ms", relayTime)
+			if relayTime > 25*time.Millisecond {
+				appMetrics.Inc("pong_proxy_relay_over_25ms")
+			}
+			relayTimes.add(float64(relayTime) / float64(time.Millisecond))
+			if perFrameDiag {
+				log.Printf("[diag] proxy_relay room=%s relay=%.3fms", roomID, relayTime.Seconds()*1000)
+			}
+
+			if now.Sub(lastDiag) >= diagSummaryInterval && gaps.count() > 0 {
+				lastDiag = now
+				g := statsOf(gaps.samples)
+				r := statsOf(relayTimes.samples)
+				log.Printf("[diag] proxy_relay summary room=%s frames=%d hz=%.1f arrival_avg=%.2fms arrival_p95=%.2fms arrival_max=%.2fms relay_avg=%.3fms relay_p95=%.3fms relay_max=%.3fms",
+					roomID, g.Count, 1000/g.Avg, g.Avg, g.P95, g.Max, r.Avg, r.P95, r.Max)
+				gaps.reset()
+				relayTimes.reset()
 			}
 		}
 	}()

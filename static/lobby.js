@@ -3,6 +3,15 @@ const API = '/api/rooms';
 const NAME_STORAGE_KEY = 'pong_player_name';
 const ROOM_SEQ_STORAGE_KEY = 'pong_room_seq';
 
+// A ?diag=1 lobby URL enables the realpath diagnostics on every page it opens
+// (the game page reads the same localStorage flag), so latency hunting does
+// not require editing URLs on each navigation.
+if (new URLSearchParams(window.location.search).get('diag') === '1') {
+    try {
+        localStorage.setItem('pong_diag', '1');
+    } catch { /* diagnostics are optional */ }
+}
+
 let playerName = '';
 
 function setSavedMode(nameInput, btnEdit, btnSave, status) {
