@@ -17,14 +17,15 @@
       "fixed_pods": 5,
       "fixed_services": 4,
       "dynamic_room_pod_ceiling": 115,
-      "dynamic_room_service_ceiling": 116
+      "dynamic_room_service_ceiling": 116,
+      "dynamic_room_cpu_ceiling": 47
     },
     "api_resources": {
       "requests": { "cpu": "50m", "memory": "64Mi" },
       "limits": { "memory": "128Mi" }
     },
     "room_resources": {
-      "requests": { "cpu": "50m", "memory": "32Mi" },
+      "requests": { "cpu": "250m", "memory": "32Mi" },
       "limits": { "memory": "64Mi" }
     }
   },
@@ -42,11 +43,11 @@
     "safe_headroom_fraction": 0.2,
     "safe_operating_fraction": 0.8,
     "safe_global_websocket_sessions": 102,
-    "safe_two_player_games_if_no_spectators": 51,
+    "safe_two_player_games_if_no_spectators": 37,
     "hard_global_websocket_sessions": 128,
     "room_quota_review_threshold_fraction": 0.8,
-    "room_quota_review_threshold": 92,
-    "calculation": "safe websocket sessions = floor(global websocket admission * 0.8); safe games = floor(safe sessions / 2); dynamic room ceiling = quota minus fixed API/gateway/static pods/services; room threshold = floor(min(dynamic pod/service ceilings) * 0.8)",
+    "room_quota_review_threshold": 37,
+    "calculation": "safe websocket sessions = floor(global websocket admission * 0.8); safe games = min(floor(safe sessions / 2), floor(dynamic room CPU ceiling * 0.8)); dynamic room ceiling = min(quota minus fixed API/gateway/static pods/services, floor(namespace CPU request quota minus fixed workload requests / room CPU request)); room threshold = floor(min(dynamic pod/service/CPU ceilings) * 0.8)",
     "claim_boundary": "The lower of measured resource saturation, admission ceiling, and available pod/service quota is the supported boundary. This file supplies configured ceilings and review thresholds; it does not substitute for a disposable benchmark result."
   },
   "signals": {
@@ -56,7 +57,7 @@
       "API memory near its 128Mi limit",
       "SQLite operation failures or rising room create/join latency",
       "pod/service quota admission failures",
-      "room pod CPU usage or memory near its 64Mi limit",
+      "room pod CPU usage above its 250m request or memory near its 64Mi limit",
       "gateway CPU usage or WebSocket failures"
     ],
     "required_evidence": [

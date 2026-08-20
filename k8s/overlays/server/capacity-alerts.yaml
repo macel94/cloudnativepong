@@ -42,6 +42,14 @@ spec:
           annotations:
             summary: Pong API resource headroom is below 20 percent
             description: The single SQLite writer is above its configured CPU request or near its memory limit; do not scale API replicas horizontally.
+        - alert: PongRoomResourcePressure
+          expr: sum by (namespace, pod, container) (rate(container_cpu_usage_seconds_total{namespace="pong", pod=~"pong-room-.*", container="pong-room"}[5m])) / on (namespace, pod, container) kube_pod_container_resource_requests{namespace="pong", pod=~"pong-room-.*", container="pong-room", resource="cpu", unit="core"} > 0.8
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: Pong room CPU headroom is below 20 percent
+            description: A room pod is using more than 80 percent of its 250m CPU request; inspect node PSI, WebSocket write timeouts, and the room CPU quota before increasing room admission.
         - alert: PongSQLiteFailures
           expr: increase(pong_sqlite_create_failure_total[5m]) + increase(pong_sqlite_get_failure_total[5m]) + increase(pong_sqlite_list_failure_total[5m]) + increase(pong_sqlite_increment_players_failure_total[5m]) + increase(pong_sqlite_delete_failure_total[5m]) > 0
           for: 5m

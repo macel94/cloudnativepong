@@ -57,7 +57,7 @@ data:
             ],
             "resources": {
               "requests": {
-                "cpu": "50m",
+                "cpu": "250m",
                 "memory": "32Mi"
               },
               "limits": {

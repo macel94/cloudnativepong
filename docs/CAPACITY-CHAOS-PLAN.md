@@ -81,11 +81,12 @@ It is intentionally separate from benchmark output: the policy records current
 limits and the calculation for safe headroom, while a run artifact records what
 actually happened in an isolated environment. The current topology has one API
 replica and one SQLite writer, a global 128-session WebSocket admission limit,
-and a 120-pod/120-service namespace quota. After fixed API, gateway, static,
-and Service objects, the dynamic room ceiling is 117 Pods/116 Services. Until a
-measured result is lower, the review threshold is 80% of each boundary: 102
-WebSocket sessions (51 two-player games when there are no spectators) and 92
-active rooms. These are guardrails,
+and a 120-pod/120-service namespace quota. Room pods reserve 250m CPU without
+a CPU limit, so the 12-core namespace CPU request quota creates a configured
+dynamic room ceiling of 47 after fixed workload requests; this is lower than
+the Pod/Service quota. Until a measured result is lower, the review threshold
+is 80% of each boundary: 102 WebSocket sessions, 37 two-player games when
+there are no spectators, and 37 active rooms. These are guardrails,
 not a production capacity claim.
 
 The first overload signal is expected to be an aggregate admission rejection,
@@ -121,12 +122,15 @@ WebSocket handshake statuses, and failure codes. Interpret the first signal as
 follows:
 
 1. admission rejection with low CPU/memory: configured ceiling is the boundary;
-2. quota rejection or pending room Pods: Pod/Service quota is the boundary;
-3. SQLite failures or rising create/join latency: the single writer/storage is
+2. quota rejection or pending room Pods: Pod/Service/CPU-request quota is the
+   boundary;
+3. room CPU pressure or WebSocket write timeouts with node PSI: room scheduling
+   or node contention is the boundary;
+4. SQLite failures or rising create/join latency: the single writer/storage is
    the boundary;
-4. resource pressure with no admission rejection: CPU/memory or gateway is the
+5. resource pressure with no admission rejection: CPU/memory or gateway is the
    boundary; and
-5. cleanup failures or rooms remaining after the run: the result is invalid
+6. cleanup failures or rooms remaining after the run: the result is invalid
    until reconciliation succeeds.
 
 Record the lowest stable concurrency/ceiling pair that has no unacceptable
