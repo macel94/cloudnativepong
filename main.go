@@ -818,8 +818,11 @@ func handleSpectatorConnection(conn gameConnection, room *localRoom, transport s
 }
 
 func streamRoomStates(conn gameConnection, room *localRoom, transport string, finishRoom bool, roomID string, player int, generation uint64) {
-	// The engine still advances at 60 Hz, but a 30 Hz snapshot stream is enough
-	// for the browser's display-time extrapolation and halves JSON/proxy writes.
+	// The engine always advances at 60 Hz. The snapshot stream runs at ~50 Hz
+	// (slightly below the sim) so the browser's display-time extrapolation only
+	// has to bridge a short gap. Fresher snapshots cut perceived multiplayer
+	// lag: the AI path is fluid because it simulates per-frame locally, and the
+	// network path closes that gap by pushing states near the engine rate.
 	ticker := time.NewTicker(game.StateBroadcastInterval)
 	defer ticker.Stop()
 	for range ticker.C {

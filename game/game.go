@@ -37,10 +37,14 @@ const (
 const TickDuration = 16 * time.Millisecond // ~60 FPS
 
 // StateBroadcastInterval is the browser snapshot cadence. It deliberately runs
-// below the simulation rate: clients render between authoritative snapshots,
-// while reducing JSON/proxy work leaves more room for multiple players and
-// spectators without changing the authoritative game speed.
-const StateBroadcastInterval = 33 * time.Millisecond // ~30 FPS
+// at or just below the simulation rate so online clients stay as smooth as the
+// local AI path: clients render between authoritative snapshots (dead-reckoning
+// with the authoritative velocity), but the fresher the snapshots the less
+// extrapolation error the browser must correct and the lower the perceived
+// multiplayer lag. Keep the interval strictly greater than TickDuration (the
+// snapshot stream still idles below the simulation rate so the proxy/JSON path
+// is not saturated), yet as close as tolerances allow.
+const StateBroadcastInterval = 20 * time.Millisecond // ~50 FPS snapshot cadence
 
 // Ball holds the ball state.
 type Ball struct {

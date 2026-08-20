@@ -80,6 +80,31 @@ h1 {
     border-color: #6366f1;
 }
 
+.player-setup input.readonly,
+.player-setup input[readonly] {
+    border-color: #2f6f4f;
+    background: #17243a;
+}
+
+.name-actions {
+    display: flex;
+    justify-content: center;
+    gap: 8px;
+    margin-top: 8px;
+}
+
+.name-actions .btn {
+    padding: 6px 14px;
+    font-size: 0.85rem;
+}
+
+.name-status {
+    margin-top: 8px;
+    font-size: 0.85rem;
+    color: #7fd39a;
+    text-align: center;
+}
+
 /* Buttons */
 .actions {
     display: flex;

@@ -1,19 +1,60 @@
 // Lobby: room list, create/join rooms
 const API = '/api/rooms';
+const NAME_STORAGE_KEY = 'pong_player_name';
+const ROOM_SEQ_STORAGE_KEY = 'pong_room_seq';
 
 let playerName = '';
 
+function setSavedMode(nameInput, btnEdit, btnSave, status) {
+    const value = playerName.trim();
+    nameInput.value = value;
+    nameInput.readOnly = true;
+    btnEdit.disabled = false;
+    btnSave.disabled = false;
+    status.textContent = value ? `You play as “${value}”. Edit or save to change it.` : '';
+}
+
+function setEditingMode(nameInput, btnEdit, btnSave) {
+    nameInput.readOnly = false;
+    btnEdit.disabled = true;
+    btnSave.disabled = false;
+}
+
 document.addEventListener('DOMContentLoaded', () => {
     const nameInput = document.getElementById('playerName');
-    const saved = localStorage.getItem('pong_player_name');
-    if (saved) {
-        nameInput.value = saved;
-        playerName = saved;
+    const btnEdit = document.getElementById('btnEditName');
+    const btnSave = document.getElementById('btnSaveName');
+    const nameStatus = document.getElementById('nameStatus');
+
+    const saved = localStorage.getItem(NAME_STORAGE_KEY);
+    if (saved && saved.trim()) {
+        playerName = saved.trim();
+        setSavedMode(nameInput, btnEdit, btnSave, nameStatus);
+    } else {
+        setEditingMode(nameInput, btnEdit, btnSave);
     }
+
+    // Editing starts fresh from the current value; nothing is persisted until
+    // the user explicitly saves.
+    btnEdit.addEventListener('click', () => {
+        setEditingMode(nameInput, btnEdit, btnSave);
+        nameInput.focus();
+    });
+
+    btnSave.addEventListener('click', () => {
+        playerName = nameInput.value.trim();
+        if (!playerName) {
+            showError('A display name is required before you can play.');
+            nameInput.focus();
+            return;
+        }
+        localStorage.setItem(NAME_STORAGE_KEY, playerName);
+        setSavedMode(nameInput, btnEdit, btnSave, nameStatus);
+        nameStatus.textContent = `Name saved. You will play as “${playerName}”.`;
+    });
 
     nameInput.addEventListener('input', () => {
         playerName = nameInput.value.trim();
-        localStorage.setItem('pong_player_name', playerName);
     });
 
     document.getElementById('btnNewRoom').addEventListener('click', createRoom);
@@ -58,8 +99,11 @@ function watchRoom(id) {
 }
 
 function playAgainstComputer() {
-    const name = playerName || 'Player';
-    window.location.href = '/game.html?mode=ai&name=' + encodeURIComponent(name);
+    if (!playerName) {
+        showError('Enter a display name first.');
+        return;
+    }
+    window.location.href = '/game.html?mode=ai&name=' + encodeURIComponent(playerName);
 }
 
 async function createRoom() {
@@ -67,11 +111,17 @@ async function createRoom() {
         showError('Enter a display name first.');
         return;
     }
+    // Each room this user creates gets a new sequential suffix so room names
+    // stay unique (e.g. "Sam's room #2") and never collide with their earlier
+    // creations. The server room id remains unique regardless.
+    const seq = (parseInt(localStorage.getItem(ROOM_SEQ_STORAGE_KEY), 10) || 0) + 1;
+    localStorage.setItem(ROOM_SEQ_STORAGE_KEY, String(seq));
+    const roomName = playerName + "'s room #" + seq;
     try {
         const res = await fetch(API + '/create', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ name: playerName + "'s room" }),
+            body: JSON.stringify({ name: roomName }),
         });
         const room = await res.json();
         if (room.id) {

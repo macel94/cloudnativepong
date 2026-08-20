@@ -8,8 +8,19 @@ A minimalist, horizontally-scalable PONG game running on Kubernetes. Each game r
 ## ✨ Features
 
 - **Zero-auth** — Just pick a name and play. No accounts, no passwords.
+- **Remembered display name** — Your name is cached in browser local storage
+  and can be edited or saved again without retyping it.
+- **Clear control cue** — The paddle you actually control is outlined in green,
+  so you instantly know which side is yours (P1 left or P2 right).
+- **Self-describing rooms** — Each room you create gets its own sequential
+  suffix (for example `Sam's room #2`), so creating several rooms never
+  produces duplicate lobby names.
 - **1 room = 1 pod** — Every game room runs in its own isolated pod. Scale infinitely.
 - **Blazing fast** — Go binary (~6 MB), distroless runtime image, and low-latency WebTransport with a WebSocket fallback.
+- **Fluid online play** — The authoritative snapshot stream runs near the
+  simulation rate (~50 Hz) so the browser's display loop only bridges a short
+  gap; the ball no longer stutters behind while playing another human the way
+  it does against the local AI.
 - **Embedded SQLite** — Pure Go, CGO-free, no external database needed.
 - **Self-cleaning** — Rooms auto-terminate when the game ends. No orphaned pods.
 - **Multi-service** — Gateway, static, API, room: each scales independently.

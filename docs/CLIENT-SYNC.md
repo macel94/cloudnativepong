@@ -17,10 +17,12 @@ The room engine is the source of truth for:
 
 The engine advances on its fixed `game.TickDuration` (currently 16 ms, about
 60 Hz). Authoritative physics stays at this rate so collisions and input timing
-do not depend on network delivery. The browser snapshot stream is intentionally
-slower (`StateBroadcastInterval`, currently 33 ms/about 30 Hz), which halves
-JSON and proxy writes while the display loop fills in the motion between
-snapshots. It accepts paddle **intent** (`up`/`down`), never a client-supplied
+do not depend on network delivery. The spanning browser snapshot stream runs
+just below the sim rate (`StateBroadcastInterval`, currently 20 ms/about 50 Hz)
+so the display loop fills in only a short gap between snapshots. Fresher
+snapshots cut the perceived multiplayer lag: the local AI path renders the
+per-frame sim directly, and the network path converges on that cadence instead
+of stalling on a coarser broadcast. It accepts paddle **intent** (`up`/`down`), never a client-supplied
 position. A client cannot move a paddle, ball, or score by sending a fabricated
 coordinate.
 

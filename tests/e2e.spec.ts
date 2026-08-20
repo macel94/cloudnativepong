@@ -100,6 +100,39 @@ test.describe('Lobby', () => {
     const later = await page.locator('#pongCanvas').screenshot();
     expect(later.equals(initial)).toBeFalsy();
   });
+
+  test('marks the controllable paddle with a green border (AI controls P1)', async ({ page }) => {
+    await page.goto(LOBBY_URL);
+    await page.locator('#playerName').fill('Border Pilot');
+    await page.locator('#btnAI').click();
+    await page.waitForURL(/game\.html\?mode=ai/);
+    await page.waitForFunction(() => Boolean(document.getElementById('pongCanvas')?.dataset.controlledPaddle));
+    await expect(page.locator('#pongCanvas')).toHaveAttribute('data-controlled-paddle', 'p1');
+  });
+
+  test('requires a display name before starting a game', async ({ page }) => {
+    await page.goto(LOBBY_URL);
+    await page.locator('#btnAI').click();
+    await expect(page.locator('#error')).toBeVisible();
+    await expect(page.locator('#error')).toContainText(/display name|Enter a display name/u);
+    await expect(page).toHaveURL(/\/$/);
+  });
+
+  test('persists the player name and exposes edit/save controls', async ({ page }) => {
+    await page.goto(LOBBY_URL);
+    const input = page.locator('#playerName');
+    await expect(page.locator('#btnEditName')).toBeVisible();
+    await expect(page.locator('#btnSaveName')).toBeVisible();
+    await input.fill('PersistedPlayer');
+    await page.locator('#btnSaveName').click();
+    await expect(input).toHaveAttribute('readonly', '');
+    await expect(page.locator('#nameStatus')).toContainText('PersistedPlayer');
+    const stored = await page.evaluate(() => localStorage.getItem('pong_player_name'));
+    expect(stored).toBe('PersistedPlayer');
+    // Editing a saved name makes the field writable again.
+    await page.locator('#btnEditName').click();
+    await expect(input).not.toHaveAttribute('readonly', '');
+  });
 });
 
 test.describe('Room workflow', () => {
@@ -155,6 +188,8 @@ test.describe('Two-player game', () => {
     await expect(p1Page.locator('#status')).toContainText('Player 1', {
       timeout: process.env.TEST_MODE === 'k8s' ? 20_000 : 5_000,
     });
+    // Player 1 controls the left paddle only.
+    await expect(p1Page.locator('#pongCanvas')).toHaveAttribute('data-controlled-paddle', 'p1');
 
     // Player 2: join the same room
     const p2Ctx = await browser.newContext();
@@ -188,6 +223,8 @@ test.describe('Two-player game', () => {
     // Player 2 should be connected (game may have already started)
     const p2Status = await p2Page.locator('#status').textContent();
     expect(p2Status.includes('Player 2') || p2Status.includes('Playing')).toBeTruthy();
+    // Player 2 controls the right paddle only; no border on P1's paddle.
+    await expect(p2Page.locator('#pongCanvas')).toHaveAttribute('data-controlled-paddle', 'p2');
 
     // Simulate P1 pressing W (move up) — send a few inputs
     await p1Page.keyboard.down('w');

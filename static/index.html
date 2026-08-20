@@ -16,7 +16,12 @@
         </header>
 
         <div class="player-setup">
-            <input type="text" id="playerName" placeholder="Your display name" maxlength="20" autofocus>
+            <input type="text" id="playerName" placeholder="Your display name" maxlength="20">
+            <div class="name-actions">
+                <button id="btnEditName" class="btn secondary" type="button">Edit Name</button>
+                <button id="btnSaveName" class="btn primary" type="button">Save Name</button>
+            </div>
+            <p id="nameStatus" class="name-status" aria-live="polite"></p>
         </div>
 
         <div class="actions">

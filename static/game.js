@@ -4,7 +4,7 @@
 
     const params = new URLSearchParams(window.location.search);
     const roomId = params.get('room');
-    const playerName = params.get('name') || 'Player';
+    const playerName = params.get('name') || '';
     const mode = params.get('mode') || 'local';
     const isAI = mode === 'ai';
     const isSpectator = mode === 'spectator';
@@ -23,6 +23,16 @@
 
     if (!isAI && !roomId) {
         document.body.innerHTML = '<h1 style="text-align:center;margin-top:80px">Missing room ID</h1>';
+        return;
+    }
+
+    // A player name is required to play (spectators may watch anonymously). The
+    // lobby enforces this before launching, and the game page enforces it again
+    // so a direct URL cannot bypass the requirement.
+    if (!isSpectator && !playerName.trim()) {
+        document.body.innerHTML =
+            '<h1 style="text-align:center;margin-top:80px">Missing player name</h1>' +
+            '<p style="text-align:center;margin-top:16px">Return to the lobby and set a display name before playing.</p>';
         return;
     }
 
@@ -645,6 +655,9 @@
         canvas.dataset.opponentPaddleY = player === 1
             ? (state.p2 ? String(state.p2.y) : '')
             : (state.p1 ? String(state.p1.y) : '');
+        // Which paddle does this client actually control? 1 = left, 2 = right,
+        // and 0/spectator = none. Used for the green control border and tests.
+        canvas.dataset.controlledPaddle = player === 1 ? 'p1' : (player === 2 ? 'p2' : '');
         ctx.clearRect(0, 0, W, H);
 
         ctx.strokeStyle = '#333';
@@ -662,6 +675,19 @@
         const p2Y = (state.p2 ? state.p2.y : 0.5) * H;
         ctx.fillRect(0, p1Y - (paddleHeight * H) / 2, PADDLE_WIDTH * W, paddleHeight * H);
         ctx.fillRect((1 - PADDLE_WIDTH) * W, p2Y - (paddleHeight * H) / 2, PADDLE_WIDTH * W, paddleHeight * H);
+
+        // Green border marks the single paddle this client can actually move, so
+        // a player instantly recognizes which side they control. Spectators and
+        // the AI opponent never get the highlight.
+        const controlledPaddle = player === 1 ? 'p1' : (player === 2 ? 'p2' : null);
+        if (controlledPaddle) {
+            const controlled = controlledPaddle === 'p1' ? state.p1 : state.p2;
+            const controlledY = (controlled ? controlled.y : 0.5) * H;
+            const controlledX = controlledPaddle === 'p1' ? 0 : (1 - PADDLE_WIDTH) * W;
+            ctx.strokeStyle = '#22c55e';
+            ctx.lineWidth = 3;
+            ctx.strokeRect(controlledX, controlledY - (paddleHeight * H) / 2, PADDLE_WIDTH * W, paddleHeight * H);
+        }
 
         if (state.ball) {
             const ballSize = BALL_SIZE * W;
@@ -799,10 +825,10 @@
                 presentationCorrection[correctionKey] += predicted - next[key].y;
             }
         }
-        presentationCorrection.ball.x = Math.max(-0.2, Math.min(0.2, presentationCorrection.ball.x));
-        presentationCorrection.ball.y = Math.max(-0.2, Math.min(0.2, presentationCorrection.ball.y));
-        presentationCorrection.p1 = Math.max(-0.2, Math.min(0.2, presentationCorrection.p1));
-        presentationCorrection.p2 = Math.max(-0.2, Math.min(0.2, presentationCorrection.p2));
+        presentationCorrection.ball.x = Math.max(-0.08, Math.min(0.08, presentationCorrection.ball.x));
+        presentationCorrection.ball.y = Math.max(-0.08, Math.min(0.08, presentationCorrection.ball.y));
+        presentationCorrection.p1 = Math.max(-0.08, Math.min(0.08, presentationCorrection.p1));
+        presentationCorrection.p2 = Math.max(-0.08, Math.min(0.08, presentationCorrection.p2));
     }
 
     let previousFrame = performance.now();
