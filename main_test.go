@@ -36,20 +36,20 @@ func TestReconnectTokenReclaimsSamePlayerSlotAndStaleGenerationIsIgnored(t *test
 		t.Fatalf("initial attach = player:%d token:%q reconnected:%v generation:%d ok:%v", player, token, reconnected, generation, ok)
 	}
 	second := &fakeGameConnection{}
-	if !room.disconnectPlayer(1, generation) {
+	if !room.disconnectPlayer(1, generation, true) {
 		t.Fatal("initial disconnect was not recorded")
 	}
 	player, replacementToken, reconnected, replacementGeneration, oldConn, ok := room.attachPlayer(second, token)
 	if !ok || player != 1 || replacementToken != token || !reconnected || replacementGeneration != generation+1 || oldConn != nil {
 		t.Fatalf("reconnect attach = player:%d token:%q reconnected:%v generation:%d old:%v ok:%v", player, replacementToken, reconnected, replacementGeneration, oldConn, ok)
 	}
-	if room.disconnectPlayer(1, generation) {
+	if room.disconnectPlayer(1, generation, true) {
 		t.Fatal("stale generation disconnected the replacement")
 	}
 	if room.engine.State().Status == game.StatusFinished {
 		t.Fatal("stale generation finished the room")
 	}
-	_ = room.disconnectPlayer(1, replacementGeneration)
+	_ = room.disconnectPlayer(1, replacementGeneration, true)
 	if timer := room.disconnectTimers[0]; timer != nil {
 		timer.Stop()
 	}

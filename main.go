@@ -755,7 +755,7 @@ func handleGameConnection(conn gameConnection, r *http.Request, roomID, lobbyAdd
 	}
 	if err := conn.WriteJSON(joined); err != nil {
 		appMetrics.Inc("pong_" + transport + "_joined_write_failure")
-		room.disconnectPlayer(player, generation)
+		room.disconnectPlayer(player, generation, false)
 		return
 	}
 	appMetrics.Inc("pong_" + transport + "_joined_write_success")
@@ -783,7 +783,7 @@ func handleGameConnection(conn gameConnection, r *http.Request, roomID, lobbyAdd
 			var input game.Input
 			if err := conn.ReadJSON(&input); err != nil {
 				appMetrics.Inc("pong_" + transport + "_disconnect")
-				room.disconnectPlayer(player, generation)
+				room.disconnectPlayer(player, generation, shouldReconnectAfterReadError(err))
 				return
 			}
 			input.Player = player
@@ -827,7 +827,7 @@ func streamRoomStates(conn gameConnection, room *localRoom, transport string, fi
 		if err := conn.WriteJSON(map[string]interface{}{"type": "state", "state": state}); err != nil {
 			appMetrics.Inc("pong_" + transport + "_state_write_failure")
 			if finishRoom {
-				room.disconnectPlayer(player, generation)
+				room.disconnectPlayer(player, generation, true)
 			}
 			return
 		}
@@ -956,17 +956,28 @@ func (r *localRoom) attachPlayer(conn gameConnection, requestedToken string) (pl
 	return index + 1, r.playerTokens[index], reconnected, r.playerGeneration[index], oldConn, true
 }
 
-func (r *localRoom) disconnectPlayer(player int, generation uint64) bool {
+func (r *localRoom) disconnectPlayer(player int, generation uint64, reconnect bool) bool {
 	index := player - 1
 	if index < 0 || index >= len(r.players) {
 		return false
 	}
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if r.playerGeneration[index] != generation || r.players[index] == nil {
+		r.mu.Unlock()
 		return false
 	}
 	r.players[index] = nil
+	if !reconnect {
+		if timer := r.disconnectTimers[index]; timer != nil {
+			timer.Stop()
+			r.disconnectTimers[index] = nil
+		}
+		r.playerTokens[index] = ""
+		r.mu.Unlock()
+		r.engine.PlayerLeft(player)
+		r.signalFinished()
+		return true
+	}
 	r.disconnectTimers[index] = time.AfterFunc(playerReconnectGracePeriod, func() {
 		r.mu.Lock()
 		if r.playerGeneration[index] != generation || r.players[index] != nil {
@@ -979,6 +990,15 @@ func (r *localRoom) disconnectPlayer(player int, generation uint64) bool {
 		r.engine.PlayerLeft(player)
 		r.signalFinished()
 	})
+	r.mu.Unlock()
+	return true
+}
+
+func shouldReconnectAfterReadError(err error) bool {
+	var closeErr *websocket.CloseError
+	if errors.As(err, &closeErr) {
+		return closeErr.Code != websocket.CloseNormalClosure && closeErr.Code != websocket.CloseGoingAway
+	}
 	return true
 }
 
