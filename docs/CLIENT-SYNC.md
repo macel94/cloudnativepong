@@ -144,6 +144,11 @@ Frontend:
   choice. Call `window.__pongDiag.summary()` from a browser console, or pass
   `?diag=1` (a lobby URL `/?diag=1` also propagates it) for a `[pong-diag]`
   console summary every two seconds and on join/unload.
+- A compact `[pong-diag]` row is also printed **by default** on the game page
+  at join, every ~8 seconds, and on unload (and once in AI mode), so a normal
+  session already leaves measurable history in the browser console without
+  turning anything on. The lobby prints a one-line hint: reload as `/?diag=1`
+  to upgrade every game page to a full two-second report.
 
 A healthy pipe has ~50 Hz state cadence, gap p95 near 25-30 ms, sub-millisecond
 write/relay costs, tiny display corrections (< 0.02 normalized units), and an

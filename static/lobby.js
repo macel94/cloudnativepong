@@ -12,6 +12,15 @@ if (new URLSearchParams(window.location.search).get('diag') === '1') {
     } catch { /* diagnostics are optional */ }
 }
 
+// Always leave one console hint so opening the lobby never looks broken: the
+// game page prints compact realpath rows by default, and ?diag=1 upgrades them
+// to a full report every 2 seconds.
+if (localStorage.getItem('pong_diag') === '1') {
+    console.log('%c[pong-diag] lobby diagnostics ON — every game page prints a full 2s report.', 'color:#22c55e');
+} else {
+    console.log('%c[pong-diag] diagnostics idle. Repair the lag hunt: reload this lobby as /?diag=1, then create/join a room — the game console will print a full report.', 'color:#22c55e');
+}
+
 let playerName = '';
 
 function setSavedMode(nameInput, btnEdit, btnSave, status) {

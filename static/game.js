@@ -82,7 +82,7 @@
     // the display-only corrections applied to the ball and paddles. The sink
     // is always populated; console summaries only print when diag=1 or
     // localStorage pong_diag=1 so normal play stays quiet.
-    let diagEnabled = params.get('diag') === '1';
+    let diagEnabled = params.get('diag') === '1' || params.get('diag') === '';
     try {
         if (window.localStorage && window.localStorage.getItem('pong_diag') === '1') diagEnabled = true;
     } catch {
@@ -139,11 +139,26 @@
                 input: this.summarize('inputGaps'),
             };
         },
-        logSummary(tag) {
-            if (!diagEnabled) return;
-            try {
-                console.log('[pong-diag]', tag, JSON.stringify(this.summary()));
-            } catch { /* logging must never break gameplay */ }
+        logSummary(tag, extra) {
+            // A compact row is always printed at connection control points so a
+            // normal session leaves diagnostic history in the browser console
+            // (you do not need to enable anything to see the headline numbers).
+            // The full series dump stays behind ?diag=1 / localStorage
+            // pong_diag=1 because that is the detailed report and the format
+            // the test harness parses.
+            const s = this.summary();
+            const line = `stateHz=${s.stateHz} gapAvg=${s.gap.avg.toFixed(1)}ms gapP95=${s.gap.p95.toFixed(1)}ms`
+                + ` snapIn=${s.snapshots} reconns=${s.reconnects} buf=${s.maxBuffered}`
+                + ` frame=${s.frame.avg.toFixed(1)}ms extrap=${s.extrapolation.avg.toFixed(1)}ms`
+                + ` ball=${s.ballCorrections.avg.toFixed(3)} p1=${s.p1Corrections.avg.toFixed(3)} p2=${s.p2Corrections.avg.toFixed(3)}`;
+            if (!diagEnabled) {
+                if (tag !== 'joined' && tag !== 'joined-ai' && tag !== 'ai' && tag !== 'online' && tag !== 'unload') {
+                    return;
+                }
+                try { console.log('[pong-diag]', tag, line); } catch {}
+                return;
+            }
+            try { console.log('[pong-diag]', tag, JSON.stringify(s)); } catch { /* logging must never break gameplay */ }
         },
     };
     window.__pongDiag = pongDiag;
@@ -736,6 +751,9 @@
         setControlHint();
         gameState = createAIState();
         statusElement.textContent = 'Playing vs Computer — use W/S or touch buttons.';
+        // Local AI has no network snapshots, so log one stable row so a session
+        // still leaves a baseline (and the console is never fully silent).
+        window.__pongDiag.logSummary('ai');
     }
 
     function render(state) {
@@ -1020,6 +1038,10 @@
     // Periodic realpath summaries when diagnostics are enabled.
     if (diagEnabled) {
         setInterval(() => pongDiag.logSummary(isAI ? 'ai' : 'online'), 2000);
-        window.addEventListener('beforeunload', () => pongDiag.logSummary('unload'));
+    } else {
+        // Always print one friendly hint plus a final row on close so a normal
+        // session still leaves measurable history in the browser console.
+        setInterval(() => pongDiag.logSummary(isAI ? 'ai' : 'online'), 8000);
     }
+    window.addEventListener('beforeunload', () => pongDiag.logSummary('unload'));
 })();
