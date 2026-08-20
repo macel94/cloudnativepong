@@ -22,6 +22,12 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+func TestProxyHandshakeTimeoutExceedsRoomDialTimeout(t *testing.T) {
+	if proxyHandshakeWriteTimeout <= roomDialTimeout {
+		t.Fatalf("proxy handshake timeout = %s, want greater than room dial timeout %s", proxyHandshakeWriteTimeout, roomDialTimeout)
+	}
+}
+
 func TestReconnectTokenReclaimsSamePlayerSlotAndStaleGenerationIsIgnored(t *testing.T) {
 	room := &localRoom{engine: game.NewEngine(), done: make(chan struct{})}
 	first := &fakeGameConnection{}

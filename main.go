@@ -215,6 +215,10 @@ const maxWebTransportMessageSize = 1 << 20
 const (
 	roomDialTimeout       = 60 * time.Second
 	roomDialRetryInterval = 500 * time.Millisecond
+	// proxyHandshakeWriteTimeout must exceed roomDialTimeout because the
+	// lobby deliberately waits for the room's first joined frame before it
+	// sends the browser's 101 response.
+	proxyHandshakeWriteTimeout = roomDialTimeout + 30*time.Second
 )
 
 func readWebTransportJSON(stream io.Reader, value interface{}) error {
@@ -382,7 +386,7 @@ func main() {
 		Handler:           requestMetrics(mux),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
-		WriteTimeout:      30 * time.Second,
+		WriteTimeout:      proxyHandshakeWriteTimeout,
 		IdleTimeout:       60 * time.Second,
 		MaxHeaderBytes:    16 << 10,
 	}
