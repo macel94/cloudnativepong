@@ -26,7 +26,7 @@ data:
         "containers": [
           {
             "name": "pong-room",
-            "image": "ghcr.io/macel94/cloudnativepong-room@sha256:361b05bc257e7f81c44bbd29d15979c7ada5ccb2763ce9af28eff15aaa461027",
+            "image": "ghcr.io/macel94/cloudnativepong-room@sha256:aff32e3199d315f3920ac5ac10ee38917f000d759cb344d002a3a6f43abf5792",
             "imagePullPolicy": "Always",
             "securityContext": {
               "allowPrivilegeEscalation": false,
