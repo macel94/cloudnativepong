@@ -74,6 +74,9 @@ func registerCanonicalMetrics(registry *metrics.Registry) {
 		"pong_room_stream_frame_over_25ms",
 		"pong_proxy_frame_over_25ms",
 		"pong_proxy_relay_over_25ms",
+		"pong_websocket_state_write_timeout",
+		"pong_webtransport_state_write_timeout",
+		"pong_proxy_client_write_timeout",
 	} {
 		registry.RegisterCounter(name)
 	}
@@ -227,6 +230,12 @@ const (
 	// lobby deliberately waits for the room's first joined frame before it
 	// sends the browser's 101 response.
 	proxyHandshakeWriteTimeout = roomDialTimeout + 30*time.Second
+
+	// A state frame is small and should cross the in-cluster and gateway hops
+	// well below this bound. If a downstream WebSocket cannot accept a frame in
+	// time, closing it is preferable to holding stale authoritative state in a
+	// blocked WriteJSON call; the browser can then use its reconnect token.
+	pongStateWriteTimeout = 150 * time.Millisecond
 )
 
 func readWebTransportJSON(stream io.Reader, value interface{}) error {
@@ -602,11 +611,41 @@ type gameConnection interface {
 	Close() error
 }
 
+type writeDeadlineConnection interface {
+	SetWriteDeadline(time.Time) error
+}
+
+// writeJSONWithDeadline prevents a slow downstream from stalling the room's
+// state stream indefinitely. Connections that do not expose deadlines remain
+// usable as simple local/test doubles.
+func writeJSONWithDeadline(conn gameConnection, value interface{}, timeout time.Duration) error {
+	deadlineConn, ok := conn.(writeDeadlineConnection)
+	if !ok {
+		return conn.WriteJSON(value)
+	}
+	if err := deadlineConn.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
+		return err
+	}
+	err := conn.WriteJSON(value)
+	if err == nil {
+		_ = deadlineConn.SetWriteDeadline(time.Time{})
+	}
+	return err
+}
+
+func writeTimedOut(err error) bool {
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
 type webSocketGameConnection struct{ conn *websocket.Conn }
 
 func (c webSocketGameConnection) ReadJSON(value interface{}) error  { return c.conn.ReadJSON(value) }
 func (c webSocketGameConnection) WriteJSON(value interface{}) error { return c.conn.WriteJSON(value) }
 func (c webSocketGameConnection) Close() error                      { return c.conn.Close() }
+func (c webSocketGameConnection) SetWriteDeadline(deadline time.Time) error {
+	return c.conn.SetWriteDeadline(deadline)
+}
 
 func setupLocalWebTransportRoutes(mux *http.ServeMux, _ *lobby.Server, _ *db.Store) {
 	mux.HandleFunc("/rooms/", func(w http.ResponseWriter, r *http.Request) {
@@ -697,6 +736,10 @@ func (c *webTransportGameConnection) WriteJSON(value interface{}) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 	return writeWebTransportJSON(c.stream, value)
+}
+
+func (c *webTransportGameConnection) SetWriteDeadline(deadline time.Time) error {
+	return c.stream.SetWriteDeadline(deadline)
 }
 
 func (c *webTransportGameConnection) Close() error { return c.stream.Close() }
@@ -867,8 +910,11 @@ func streamRoomStates(conn gameConnection, room *localRoom, transport string, fi
 
 		state := room.engine.State()
 		writeStart := time.Now()
-		if err := conn.WriteJSON(map[string]interface{}{"type": "state", "state": state}); err != nil {
+		if err := writeJSONWithDeadline(conn, map[string]interface{}{"type": "state", "state": state}, pongStateWriteTimeout); err != nil {
 			appMetrics.Inc("pong_" + transport + "_state_write_failure")
+			if writeTimedOut(err) {
+				appMetrics.Inc("pong_" + transport + "_state_write_timeout")
+			}
 			if finishRoom {
 				room.disconnectPlayer(player, generation, true)
 			}
@@ -1700,7 +1746,18 @@ func proxyRoomWS(w http.ResponseWriter, r *http.Request, lobbySrv *lobby.Server,
 		<-clientReady
 		clientWriteMu.Lock()
 		defer clientWriteMu.Unlock()
-		return writeWebSocketFrame(clientConn, messageType, payload)
+		if err := clientConn.SetWriteDeadline(time.Now().Add(pongStateWriteTimeout)); err != nil {
+			return err
+		}
+		err := writeWebSocketFrame(clientConn, messageType, payload)
+		if err != nil {
+			if writeTimedOut(err) {
+				appMetrics.Inc("pong_proxy_client_write_timeout")
+			}
+			return err
+		}
+		_ = clientConn.SetWriteDeadline(time.Time{})
+		return nil
 	}
 
 	// Gorilla handles control frames from the room connection. Forwarding

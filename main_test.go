@@ -101,6 +101,45 @@ func (fakeGameConnection) ReadJSON(interface{}) error  { return io.EOF }
 func (fakeGameConnection) WriteJSON(interface{}) error { return nil }
 func (fakeGameConnection) Close() error                { return nil }
 
+type deadlineGameConnection struct {
+	deadlines []time.Time
+	writeErr  error
+}
+
+func (c *deadlineGameConnection) ReadJSON(interface{}) error  { return io.EOF }
+func (c *deadlineGameConnection) WriteJSON(interface{}) error { return c.writeErr }
+func (c *deadlineGameConnection) Close() error                { return nil }
+func (c *deadlineGameConnection) SetWriteDeadline(deadline time.Time) error {
+	c.deadlines = append(c.deadlines, deadline)
+	return nil
+}
+
+type timeoutGameError struct{}
+
+func (timeoutGameError) Error() string   { return "write timed out" }
+func (timeoutGameError) Timeout() bool   { return true }
+func (timeoutGameError) Temporary() bool { return true }
+
+func TestWriteJSONWithDeadlineClearsSuccessfulDeadline(t *testing.T) {
+	conn := &deadlineGameConnection{}
+	if err := writeJSONWithDeadline(conn, map[string]string{"type": "state"}, time.Second); err != nil {
+		t.Fatalf("writeJSONWithDeadline() error = %v", err)
+	}
+	if len(conn.deadlines) != 2 || conn.deadlines[0].IsZero() || !conn.deadlines[1].IsZero() {
+		t.Fatalf("write deadlines = %#v, want an active deadline followed by a cleared deadline", conn.deadlines)
+	}
+}
+
+func TestWriteJSONWithDeadlineLeavesFailedConnectionArmed(t *testing.T) {
+	conn := &deadlineGameConnection{writeErr: timeoutGameError{}}
+	if err := writeJSONWithDeadline(conn, map[string]string{"type": "state"}, time.Second); !writeTimedOut(err) {
+		t.Fatalf("writeJSONWithDeadline() error = %v, want a timeout", err)
+	}
+	if len(conn.deadlines) != 1 || conn.deadlines[0].IsZero() {
+		t.Fatalf("write deadlines = %#v, want only the active deadline after failure", conn.deadlines)
+	}
+}
+
 func TestRequestMetricsCountsFailureWithoutRequestData(t *testing.T) {
 	registry := metrics.NewRegistry()
 	old := appMetrics

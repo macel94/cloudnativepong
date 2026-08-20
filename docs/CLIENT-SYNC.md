@@ -149,6 +149,12 @@ Frontend:
   session already leaves measurable history in the browser console without
   turning anything on. The lobby prints a one-line hint: reload as `/?diag=1`
   to upgrade every game page to a full two-second report.
+- Server WebSocket state writes have a 150ms deadline. A stalled room-to-proxy
+  or proxy-to-browser hop is closed instead of letting an old state frame block
+  the authoritative stream for hundreds of milliseconds. The browser's
+  reconnect-token path then reconnects the player. `pong_*_state_write_timeout`
+  and `pong_proxy_client_write_timeout` distinguish this recovery path from
+  browser rendering or simulation problems.
 
 A healthy pipe has ~50 Hz state cadence, gap p95 near 25-30 ms, sub-millisecond
 write/relay costs, tiny display corrections (< 0.02 normalized units), and an
