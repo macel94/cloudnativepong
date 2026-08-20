@@ -12,16 +12,16 @@ resources:
 images:
   - name: cloudnativepong-api
     newName: ghcr.io/macel94/cloudnativepong-api
-    digest: sha256:d568ade9fb5361880c647811e6afe5de06bc115b2e4f98edf48410e4560dc75f
+    digest: sha256:fdb766f0b87ab69013f345bdb0b669644c8ffc06581bc65c0a7c70bcee134e39
   - name: cloudnativepong-room
     newName: ghcr.io/macel94/cloudnativepong-room
-    digest: sha256:aff32e3199d315f3920ac5ac10ee38917f000d759cb344d002a3a6f43abf5792
+    digest: sha256:387b358e6ba09fd6116e9d10a1dd5389846678d6dbee14d0f114e25695932499
   - name: cloudnativepong-static
     newName: ghcr.io/macel94/cloudnativepong-static
-    digest: sha256:0de8307bd409a5c5d2fe72511ae47ef23234759e9b017fac1563811c2d2ff010
+    digest: sha256:79c3d80207c11a2b282109e7cec51d1547a49509f4c55a2c43ec636a38eb312a
   - name: cloudnativepong-gateway
     newName: ghcr.io/macel94/cloudnativepong-gateway
-    digest: sha256:e7dfe218ac39b38e08a847f808e5ef8a67572990a667a89d045a0681cb100ce7
+    digest: sha256:2817bb422871070bb159ba6463f03b6d2a12cec4d4a8a80031ec1d80ded82f72
 
 patches:
   - path: api-native-staging.yaml
