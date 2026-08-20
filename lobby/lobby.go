@@ -62,10 +62,10 @@ type Orchestrator interface {
 // Server handles HTTP requests for the lobby.
 const defaultRoomIdleTimeout = 10 * time.Minute
 
-// Room Pods are created asynchronously. Wait for the Service to publish a
-// ready endpoint before returning the room to callers so the lobby's bounded
-// WebSocket dial retry budget is reserved for transient routing failures, not
-// normal image startup.
+// Room Pods are created asynchronously. Room creation returns after Kubernetes
+// accepts the Service and Pod; the browser-facing WebSocket proxy waits for the
+// endpoint to become usable. This keeps cold image pulls from turning the
+// create request into a user-visible 503.
 const (
 	roomEndpointReadyTimeout = 15 * time.Second
 	roomEndpointPollInterval = 100 * time.Millisecond
@@ -900,11 +900,11 @@ func (s *Server) createK8sPod(roomID string) (string, error) {
 	if err := json.Unmarshal(respBody, &result); err != nil {
 		return "", errors.New("invalid kubernetes pod response")
 	}
-	if err := s.waitForRoomEndpoint(roomID, apiHost, apiPort, ns, token); err != nil {
-		s.metric("pong_room_ready_wait_failure")
-		return "", err
-	}
-	s.metric("pong_room_ready_wait_success")
+	// Do not synchronously wait for readiness here. The public create request
+	// must not occupy the single lobby worker while a room image is pulled or
+	// EndpointSlice propagation is converging. proxyRoomWS uses its own bounded
+	// dial retry window and reports an unavailable room only if that window is
+	// actually exceeded.
 	return result.Status.PodIP, nil
 }
 

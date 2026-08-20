@@ -34,6 +34,10 @@
 
     let ws = null;
     let connection = null;
+    let connectionGeneration = 0;
+    let reconnectTimer = null;
+    let reconnectAttempts = 0;
+    let reconnectDeadline = 0;
     let player = isAI ? 1 : 0;
     let gameState = null;
     let gameOverShown = false;
@@ -76,6 +80,7 @@
     const WIN_SCORE = 7;
     const TICK_MS = 16;
     const INPUT_SEND_MS = 33;
+    const RECONNECT_GRACE_MS = 15000;
 
     function setControlHint() {
         if (!controlHint) return;
@@ -262,6 +267,10 @@
 
         if (message.type === 'joined') {
             player = message.player;
+            if (message.reconnect_token && /^[0-9a-f]{32}$/u.test(message.reconnect_token)) {
+                const secure = window.location.protocol === 'https:' ? '; Secure' : '';
+                document.cookie = `pong_reconnect_${roomId}=${message.reconnect_token}; Max-Age=3600; Path=/; SameSite=Strict${secure}`;
+            }
             stateBuffer.length = 0;
             presentationCorrection = {
                 ball: { x: 0, y: 0 },
@@ -269,16 +278,20 @@
                 p2: 0,
             };
             presentationCorrectionAt = performance.now();
-            nextInputSequence = 0;
+            const serverInputSequence = Number.isSafeInteger(message.input_sequence) && message.input_sequence >= 0
+                ? message.input_sequence
+                : 0;
+            nextInputSequence = serverInputSequence;
             predictedLocalPaddleY = null;
             reconciliationTargetY = null;
             lastAcknowledgedInputSequence = 0;
             pendingInputs.length = 0;
             setControlHint();
-            statusElement.textContent =
-                'You are Player ' + player + '. ' +
-                (player === 1 ? 'Use W/S or touch buttons.' : 'Use ↑/↓ or touch buttons.') +
-                (player === 1 ? ' Waiting for opponent...' : '');
+            statusElement.textContent = message.reconnected
+                ? 'Reconnected. Resuming game...'
+                : 'You are Player ' + player + '. ' +
+                    (player === 1 ? 'Use W/S or touch buttons.' : 'Use ↑/↓ or touch buttons.') +
+                    (player === 1 ? ' Waiting for opponent...' : '');
         }
 
         if (message.type === 'state' && message.state && message.state.ball) {
@@ -318,33 +331,64 @@
         connection = null;
     }
 
-    function connectWebSocket() {
+    function scheduleReconnect() {
+        if (gameOverShown || reconnectTimer !== null) return;
+        if (reconnectDeadline === 0) reconnectDeadline = performance.now() + RECONNECT_GRACE_MS;
+        const remaining = reconnectDeadline - performance.now();
+        if (remaining <= 0) {
+            markDisconnected('Disconnected. Please return to the lobby.');
+            return;
+        }
+        const delay = Math.min(1000, 200 * (2 ** Math.min(reconnectAttempts, 2)));
+        reconnectTimer = setTimeout(() => {
+            reconnectTimer = null;
+            reconnectAttempts += 1;
+            connectWebSocket(true);
+        }, Math.min(delay, remaining));
+        if (!gameOverShown) statusElement.textContent = 'Connection lost. Reconnecting...';
+    }
+
+    function connectWebSocket(reconnecting = false) {
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
         const wsURL = `${protocol}//${window.location.host}/rooms/${encodeURIComponent(roomId)}/ws`;
         const spectatorQuery = isSpectator ? '?spectator=1' : '';
-        ws = new WebSocket(wsURL + spectatorQuery);
+        const socket = new WebSocket(wsURL + spectatorQuery);
+        const generation = ++connectionGeneration;
+        ws = socket;
         connection = {
-            send: (value) => ws.send(JSON.stringify(value)),
-            close: () => ws.close(),
-            isOpen: () => ws.readyState === WebSocket.OPEN,
+            send: (value) => socket.send(JSON.stringify(value)),
+            close: () => socket.close(),
+            isOpen: () => socket.readyState === WebSocket.OPEN,
         };
 
-        ws.onopen = function () {
-            statusElement.textContent = isSpectator
-                ? 'Connected via WebSocket. Joining spectator view...'
-                : 'Connected via WebSocket. Waiting for opponent...';
-            ws.send(JSON.stringify({ type: 'proxy-ready' }));
+        socket.onopen = function () {
+            if (generation !== connectionGeneration) return;
+            reconnectAttempts = 0;
+            if (!reconnecting) reconnectDeadline = 0;
+            statusElement.textContent = reconnecting
+                ? 'Reconnected. Joining game...'
+                : (isSpectator
+                    ? 'Connected via WebSocket. Joining spectator view...'
+                    : 'Connected via WebSocket. Waiting for opponent...');
+            socket.send(JSON.stringify({ type: 'proxy-ready' }));
         };
-        ws.onmessage = function (event) {
+        socket.onmessage = function (event) {
+            if (generation !== connectionGeneration) return;
             try {
                 handleMessage(JSON.parse(event.data));
             } catch {
                 statusElement.textContent = 'Received invalid game data.';
             }
         };
-        ws.onclose = () => markDisconnected('Disconnected.');
-        ws.onerror = () => {
-            if (!gameOverShown) statusElement.textContent = 'Connection error.';
+        socket.onclose = () => {
+            if (generation !== connectionGeneration) return;
+            markDisconnected('Disconnected.');
+            scheduleReconnect();
+        };
+        socket.onerror = () => {
+            if (generation === connectionGeneration && !gameOverShown) {
+                statusElement.textContent = 'Connection error. Reconnecting...';
+            }
         };
     }
 

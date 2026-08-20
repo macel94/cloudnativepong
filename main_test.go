@@ -22,6 +22,33 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+func TestReconnectTokenReclaimsSamePlayerSlotAndStaleGenerationIsIgnored(t *testing.T) {
+	room := &localRoom{engine: game.NewEngine(), done: make(chan struct{})}
+	first := &fakeGameConnection{}
+	player, token, reconnected, generation, _, ok := room.attachPlayer(first, "")
+	if !ok || player != 1 || reconnected || !validReconnectToken(token) || generation != 1 {
+		t.Fatalf("initial attach = player:%d token:%q reconnected:%v generation:%d ok:%v", player, token, reconnected, generation, ok)
+	}
+	second := &fakeGameConnection{}
+	if !room.disconnectPlayer(1, generation) {
+		t.Fatal("initial disconnect was not recorded")
+	}
+	player, replacementToken, reconnected, replacementGeneration, oldConn, ok := room.attachPlayer(second, token)
+	if !ok || player != 1 || replacementToken != token || !reconnected || replacementGeneration != generation+1 || oldConn != nil {
+		t.Fatalf("reconnect attach = player:%d token:%q reconnected:%v generation:%d old:%v ok:%v", player, replacementToken, reconnected, replacementGeneration, oldConn, ok)
+	}
+	if room.disconnectPlayer(1, generation) {
+		t.Fatal("stale generation disconnected the replacement")
+	}
+	if room.engine.State().Status == game.StatusFinished {
+		t.Fatal("stale generation finished the room")
+	}
+	_ = room.disconnectPlayer(1, replacementGeneration)
+	if timer := room.disconnectTimers[0]; timer != nil {
+		timer.Stop()
+	}
+}
+
 func TestRequestIDIsOpaqueValidatedAndPropagated(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		id := newRequestID()
@@ -61,6 +88,12 @@ func TestRequestIDIsOpaqueValidatedAndPropagated(t *testing.T) {
 		t.Fatalf("request duration metric missing: %q", body)
 	}
 }
+
+type fakeGameConnection struct{}
+
+func (fakeGameConnection) ReadJSON(interface{}) error  { return io.EOF }
+func (fakeGameConnection) WriteJSON(interface{}) error { return nil }
+func (fakeGameConnection) Close() error                { return nil }
 
 func TestRequestMetricsCountsFailureWithoutRequestData(t *testing.T) {
 	registry := metrics.NewRegistry()
@@ -627,7 +660,9 @@ func TestProxyRoomWSForwardsImmediateJoinedFrame(t *testing.T) {
 	t.Cleanup(func() { publicAdmission = oldAdmission })
 
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	targetToken := make(chan string, 1)
 	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		targetToken <- r.Header.Get(reconnectTokenHeader)
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
 			return
@@ -670,7 +705,10 @@ func TestProxyRoomWSForwardsImmediateJoinedFrame(t *testing.T) {
 
 	client, response, err := websocket.DefaultDialer.Dial(
 		"ws"+strings.TrimPrefix(proxy.URL, "http")+"/rooms/"+room.ID+"/ws",
-		http.Header{"Origin": []string{"http://localhost:8080"}},
+		http.Header{
+			"Origin": []string{"http://localhost:8080"},
+			"Cookie": []string{"pong_reconnect_" + room.ID + "=0123456789abcdef0123456789abcdef"},
+		},
 	)
 	if err != nil {
 		if response != nil {
@@ -692,6 +730,14 @@ func TestProxyRoomWSForwardsImmediateJoinedFrame(t *testing.T) {
 	}
 	if messageType != websocket.TextMessage || string(payload) != `{"type":"joined","player":1}` {
 		t.Fatalf("received message type=%d payload=%s, want immediate joined frame", messageType, payload)
+	}
+	select {
+	case token := <-targetToken:
+		if token != "0123456789abcdef0123456789abcdef" {
+			t.Fatalf("target reconnect token = %q, want the room cookie value", token)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for target reconnect token")
 	}
 }
 

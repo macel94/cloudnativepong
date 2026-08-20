@@ -9,6 +9,7 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -212,7 +213,7 @@ const maxWebTransportMessageSize = 1 << 20
 // proxy retry bounded, but allow the Kubernetes data plane a few seconds to
 // converge after the room endpoint becomes ready.
 const (
-	roomDialTimeout       = 5 * time.Second
+	roomDialTimeout       = 60 * time.Second
 	roomDialRetryInterval = 500 * time.Millisecond
 )
 
@@ -430,16 +431,22 @@ func main() {
 
 // ---- Local mode: lobby + rooms in one process ----
 
+const playerReconnectGracePeriod = 15 * time.Second
+const reconnectTokenHeader = "X-Pong-Reconnect-Token"
+
 type localRoom struct {
-	engine      *game.Engine
-	players     [2]gameConnection
-	mu          sync.Mutex
-	loopOnce    sync.Once
-	done        chan struct{}
-	doneOnce    sync.Once
-	cleanupOnce sync.Once
-	cleanup     func()
-	start       func() error
+	engine           *game.Engine
+	players          [2]gameConnection
+	playerTokens     [2]string
+	playerGeneration [2]uint64
+	disconnectTimers [2]*time.Timer
+	mu               sync.Mutex
+	loopOnce         sync.Once
+	done             chan struct{}
+	doneOnce         sync.Once
+	cleanupOnce      sync.Once
+	cleanup          func()
+	start            func() error
 }
 
 var localRooms sync.Map // roomID -> *localRoom
@@ -715,26 +722,36 @@ func handleGameConnection(conn gameConnection, r *http.Request, roomID, lobbyAdd
 		return
 	}
 
-	room.mu.Lock()
-	var player int
-	if room.players[0] == nil {
-		player = 1
-		room.players[0] = conn
-	} else if room.players[1] == nil {
-		player = 2
-		room.players[1] = conn
-	} else {
-		room.mu.Unlock()
+	player, reconnectToken, reconnected, generation, oldConn, ok := room.attachPlayer(conn, reconnectTokenFromRequest(r, roomID))
+	if !ok {
 		appMetrics.Inc("pong_" + transport + "_room_full")
 		_ = conn.WriteJSON(map[string]string{"type": "error", "message": "room full"})
 		return
 	}
-	room.mu.Unlock()
+	if oldConn != nil && oldConn != conn {
+		// A reconnect replaces the stale relay. Its reader is generation-checked
+		// below, so it cannot tear down the replacement connection.
+		_ = oldConn.Close()
+	}
 	appMetrics.Inc("pong_" + transport + "_player_assigned")
 
-	if err := conn.WriteJSON(map[string]interface{}{"type": "joined", "player": player}); err != nil {
+	state := room.engine.State()
+	inputSequence := state.P1InputSequence
+	if player == 2 {
+		inputSequence = state.P2InputSequence
+	}
+	joined := map[string]interface{}{
+		"type":            "joined",
+		"player":          player,
+		"reconnect_token": reconnectToken,
+		"input_sequence":  inputSequence,
+	}
+	if reconnected {
+		joined["reconnected"] = true
+	}
+	if err := conn.WriteJSON(joined); err != nil {
 		appMetrics.Inc("pong_" + transport + "_joined_write_failure")
-		room.signalFinished()
+		room.disconnectPlayer(player, generation)
 		return
 	}
 	appMetrics.Inc("pong_" + transport + "_joined_write_success")
@@ -762,17 +779,7 @@ func handleGameConnection(conn gameConnection, r *http.Request, roomID, lobbyAdd
 			var input game.Input
 			if err := conn.ReadJSON(&input); err != nil {
 				appMetrics.Inc("pong_" + transport + "_disconnect")
-				room.engine.PlayerLeft(player)
-				room.signalFinished()
-				room.mu.Lock()
-				other := 0
-				if player == 1 {
-					other = 1
-				}
-				if room.players[other] != nil {
-					_ = room.players[other].Close()
-				}
-				room.mu.Unlock()
+				room.disconnectPlayer(player, generation)
 				return
 			}
 			input.Player = player
@@ -781,7 +788,7 @@ func handleGameConnection(conn gameConnection, r *http.Request, roomID, lobbyAdd
 	}()
 
 	room.loopOnce.Do(func() { go runGameLoop(room) })
-	streamRoomStates(conn, room, transport, true, roomID)
+	streamRoomStates(conn, room, transport, true, roomID, player, generation)
 }
 
 func handleSpectatorConnection(conn gameConnection, room *localRoom, transport string) {
@@ -803,10 +810,10 @@ func handleSpectatorConnection(conn gameConnection, room *localRoom, transport s
 		}
 	}()
 
-	streamRoomStates(conn, room, transport, false, "")
+	streamRoomStates(conn, room, transport, false, "", 0, 0)
 }
 
-func streamRoomStates(conn gameConnection, room *localRoom, transport string, finishRoom bool, roomID string) {
+func streamRoomStates(conn gameConnection, room *localRoom, transport string, finishRoom bool, roomID string, player int, generation uint64) {
 	// The engine still advances at 60 Hz, but a 30 Hz snapshot stream is enough
 	// for the browser's display-time extrapolation and halves JSON/proxy writes.
 	ticker := time.NewTicker(game.StateBroadcastInterval)
@@ -816,7 +823,7 @@ func streamRoomStates(conn gameConnection, room *localRoom, transport string, fi
 		if err := conn.WriteJSON(map[string]interface{}{"type": "state", "state": state}); err != nil {
 			appMetrics.Inc("pong_" + transport + "_state_write_failure")
 			if finishRoom {
-				room.signalFinished()
+				room.disconnectPlayer(player, generation)
 			}
 			return
 		}
@@ -838,10 +845,11 @@ func isSpectatorRequest(r *http.Request) bool {
 }
 
 func roomWebSocketURL(addr string, spectator bool) string {
+	path := "ws://" + addr + "/ws"
 	if spectator {
-		return "ws://" + addr + "/ws?spectator=1"
+		path += "?spectator=1"
 	}
-	return "ws://" + addr + "/ws"
+	return path
 }
 
 // dialRoomWithRetry tolerates the short interval between a ready EndpointSlice
@@ -855,9 +863,9 @@ func dialRoomWithRetry(parent context.Context, addr string, spectator bool, head
 		HandshakeTimeout: 2 * time.Second,
 		NetDialContext:   (&net.Dialer{Timeout: 2 * time.Second}).DialContext,
 	}
-	url := roomWebSocketURL(addr, spectator)
+	targetURL := roomWebSocketURL(addr, spectator)
 	for {
-		target, response, err := dialer.DialContext(ctx, url, header)
+		target, response, err := dialer.DialContext(ctx, targetURL, header)
 		if err == nil {
 			return target, nil
 		}
@@ -884,6 +892,9 @@ func runGameLoop(room *localRoom) {
 	defer ticker.Stop()
 
 	for range ticker.C {
+		if !room.playersConnected() && room.engine.State().Status != game.StatusFinished {
+			continue
+		}
 		state := room.engine.Tick()
 		if state.Status == game.StatusFinished {
 			room.signalFinished()
@@ -899,6 +910,109 @@ func runGameLoop(room *localRoom) {
 			return
 		}
 	}
+}
+
+func (r *localRoom) attachPlayer(conn gameConnection, requestedToken string) (player int, token string, reconnected bool, generation uint64, oldConn gameConnection, ok bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.engine.State().Status == game.StatusFinished {
+		return 0, "", false, 0, nil, false
+	}
+
+	index := -1
+	if validReconnectToken(requestedToken) {
+		for i := range r.playerTokens {
+			if r.playerTokens[i] == requestedToken && r.players[i] == nil && r.disconnectTimers[i] != nil {
+				index = i
+				reconnected = true
+				break
+			}
+		}
+	} else {
+		for i := range r.players {
+			if r.players[i] == nil && r.playerTokens[i] == "" {
+				index = i
+				break
+			}
+		}
+	}
+	if index < 0 {
+		return 0, "", false, 0, nil, false
+	}
+	if timer := r.disconnectTimers[index]; timer != nil {
+		timer.Stop()
+		r.disconnectTimers[index] = nil
+	}
+	oldConn = r.players[index]
+	if r.playerTokens[index] == "" {
+		r.playerTokens[index] = newReconnectToken()
+	}
+	r.players[index] = conn
+	r.playerGeneration[index]++
+	return index + 1, r.playerTokens[index], reconnected, r.playerGeneration[index], oldConn, true
+}
+
+func (r *localRoom) disconnectPlayer(player int, generation uint64) bool {
+	index := player - 1
+	if index < 0 || index >= len(r.players) {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.playerGeneration[index] != generation || r.players[index] == nil {
+		return false
+	}
+	r.players[index] = nil
+	r.disconnectTimers[index] = time.AfterFunc(playerReconnectGracePeriod, func() {
+		r.mu.Lock()
+		if r.playerGeneration[index] != generation || r.players[index] != nil {
+			r.mu.Unlock()
+			return
+		}
+		r.disconnectTimers[index] = nil
+		r.playerTokens[index] = ""
+		r.mu.Unlock()
+		r.engine.PlayerLeft(player)
+		r.signalFinished()
+	})
+	return true
+}
+
+func (r *localRoom) playersConnected() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.players[0] != nil && r.players[1] != nil
+}
+
+func newReconnectToken() string {
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return newRequestID()
+	}
+	return hex.EncodeToString(raw[:])
+}
+
+func validReconnectToken(value string) bool {
+	if len(value) != 32 {
+		return false
+	}
+	for _, char := range value {
+		if !(char >= '0' && char <= '9' || char >= 'a' && char <= 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+func reconnectTokenFromRequest(r *http.Request, roomID string) string {
+	if token := strings.TrimSpace(r.Header.Get(reconnectTokenHeader)); validReconnectToken(token) {
+		return token
+	}
+	cookie, err := r.Cookie("pong_reconnect_" + roomID)
+	if err == nil && validReconnectToken(cookie.Value) {
+		return cookie.Value
+	}
+	return ""
 }
 
 func getOrCreateLocalRoom(id string) *localRoom {
@@ -1306,6 +1420,9 @@ func proxyRoomWebTransport(session *webtransport.Session, r *http.Request, roomI
 	}
 	targetHeader.Set(requestIDHeader, requestID(r))
 	targetHeader.Set(correlationIDHeader, requestID(r))
+	if token := reconnectTokenFromRequest(r, roomID); token != "" {
+		targetHeader.Set(reconnectTokenHeader, token)
+	}
 	telemetry.Inject(r.Context(), targetHeader)
 	target, err := dialRoomWithRetry(r.Context(), addr, isSpectatorRequest(r), targetHeader, "pong_webtransport_proxy_dial_retry")
 	if err != nil {
@@ -1451,6 +1568,9 @@ func proxyRoomWS(w http.ResponseWriter, r *http.Request, lobbySrv *lobby.Server,
 	}
 	targetHeader.Set(requestIDHeader, requestID(r))
 	targetHeader.Set(correlationIDHeader, requestID(r))
+	if token := reconnectTokenFromRequest(r, roomID); token != "" {
+		targetHeader.Set(reconnectTokenHeader, token)
+	}
 	telemetry.Inject(r.Context(), targetHeader)
 	target, err := dialRoomWithRetry(r.Context(), addr, isSpectatorRequest(r), targetHeader, "pong_websocket_proxy_dial_retry")
 	if err != nil {
