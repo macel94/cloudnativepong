@@ -846,6 +846,57 @@
         presentationCorrection.p2 *= amount;
     }
 
+    // Display-only prediction of the ball over the next ~ms. This mirrors the
+    // authoritative rules (wall and paddle reflection, offset-based rebound,
+    // speed clamp) so the presentation matches what the next snapshot reports
+    // and the display does not need to snap after a bounce. Scores are held at
+    // the edge (the real reset is authoritative). Never authoritative.
+    function simulateBallDisplay(ball, p1, p2, ms) {
+        let x = ball.x;
+        let y = ball.y;
+        let dx = ball.dx;
+        let dy = ball.dy;
+        let remaining = ms / TICK_MS;
+        const sub = 0.125; // sub-tick step keeps the ball from tunneling a paddle
+        while (remaining > 1e-9) {
+            const s = Math.min(sub, remaining);
+            remaining -= s;
+            x += dx * s;
+            y += dy * s;
+
+            if (y - BALL_SIZE / 2 <= 0) { y = BALL_SIZE / 2; dy = Math.abs(dy); }
+            if (y + BALL_SIZE / 2 >= 1) { y = 1 - BALL_SIZE / 2; dy = -Math.abs(dy); }
+
+            if (x - BALL_SIZE / 2 <= PADDLE_WIDTH && dx < 0) {
+                const offset = (y - p1.y) / (PADDLE_HEIGHT / 2);
+                if (Math.abs(offset) <= 1) {
+                    x = PADDLE_WIDTH + BALL_SIZE / 2;
+                    dx = Math.abs(dx);
+                    dy += offset * 0.005;
+                    const speed = Math.hypot(dx, dy);
+                    if (speed > MAX_BALL_SPEED) { const s2 = MAX_BALL_SPEED / speed; dx *= s2; dy *= s2; }
+                } else if (x - BALL_SIZE / 2 <= 0) {
+                    x = BALL_SIZE / 2; dy = 0; break;
+                }
+            }
+            if (x + BALL_SIZE / 2 >= 1 - PADDLE_WIDTH && dx > 0) {
+                const offset = (y - p2.y) / (PADDLE_HEIGHT / 2);
+                if (Math.abs(offset) <= 1) {
+                    x = 1 - PADDLE_WIDTH - BALL_SIZE / 2;
+                    dx = -Math.abs(dx);
+                    dy += offset * 0.005;
+                    const speed = Math.hypot(dx, dy);
+                    if (speed > MAX_BALL_SPEED) { const s2 = MAX_BALL_SPEED / speed; dx *= s2; dy *= s2; }
+                } else if (x + BALL_SIZE / 2 >= 1) {
+                    x = 1 - BALL_SIZE / 2; dy = 0; break;
+                }
+            }
+            if (x <= 0) { x = 0; dy = 0; break; }
+            if (x >= 1) { x = 1; dy = 0; break; }
+        }
+        return { x, y, dx, dy };
+    }
+
     function extrapolatedState(now) {
         if (stateBuffer.length === 0) return lastRenderedState;
 
@@ -859,15 +910,12 @@
         // rendered immediately even before a second snapshot arrives. The
         // snapshot-derived remote-paddle velocity is only used where the wire
         // protocol does not carry paddle velocity.
-        const ballVelocity = {
-            x: newest.state.ball.dx / TICK_MS,
-            y: newest.state.ball.dy / TICK_MS,
-        };
         const p1Velocity = paddleVelocity(older, newest, 'p1');
         const p2Velocity = paddleVelocity(older, newest, 'p2');
-        const ballX = newest.state.ball.x + ballVelocity.x * elapsedMs;
-        const rawBallY = newest.state.ball.y + ballVelocity.y * elapsedMs;
-        const reflected = reflectBallY(rawBallY, newest.state.ball.dy);
+        // Simulate the display ball forward from the newest authoritative state
+        // with wall and paddle bounces, so a paddle hit does not make the ball
+        // jump sideways when the authoritative snapshot confirms it.
+        const simulated = simulateBallDisplay(newest.state.ball, newest.state.p1, newest.state.p2, elapsedMs);
         const localPaddle = localPaddleKey();
 
         decayPresentationCorrection(now);
@@ -875,9 +923,10 @@
             ...newest.state,
             ball: {
                 ...newest.state.ball,
-                x: clampUnit(ballX + presentationCorrection.ball.x),
-                y: clampUnit(reflected.y + presentationCorrection.ball.y),
-                dy: reflected.dy,
+                x: clampUnit(simulated.x + presentationCorrection.ball.x),
+                y: clampUnit(simulated.y + presentationCorrection.ball.y),
+                dx: simulated.dx,
+                dy: simulated.dy,
             },
             p1: { y: localPaddle === 'p1' && predictedLocalPaddleY !== null
                 ? predictedLocalPaddleY

@@ -843,9 +843,13 @@ func streamRoomStates(conn gameConnection, room *localRoom, transport string, fi
 		gaps         diagSampleRing
 		writeTimes   diagSampleRing
 		perFrameDiag = diagPerFrame()
+		nextDue      = time.Now()
 	)
 
-	for range ticker.C {
+	for {
+		if remaining := nextDue.Sub(time.Now()); remaining > 0 {
+			time.Sleep(remaining)
+		}
 		now := time.Now()
 		if !lastSent.IsZero() {
 			gap := now.Sub(lastSent)
@@ -893,6 +897,14 @@ func streamRoomStates(conn gameConnection, room *localRoom, transport string, fi
 				localRooms.Delete(roomID)
 			}
 			return
+		}
+
+		// Step the cadence anchor forward. If a slow write or scheduler stall
+		// left us behind the planned schedule, re-anchor to the next interval so
+		// the stream never drains a queue of delayed snapshots back-to-back.
+		nextDue = nextDue.Add(game.StateBroadcastInterval)
+		if nextDue.Compare(time.Now()) < 0 {
+			nextDue = time.Now().Add(game.StateBroadcastInterval)
 		}
 	}
 }

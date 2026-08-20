@@ -78,10 +78,12 @@ and applies it on each 60 Hz simulation tick.
   position on each display frame. A bounded correction decays when the next
   snapshot disagrees; the opponent is no longer intentionally rendered in the
   past.
-- **Ball:** latest-snapshot dead reckoning. The authoritative ball velocity is
-  used immediately to advance the ball between packets, with local wall
-  reflection for presentation only. Collisions, paddle hits, scoring, and
-  resets remain server-controlled; a new snapshot corrects any visual error.
+- **Ball:** latest-snapshot dead reckoning with prediction. The authoritative
+  ball velocity advances the ball between packets, but wall **and paddle**
+  bounces are predicted locally (mirroring the server's rebound rules) so a
+  paddle hit does not force the display into a large correction. Collisions,
+  scoring, and resets remain server-controlled; a new snapshot corrects any
+  residual visual error.
 - **Score and game status:** updated from the newest authoritative snapshot,
   not from predicted presentation state.
 
@@ -116,6 +118,11 @@ at. Every hop records the same three numbers: frame cadence (Hz), inter-frame
 jitter (gap avg/p95/max), and the hop's own work inside that gap (write or
 relay time).
 
+The room snapshot stream is paced from a fixed cadence anchor rather than a
+naive ticker: if a slow consumer (write backpressure) or a scheduler stall
+makes a broadcast late, it re-anchors to the next interval instead of firing
+a catch-up burst. This keeps delivery steady and limits drift.
+
 Backend:
 
 - The room pod's `streamRoomStates` logs `[diag] room_state_stream summary`
@@ -142,6 +149,15 @@ A healthy pipe has ~50 Hz state cadence, gap p95 near 25-30 ms, sub-millisecond
 write/relay costs, tiny display corrections (< 0.02 normalized units), and an
 unfilled extrapolation window close to zero. Deviation points at the exact hop:
 backends ending into the room pod, the proxy, or the browser event loop.
+
+How to read the numbers. On a throttled headless browser VM the browser's own
+event loop is usually the slow limb: its render-frame deltas and input cadence
+fall towards 15-20 Hz, and its slow drain inflates the *room-stream write cost*
+and therefore the cadence gaps measured back to itself (TCP backpressure). The
+proxy relay copy cost stays sub-millisecond even then, so it is the surest
+server-side signal; the browser-side extrapolation window and corrections are
+the honest end-to-end picture. A real desktop display at 60+ Hz therefore
+shows far less extrapolation than the CI headless harness.
 
 ## Tests
 
