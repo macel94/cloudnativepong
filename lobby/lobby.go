@@ -62,6 +62,28 @@ type Orchestrator interface {
 // Server handles HTTP requests for the lobby.
 const defaultRoomIdleTimeout = 10 * time.Minute
 
+// Room resources are deliberately explicit in the API-created Pod spec. Keep
+// these values aligned with the room templates and capacity-policy.json: the
+// API submits the final Pod object and does not rely on a mounted template for
+// these fields.
+const (
+	roomCPURequest    = "250m"
+	roomMemoryRequest = "32Mi"
+	roomMemoryLimit   = "64Mi"
+)
+
+func roomResourceRequirements() map[string]interface{} {
+	return map[string]interface{}{
+		"requests": map[string]string{
+			"cpu":    roomCPURequest,
+			"memory": roomMemoryRequest,
+		},
+		"limits": map[string]string{
+			"memory": roomMemoryLimit,
+		},
+	}
+}
+
 // Room Pods are created asynchronously. Room creation returns after Kubernetes
 // accepts the Service and Pod; the browser-facing WebSocket proxy waits for the
 // endpoint to become usable. This keeps cold image pulls from turning the
@@ -833,15 +855,7 @@ func (s *Server) createK8sPod(roomID string) (string, error) {
 						"readOnlyRootFilesystem": true,
 						"runAsNonRoot":           true,
 					},
-					"resources": map[string]interface{}{
-						"requests": map[string]string{
-							"cpu":    "50m",
-							"memory": "32Mi",
-						},
-						"limits": map[string]string{
-							"memory": "64Mi",
-						},
-					},
+					"resources": roomResourceRequirements(),
 				},
 			},
 			"restartPolicy":                 "Never",

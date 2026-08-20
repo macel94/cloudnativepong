@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -19,6 +20,21 @@ func newTestServer(t *testing.T, idleTimeout time.Duration) (*Server, *db.Store)
 		t.Fatalf("db.New() error = %v", err)
 	}
 	return NewServerWithIdleTimeout(store, "local", "", "", idleTimeout), store
+}
+
+func TestRoomResourceRequirementsMatchCapacityContract(t *testing.T) {
+	want := map[string]interface{}{
+		"requests": map[string]string{
+			"cpu":    "250m",
+			"memory": "32Mi",
+		},
+		"limits": map[string]string{
+			"memory": "64Mi",
+		},
+	}
+	if got := roomResourceRequirements(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("roomResourceRequirements() = %#v, want %#v", got, want)
+	}
 }
 
 func TestHandleCreateRoomReservesCreatorSlot(t *testing.T) {
