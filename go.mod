@@ -1,11 +1,11 @@
 module github.com/cloudnativepong
 
-go 1.25.0
+go 1.26.0
 
 require (
 	github.com/gorilla/websocket v1.5.3
-	github.com/quic-go/quic-go v0.61.0
-	github.com/quic-go/webtransport-go v0.12.0
+	github.com/quic-go/quic-go v0.62.0
+	github.com/quic-go/webtransport-go v0.13.0
 	go.opentelemetry.io/otel v1.46.0
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp v1.46.0
 	go.opentelemetry.io/otel/sdk v1.46.0
@@ -16,7 +16,7 @@ require (
 require (
 	github.com/cenkalti/backoff/v5 v5.0.3 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
-	github.com/dunglas/httpsfv v1.1.0 // indirect
+	github.com/dunglas/httpsfv v1.1.1 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/go-logr/logr v1.4.4 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
