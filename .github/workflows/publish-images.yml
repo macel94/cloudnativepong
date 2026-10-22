@@ -9,6 +9,8 @@ on:
       - 'Dockerfile.*'
       - '.dockerignore'
       - 'build/caddy/**'
+      - 'security/**'
+      - 'scripts/create-vulnerability-decision.mjs'
       - 'gateway/Caddyfile'
       - 'static/Caddyfile'
       - 'go.mod'

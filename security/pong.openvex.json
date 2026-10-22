@@ -3,19 +3,18 @@
   "@id": "https://github.com/macel94/cloudnativepong/blob/main/security/pong.openvex.json",
   "author": "Belacca platform",
   "role": "Application security decision",
-  "timestamp": "2026-08-13T00:00:00Z",
-  "version": 1,
+  "timestamp": "2026-10-21T23:00:00Z",
+  "version": 2,
   "tooling": "https://trivy.dev/latest/docs/supply-chain/vex/file/",
   "statements": [
     {
       "vulnerability": { "name": "GO-2026-5932" },
       "products": [
-        { "@id": "pkg:golang/golang.org/x/crypto@v0.55.0" },
-        { "@id": "pkg:golang/golang.org/x/crypto@v0.52.0" }
+        { "@id": "pkg:golang/golang.org/x/crypto@v0.57.0" }
       ],
       "status": "not_affected",
       "justification": "vulnerable_code_not_present",
-      "impact_statement": "Cloud Native Pong and the Caddy runtime use crypto primitives but do not import or link the unmaintained golang.org/x/crypto/openpgp package. The finding is retained as observed evidence and does not authorize any other vulnerability or package version."
+      "impact_statement": "The reviewed linux/amd64 CGO-disabled Pong and standard Caddy 2.11.7 production import graphs contain x/crypto v0.57.0 primitives but exclude every golang.org/x/crypto/openpgp package. Docker builds fail if that package enters the graph. See security/openpgp-review.md for locked inputs and scan evidence. Legacy version scopes are retired; no other vulnerability or package version is authorized. This is a binary-specific absence assessment, not a fix for the unmaintained OpenPGP package."
     }
   ]
 }
