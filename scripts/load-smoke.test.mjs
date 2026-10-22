@@ -56,8 +56,19 @@ test('capacity policy matches the configured topology and safe headroom model', 
   assert.equal(policy.topology.sqlite_writers, 1);
   assert.equal(policy.admission.global_websocket_sessions, 128);
   assert.equal(policy.capacity_model.safe_global_websocket_sessions, 102);
-  assert.equal(policy.capacity_model.safe_two_player_games_if_no_spectators, 51);
-  assert.equal(policy.capacity_model.room_quota_review_threshold, 92);
+  // CPU is the tighter room quota in the current policy; do not keep the
+  // historical pod-only threshold when validating the configured headroom.
+  const roomQuota = policy.topology.room_resource_quota;
+  const safeRoomQuota = Math.floor(Math.min(
+    roomQuota.dynamic_room_pod_ceiling,
+    roomQuota.dynamic_room_service_ceiling,
+    roomQuota.dynamic_room_cpu_ceiling,
+  ) * policy.capacity_model.room_quota_review_threshold_fraction);
+  assert.equal(policy.capacity_model.safe_two_player_games_if_no_spectators, Math.min(
+    Math.floor(policy.capacity_model.safe_global_websocket_sessions / policy.topology.room_players),
+    safeRoomQuota,
+  ));
+  assert.equal(policy.capacity_model.room_quota_review_threshold, safeRoomQuota);
   assert.equal(policy.topology.room_resource_quota.dynamic_room_pod_ceiling, 115);
   assert.equal(policy.overload_policy.status, 429);
   assert.equal(policy.overload_policy.retry_after_seconds, 60);

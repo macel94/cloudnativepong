@@ -8,6 +8,7 @@ on:
     paths:
       - 'Dockerfile.*'
       - '.dockerignore'
+      - 'build/caddy/**'
       - 'gateway/Caddyfile'
       - 'static/Caddyfile'
       - 'go.mod'
