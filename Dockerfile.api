@@ -9,7 +9,7 @@
 #   docker run --rm -p 8080:8080 cloudnativepong-api:latest
 
 # ── Build Stage ────────────────────────────────────────────────────
-FROM docker.io/library/golang:1.27.3-alpine@sha256:f2c872bcee949b7be9c490efd02b48a8a2fbf947cdf533f1c58525ec9d8170fd AS builder
+FROM docker.io/library/golang:1.27.3-alpine@sha256:fa3d596898d9f126af7c01d14ee7597bab3f39cccf392ef36b69fe77cd681f18 AS builder
 ENV GOTOOLCHAIN=local
 
 RUN apk add --no-cache \
@@ -36,7 +36,7 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
     go build -ldflags="-s -w" -o /pong .
 
 # ── Final Stage ────────────────────────────────────────────────────
-FROM gcr.io/distroless/static-debian13:nonroot@sha256:d62067879de890a1def9da0e7766b7d20810a5e5555cef8506b752437d7a3e88
+FROM gcr.io/distroless/static-debian13:nonroot@sha256:25ac8f0c3b2334a9eb05452266bd4697864a8c8ef0ef71e5e6480d7f92868329
 
 # Metadata labels
 LABEL org.opencontainers.image.title="Cloud Native Pong — API / Lobby" \
